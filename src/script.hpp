@@ -1,5 +1,5 @@
 // Lua scripting: a `nut` table over the asset code, shared by `nuttool script` and the GUI's
-// script window. See README.md ("Scripting") for the API.
+// script window. docs/scripting.md documents the API.
 #pragma once
 
 #include "common.hpp"
@@ -11,6 +11,7 @@ namespace nut::script {
 
 struct Options {
     fs::path assets;                                // nut.assets; relative paths are tried here first
+    fs::path scriptDir;                             // nut.script_dir; relative paths not in `assets` go here
     std::vector<std::string> args;                  // the global `arg` table
     std::function<void(const std::string&)> output; // print() and nut.run() output
     const std::atomic<bool>* cancel = nullptr;      // set to stop the script

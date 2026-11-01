@@ -844,7 +844,7 @@ const std::vector<Command>& commands() {
         {"ini-export", "<file.ini> <out.txt>", "Convert font metadata (UTF-16BE precache lists become UTF-8)", iniExport},
         {"ini-import", "<in.txt> <out.ini> [--utf16]", "Write font metadata back (--utf16 for precache lists)", iniImport},
         {"script", "<file.lua> [--assets dir] [script arguments...]",
-         "Run a Lua script (see README, \"Scripting\"); arguments after the file go to the script's `arg` table", nullptr},
+         "Run a Lua script (see docs/scripting.md); arguments after the file go to the script's `arg` table", nullptr},
     };
     return cmds;
 }
@@ -891,6 +891,7 @@ int runScript(const std::vector<std::string>& args) {
         i += 2;
     }
     opt.args.assign(args.begin() + std::ptrdiff_t(i), args.end());
+    opt.scriptDir = fs::absolute(fs::path(std::u8string(reinterpret_cast<const char8_t*>(args[1].c_str())))).parent_path();
     opt.output = [](const std::string& s) { print("%s", s.c_str()); };
     std::string code;
     try {
@@ -908,6 +909,10 @@ int run(const std::vector<std::string>& args) {
         return 1;
     }
     if (args[0] == "script") return runScript(args);
+    if (args[0] == "help" || args[0] == "--help" || args[0] == "-h") {
+        usage();
+        return 0;
+    }
     for (auto& cmd : commands()) {
         if (args[0] != cmd.name) continue;
         try {

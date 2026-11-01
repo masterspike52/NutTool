@@ -7,7 +7,7 @@ namespace nut::gui {
 
 namespace {
 
-const char* kExample = R"(-- NutTool script. print() writes to the output below; see README.md, "Scripting".
+const char* kExample = R"(-- NutTool script. print() writes to the output below; docs/scripting.md has the API.
 -- nut.assets is the open assets folder: relative paths start there.
 
 local path = "Bundle/4f/685374"
@@ -50,10 +50,11 @@ void App::runScript() {
     }
     std::string code = scriptText_;
     std::string chunk = scriptPath_.empty() ? std::string("script") : toUtf8(scriptPath_.filename());
-    fs::path root = root_;
-    runTask("Running script", false, [out, code, chunk, root](Task& t) -> std::function<void()> {
+    fs::path root = root_, dir = scriptPath_.empty() ? fs::path() : scriptPath_.parent_path();
+    runTask("Running script", false, [out, code, chunk, root, dir](Task& t) -> std::function<void()> {
         script::Options opt;
         opt.assets = root;
+        opt.scriptDir = dir;
         opt.cancel = &t.cancel;
         opt.output = [out](const std::string& s) {
             std::lock_guard<std::mutex> lk(out->m);

@@ -71,6 +71,7 @@ std::string avError(int e) {
 
 // Decodes a RIFF file (XMA2, ADPCM...) held in memory.
 Pcm decodeRiff(const Bytes& file) {
+    av_log_set_level(AV_LOG_ERROR); // not FFmpeg's notes about estimated durations and skipped samples
     Memory mem{&file};
     struct State {
         AVFormatContext* fmt = nullptr;

@@ -51,13 +51,14 @@ template <class F> int guarded(lua_State* L, F&& f) {
     return lua_error(L);
 }
 
-// A path from a script: absolute, or relative to the assets folder when it exists there, else to
-// the current folder.
+// A path from a script: absolute; or relative to the assets folder when it exists there, else to
+// the script's folder (when the script is a file), else to the current folder.
 fs::path resolve(lua_State* L, const char* p) {
     fs::path path = fs::path(std::u8string(reinterpret_cast<const char8_t*>(p)));
     if (path.is_absolute()) return path;
-    const fs::path& assets = context(L).opt->assets;
-    if (!assets.empty() && fs::exists(longPath(assets / path))) return assets / path;
+    const Options& opt = *context(L).opt;
+    if (!opt.assets.empty() && fs::exists(longPath(opt.assets / path))) return opt.assets / path;
+    if (!opt.scriptDir.empty()) return opt.scriptDir / path;
     return path;
 }
 
@@ -214,7 +215,11 @@ struct File {
     bool changed = false;
 };
 
-File& checkFile(lua_State* L, int idx = 1) { return **static_cast<File**>(luaL_checkudata(L, idx, kFile)); }
+File& checkFile(lua_State* L, int idx = 1) {
+    File* f = *static_cast<File**>(luaL_checkudata(L, idx, kFile));
+    if (!f) luaL_error(L, "the file is closed");
+    return *f;
+}
 
 caff::Caff& checkBundle(lua_State* L, File& f) {
     if (!f.l.caff) luaL_error(L, "%s is not a bundle", utf8(f.path).c_str());
@@ -222,6 +227,9 @@ caff::Caff& checkBundle(lua_State* L, File& f) {
 }
 
 int l_open(lua_State* L) {
+    // A File holds a whole asset (often tens of MB) but looks tiny to Lua's collector: free the
+    // ones no longer referenced before loading another, so loops over many files stay small.
+    lua_gc(L, LUA_GCCOLLECT);
     return guarded(L, [&] {
         auto* f = new File;
         f->path = resolve(L, luaL_checkstring(L, 1));
@@ -238,6 +246,7 @@ int l_open(lua_State* L) {
     });
 }
 
+// f:close() (also __gc and __close, for `local f <close> = nut.open(...)`): frees the asset now.
 int f_gc(lua_State* L) {
     auto** ud = static_cast<File**>(luaL_checkudata(L, 1, kFile));
     delete *ud;
@@ -246,8 +255,9 @@ int f_gc(lua_State* L) {
 }
 
 int f_tostring(lua_State* L) {
-    File& f = checkFile(L);
-    lua_pushfstring(L, "nut.File(%s, %s)", utf8(f.path).c_str(), kindName(f.l.kind));
+    File* f = *static_cast<File**>(luaL_checkudata(L, 1, kFile));
+    if (!f) lua_pushstring(L, "nut.File(closed)");
+    else lua_pushfstring(L, "nut.File(%s, %s)", utf8(f->path).c_str(), kindName(f->l.kind));
     return 1;
 }
 
@@ -537,9 +547,20 @@ size_t entryArg(lua_State* L, File& f, int idx) {
 
 int f_entry(lua_State* L) {
     File& f = checkFile(L);
-    const Bytes& b = f.l.sb->entries[entryArg(L, f, 2)].data;
+    size_t i = entryArg(L, f, 2);
+    const Bytes& b = f.l.sb->entries[i].data;
     lua_pushlstring(L, reinterpret_cast<const char*>(b.data()), b.size());
     return 1;
+}
+
+// f:entry_name(i) -> the entry's asset name ("wavebank_DialogJamJars", "aid_texture_..."), "" if unknown
+int f_entry_name(lua_State* L) {
+    File& f = checkFile(L);
+    size_t i = entryArg(L, f, 2);
+    return guarded(L, [&] {
+        lua_pushstring(L, ops::entryName(f.l.sb->entries[i]).c_str());
+        return 1;
+    });
 }
 
 int f_set_entry(lua_State* L) {
@@ -593,7 +614,8 @@ bool run(const std::string& code, const std::string& chunkName, const Options& o
         {"kind", f_kind},         {"path", f_path},           {"symbols", f_symbols},   {"find", f_find},
         {"read", f_read},         {"write", f_write},         {"models", f_models},     {"textures", f_textures},
         {"model", f_model},       {"colours", f_colours},     {"set_colour", f_set_colour}, {"import_obj", f_import_obj},
-        {"entries", f_entries},   {"entry", f_entry},         {"set_entry", f_set_entry}, {"save", f_save},
+        {"entries", f_entries},   {"entry", f_entry},         {"entry_name", f_entry_name}, {"set_entry", f_set_entry},
+        {"save", f_save},         {"close", f_gc},
         {nullptr, nullptr},
     };
     lua_newtable(L);
@@ -601,6 +623,8 @@ bool run(const std::string& code, const std::string& chunkName, const Options& o
     lua_setfield(L, -2, "__index");
     lua_pushcfunction(L, f_gc);
     lua_setfield(L, -2, "__gc");
+    lua_pushcfunction(L, f_gc);
+    lua_setfield(L, -2, "__close");
     lua_pushcfunction(L, f_tostring);
     lua_setfield(L, -2, "__tostring");
     lua_pop(L, 1);
@@ -612,6 +636,8 @@ bool run(const std::string& code, const std::string& chunkName, const Options& o
     luaL_setfuncs(L, nutFunctions, 0);
     lua_pushstring(L, utf8(opt.assets).c_str());
     lua_setfield(L, -2, "assets");
+    lua_pushstring(L, utf8(opt.scriptDir).c_str());
+    lua_setfield(L, -2, "script_dir");
     lua_pushstring(L, "0.2.0");
     lua_setfield(L, -2, "version");
     lua_setglobal(L, "nut");

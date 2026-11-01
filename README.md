@@ -380,6 +380,10 @@ player models' Kazooie part and wrench), the swap warns: in game, Kazooie then s
 her bind pose and there is no wrench (so no attack hitbox). Swap between models with the
 same parts (Banjo's outfits) to keep those.
 
+**[docs/model-swaps.md](docs/model-swaps.md)** walks through a swap step by step: what
+the swap notes mean, testing in reNut, and what to do when a swapped character crashes the
+game, T-poses or looks distorted.
+
 How the game reads this: at load it builds each vertex and index buffer from the
 rendergraph's resource records (`0x82BC32D0`): vertex buffers `{->header, ->.gpu offset,
 size}` and index buffers `{->header, ->.gpu offset, bytes, format}`; a draw's index count
@@ -388,59 +392,28 @@ symbols, swaps and relocates).
 
 ### Scripting (Lua)
 
-Scripts are Lua 5.5 with a `nut` table over the asset code. Run them in the GUI
-(**Tools > Script**: an editor with Run (Ctrl+Enter), Stop and the output; the text is
-kept between sessions) or from the command line:
+Scripts are Lua 5.5 with a `nut` table over the asset code: open bundles and stream
+bundles, read and replace symbols, inspect models, recolour materials, import OBJs, read
+wave banks, and run any `nuttool` command. Run them in the GUI (**Tools > Script**:
+an editor with Run (Ctrl+Enter), Stop and the output) or from the command line:
 
 ```
 nuttool script recolour.lua --assets F:\game\assets [arguments for the script...]
 ```
 
-Relative paths are tried in the assets folder first (the GUI's open folder, or
-`--assets`), then the current folder. Errors stop the script with a message and line
-number; `pcall` catches them.
-
 ```lua
-local f = nut.open("Bundle/4f/685374")          -- a bundle, CAFF or stream bundle
+local f = nut.open("Bundle/4f/685374")          -- relative paths start in the assets folder
 for _, name in ipairs(f:models()) do
   local m = f:model(name)
   print(name, m.meshes, m.vertices, #m.bones)
 end
-for _, c in ipairs(f:colours("banjox_actor_mumbo")) do
-  if c.constant == "c:velvetColour" then
-    f:set_colour("banjox_actor_mumbo", c.material, c.constant, 0.8, 0.1, 0.1)
-  end
-end
+f:set_colour("banjox_actor_mumbo", "blinn11", "velvetColour", 0.8, 0.1, 0.1)
 f:save()                                         -- in place, with a one-time .bak
-
-local code, out = nut.run("model-fbx", nut.assets .. "/Bundle/4f/685374", "banjox_actor_mumbo", "mumbo.fbx")
-print(code, out)
 ```
 
-| Function | Does |
-|---|---|
-| `print(...)` | writes to the output |
-| `nut.assets`, `nut.version`, `arg` | assets folder, NutTool version, script arguments (`arg[0]` is the script) |
-| `nut.run(command, args...)` | runs any `nuttool` command; returns its exit code and output |
-| `nut.open(path)` | opens a file as a File object |
-| `nut.list(dir [, recursive])` | file names in a folder |
-| `nut.exists(path)`, `nut.read(path)`, `nut.write(path, data)` | files as byte strings |
-| `nut.hash(name)` | asset id of an `aid_` name |
-| `nut.wavebank(data)` | a wave bank's `{name, waves}`, each wave `{name, format, channels, rate, samples, seconds, loop_start, loop_length, size}`; nil for other data |
-| `f:kind()`, `f:path()` | `"bundle"`, `"streambundle"` or another kind; the file's path |
-| `f:symbols()` | `{index, name, asset, section, size}` for every symbol |
-| `f:find(name [, section])` | index of the symbol with that symbol or asset name |
-| `f:read(i)`, `f:write(i, data)` | a symbol's bytes (indices start at 1) |
-| `f:models()`, `f:textures()` | model and texture names in a bundle |
-| `f:model(name)` | `{name, meshes, vertices, triangles, groups, nodes, switches, bones, textures, materials}` |
-| `f:colours(model)` | colour constants: `{material, constant, r, g, b, a, uses}` |
-| `f:set_colour(model, material, constant, r, g, b [, a])` | sets a colour everywhere the model uses it; returns the count |
-| `f:import_obj(model, obj)` | as `model-import`; returns `{edited, rebuilt, hidden, notes}` |
-| `f:entries()`, `f:entry(i)`, `f:set_entry(i, data)` | stream bundle entries |
-| `f:save([path])` | writes the file (in place with a `.bak`, or to `path`); returns the path |
-
-Everything else (texture import and export, model swaps, text, fonts, FBX) is reachable
-through `nut.run` with the command-line syntax above. Model names may omit `aid_model_`.
+**[docs/scripting.md](docs/scripting.md)** is the full reference: every function, path
+rules, binary data, saving and backups, and recipes (batch FBX export, text edits,
+audio, byte patching).
 
 ### Mod packages for reNut (.nbpatch)
 
