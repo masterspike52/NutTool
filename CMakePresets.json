@@ -5,6 +5,7 @@
         {
             "name": "base",
             "hidden": true,
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
             "generator": "Ninja",
             "binaryDir": "${sourceDir}/out/build/${presetName}",
             "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
@@ -26,10 +27,37 @@
             "displayName": "Windows Debug",
             "inherits": "base",
             "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
+            "name": "linux-base",
+            "hidden": true,
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+            "cacheVariables": {
+                "VCPKG_INSTALLED_DIR": "${sourceDir}/out/vcpkg_installed-linux",
+                "VCPKG_TARGET_TRIPLET": "x64-linux",
+                "NUTTOOL_PORTABLE": "ON"
+            }
+        },
+        {
+            "name": "linux-release",
+            "displayName": "Linux Release",
+            "inherits": "linux-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
+            "name": "linux-debug",
+            "displayName": "Linux Debug",
+            "inherits": "linux-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
         }
     ],
     "buildPresets": [
         { "name": "win-release", "configurePreset": "win-release" },
-        { "name": "win-debug", "configurePreset": "win-debug" }
+        { "name": "win-debug", "configurePreset": "win-debug" },
+        { "name": "linux-release", "configurePreset": "linux-release" },
+        { "name": "linux-debug", "configurePreset": "linux-debug" }
     ]
 }

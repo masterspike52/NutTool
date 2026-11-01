@@ -30,7 +30,11 @@ struct WaveBank {
     std::vector<Wave> waves;
 };
 
-WaveBank parseWaveBank(const Bytes& d);
+// Without `withData` only the tables are read (names, formats, lengths): `d` may then be just the
+// start of the bank, up to the end of its name table (headerBytes).
+WaveBank parseWaveBank(const Bytes& d, bool withData = true);
+// Bytes from the start of a bank that hold every table but the wave data, from its first 52 bytes.
+size_t waveBankHeaderBytes(const Bytes& head);
 // Playable file for one wave: RIFF WAVE for PCM/ADPCM, RIFF XMA2 for XMA, raw otherwise.
 // `ext` receives the suggested file extension.
 Bytes waveToFile(const Wave& w, std::string& ext);

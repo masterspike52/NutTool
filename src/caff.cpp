@@ -365,6 +365,74 @@ void Caff::replaceSymbolData(size_t idx, const Bytes& data) {
     s.size = uint32_t(data.size());
 }
 
+// A bundle's last symbol is its manifest, and the game reads it from there: new symbols, their
+// bytes and their names go in front of it.
+static bool isManifest(const Caff& c, size_t s) { return c.symbolName(s) == "manifest"; }
+
+size_t Caff::appendSymbol(uint32_t nameIndex, uint8_t section, uint8_t kind, const Bytes& data) {
+    Section& sec = sections.at(size_t(section) - 1);
+    uint32_t align = 1u << sec.alignLog2;
+    size_t man = !symbols.empty() && isManifest(*this, symbols.size() - 1) ? symbols.size() - 1 : symbols.size();
+    // When the manifest is the last thing in this section, its bytes move behind the new ones.
+    Bytes manData;
+    if (man < symbols.size() && symbols[man].section == section) {
+        bool last = std::none_of(symbols.begin(), symbols.end(), [&](const Symbol& o) { return o.section == section && o.offset > symbols[man].offset; });
+        if (last) {
+            manData = symbolData(man);
+            sec.data.resize(symbols[man].offset);
+        }
+    }
+    size_t at = (sec.data.size() + align - 1) / align * align;
+    if (at + data.size() + manData.size() + align > 0xFFFFFFFFull) fail("CAFF: section " + sec.name + " over 4 GB");
+    sec.data.resize(at, 0);
+    sec.data.insert(sec.data.end(), data.begin(), data.end());
+    if (!manData.empty()) {
+        size_t mo = (sec.data.size() + align - 1) / align * align;
+        sec.data.resize(mo, 0);
+        sec.data.insert(sec.data.end(), manData.begin(), manData.end());
+        symbols[man].offset = uint32_t(mo);
+    }
+    Symbol s;
+    s.nameIndex = nameIndex;
+    s.offset = uint32_t(at);
+    s.size = uint32_t(data.size());
+    s.section = section;
+    s.kind = kind;
+    if (man == symbols.size()) {
+        symbols.push_back(s);
+        return symbols.size() - 1;
+    }
+    // Insert before the manifest; whatever referred to it (1-based man + 1) moves up one.
+    symbols.insert(symbols.begin() + std::ptrdiff_t(man), s);
+    uint32_t old = uint32_t(man + 1);
+    for (int set = 0; set < 2; ++set) {
+        for (auto& r : relocs[set]) {
+            if (r.from >= old) ++r.from;
+            if (r.to >= old) ++r.to;
+        }
+        for (auto& w : swaps[set])
+            if (w.symbol >= old) ++w.symbol;
+    }
+    for (auto& p : pools)
+        if (p.symbol >= old) ++p.symbol;
+    return man;
+}
+
+uint32_t Caff::symbolNameIndex(const std::string& name) {
+    for (size_t i = 0; i < symbolNames.size(); ++i)
+        if (symbolNames[i] == name) return uint32_t(i + 1);
+    // Like the manifest symbol, its name stays last.
+    if (!symbolNames.empty() && symbolNames.back() == "manifest") {
+        uint32_t manName = uint32_t(symbolNames.size());
+        symbolNames.insert(symbolNames.end() - 1, name);
+        for (auto& s : symbols)
+            if (s.nameIndex == manName) ++s.nameIndex;
+        return manName;
+    }
+    symbolNames.push_back(name);
+    return uint32_t(symbolNames.size());
+}
+
 // ---- JSON manifest -------------------------------------------------------
 
 Json Caff::toJson() const {

@@ -1,6 +1,8 @@
 #include "media.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 namespace nut::media {
 namespace {
@@ -56,7 +58,20 @@ std::string describeAsf(const Bytes& d) {
 
 bool isWaveBank(const Bytes& d) { return d.size() >= 52 && (std::memcmp(d.data(), "DNBW", 4) == 0 || std::memcmp(d.data(), "WBND", 4) == 0); }
 
-WaveBank parseWaveBank(const Bytes& d) {
+size_t waveBankHeaderBytes(const Bytes& head) {
+    if (!isWaveBank(head)) fail("not an XACT wave bank");
+    bool be = std::memcmp(head.data(), "DNBW", 4) == 0;
+    Reader r(head, be);
+    r.skip(12);
+    size_t end = 52;
+    for (int s = 0; s < 5; ++s) {
+        uint32_t off = r.u32(), len = r.u32();
+        if (s < 4) end = std::max(end, size_t(off) + len); // segment 4 is the wave data
+    }
+    return end;
+}
+
+WaveBank parseWaveBank(const Bytes& d, bool withData) {
     if (!isWaveBank(d)) fail("not an XACT wave bank");
     bool be = std::memcmp(d.data(), "DNBW", 4) == 0;
     Reader r(d, be);
@@ -94,8 +109,10 @@ WaveBank parseWaveBank(const Bytes& d) {
             if (w.formatTag == 1 && w.sampleRate * 1000 > std * 995 && w.sampleRate * 1000 < std * 1005) w.sampleRate = std;
         w.blockAlign = (fmt >> 23) & 0xFF;
         w.bitsPerSample = (fmt >> 31) ? 16 : 8;
-        if (seg[4].off + uint64_t(off) + len > d.size()) fail("wave " + std::to_string(i) + " data out of range");
-        w.data.assign(d.begin() + seg[4].off + off, d.begin() + seg[4].off + off + len);
+        if (withData) {
+            if (seg[4].off + uint64_t(off) + len > d.size()) fail("wave " + std::to_string(i) + " data out of range");
+            w.data.assign(d.begin() + seg[4].off + off, d.begin() + seg[4].off + off + len);
+        }
         if (seg[3].len && nameSize) {
             Reader nr(d, be);
             nr.seek(seg[3].off + size_t(i) * nameSize);

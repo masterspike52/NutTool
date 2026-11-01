@@ -17,6 +17,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <utility>
 
 namespace nut::gui {
 
@@ -62,6 +63,7 @@ std::unique_ptr<Document> loadDocument(const fs::path& path, const fs::path& ass
 struct Task {
     std::string label;
     bool modal = false;
+    bool readOnly = false; // writes nothing, so it may be abandoned at exit
     std::atomic<bool> cancel{false};
     std::atomic<bool> finished{false};
     std::mutex m;
@@ -79,12 +81,12 @@ struct Task {
 };
 
 struct BrowserItem {
-    enum Kind { File, Texture, Model };
+    enum Kind { File, Texture, Model, Audio };
     std::string label;
     std::string tooltip;
     fs::path path;
     Kind kind = File;
-    std::string key;    // texture/model name for catalog items
+    std::string key;    // texture/model/wave bank name for catalog items
     std::string lower;  // label + tooltip, lower-case, for searching
 };
 
@@ -119,12 +121,20 @@ public:
     // Catalog items (available once indexing has finished).
     void openTexture(const std::string& name);
     void openModel(const std::string& name);
+    // A wave bank; `filter` pre-fills its wave filter.
+    void openAudio(const std::string& name, const std::string& filter = {});
     std::shared_ptr<const Catalog> catalog() const { return catalog_; }
-    // Opens a catalog item now, or as soon as indexing finishes ("tex:" / "model:" + name).
+    // Opens a catalog item now, or as soon as indexing finishes ("tex:" / "model:" / "audio:" + name).
     void openWhenIndexed(const std::string& key);
     // Animation to play in the next model tab that opens (--anim on the command line).
     void setStartupAnimation(const std::string& name) { startupAnim_ = name; }
     std::string takeStartupAnimation() { return std::exchange(startupAnim_, {}); }
+    void setStartupReplacement(const std::string& name) { startupReplace_ = name; }
+    // --script <file>: opens the script window and runs the file once the assets folder is known.
+    void setStartupScript(const fs::path& p) { startupScript_ = p; }
+    void setStartupFbx(const fs::path& p) { startupFbx_ = p; }
+    fs::path takeStartupFbx() { return std::exchange(startupFbx_, {}); }
+    std::string takeStartupReplacement() { return std::exchange(startupReplace_, {}); }
     // Opens an assets folder, or a single file (from the command line or drag and drop).
     void openAny(const fs::path& p);
 
@@ -134,7 +144,9 @@ public:
     void saveFileDialog(const std::string& title, std::vector<Filter> filters, FileCallback cb, const fs::path& start = {});
     void openFolderDialog(const std::string& title, FileCallback cb, const fs::path& start = {});
 
-    void runTask(const std::string& label, bool modal, std::function<std::function<void()>(Task&)> work);
+    void runTask(const std::string& label, bool modal, std::function<std::function<void()>(Task&)> work, bool readOnly = false);
+    // For work that writes nothing: at exit it is not waited for.
+    void runReadOnlyTask(const std::string& label, bool modal, std::function<std::function<void()>(Task&)> work);
     bool busy() const { return !tasks_.empty(); }
 
 private:
@@ -165,6 +177,13 @@ private:
     void pumpTasks();
     void saveDocument(Document& d, bool saveAs);
     void closeDocument(size_t i);
+    void drawRestore();
+    // Scripting (script_window.cpp)
+    void drawScript();
+    void runScript();
+    bool scriptRunning() const;
+    void saveScriptText();
+    fs::path scriptAutosavePath() const;
 
     SDL_Window* window_;
     bool quit_ = false;
@@ -182,7 +201,7 @@ private:
     std::shared_ptr<const Catalog> catalog_;
     bool indexing_ = false;
     std::vector<std::string> pendingOpen_;
-    std::string startupAnim_;
+    std::string startupAnim_, startupReplace_;
 
     std::vector<std::unique_ptr<Document>> docs_;
     std::string selectTab_;      // tab to bring to front on the next frame
@@ -225,6 +244,22 @@ private:
     std::vector<nbpatch::Change> modChanges_;
     std::vector<char> modPick_;
     bool modScanned_ = false;
+    // Restoring backups
+    bool showRestore_ = false, restoreScanned_ = false;
+    std::vector<nbpatch::Change> restoreChanges_;
+    std::vector<char> restorePick_;
+    // Scripting: the editor text is kept in script.lua next to settings.txt.
+    struct ScriptOutput {
+        std::mutex m;
+        std::string text;
+        bool scroll = false;
+    };
+    bool showScript_ = false, scriptLoaded_ = false;
+    bool scriptAutosave_ = true; // off for a --script file, so it does not replace the saved editor text
+    std::string scriptText_;
+    fs::path scriptPath_, startupScript_, startupFbx_;
+    std::shared_ptr<ScriptOutput> scriptOutput_ = std::make_shared<ScriptOutput>();
+    Task* scriptTask_ = nullptr; // compared only, never dereferenced unless still in tasks_
 
     // Fonts
     std::set<uint32_t> glyphs_;

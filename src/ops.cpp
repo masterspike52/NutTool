@@ -1,5 +1,7 @@
 #include "ops.hpp"
 
+#include "audio.hpp"
+
 #include "assetdb.hpp"
 #include "container.hpp"
 #include "font.hpp"
@@ -368,16 +370,27 @@ streambundle::StreamBundle packStreamBundle(const fs::path& dir) {
     return sb;
 }
 
-void exportWaveBank(const Bytes& data, const fs::path& dir, const std::string& base) {
+int exportWaveBank(const Bytes& data, const fs::path& dir, const std::string& base, bool wav) {
     media::WaveBank wb = media::parseWaveBank(data);
     writeFile(dir / (safeName(base) + ".xwb"), data);
+    int decoded = 0;
     for (size_t i = 0; i < wb.waves.size(); ++i) {
         std::string ext;
-        Bytes f = media::waveToFile(wb.waves[i], ext);
+        Bytes f;
+        if (wav && audio::canDecode(wb.waves[i])) {
+            try {
+                f = audio::toWav(audio::decode(wb.waves[i]));
+                ext = ".wav";
+                ++decoded;
+            } catch (std::exception&) {
+            }
+        }
+        if (f.empty()) f = media::waveToFile(wb.waves[i], ext);
         char prefix[16];
         std::snprintf(prefix, sizeof prefix, "%03zu_", i);
         writeFile(dir / safeName(base) / (std::string(prefix) + safeName(wb.waves[i].name) + ext), f);
     }
+    return decoded;
 }
 
 Bytes precacheToUtf8(const Bytes& d) {

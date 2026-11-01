@@ -56,7 +56,11 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             if ((a == "--model" || a == "--texture") && i + 1 < argc) app->openWhenIndexed((a == "--model" ? "model:" : "tex:") + std::string(argv[++i]));
+            else if (a == "--audio" && i + 1 < argc) app->openWhenIndexed("audio:" + std::string(argv[++i]));
             else if (a == "--anim" && i + 1 < argc) app->setStartupAnimation(argv[++i]);
+            else if (a == "--replace-with" && i + 1 < argc) app->setStartupReplacement(argv[++i]); // previews a model swap (not saved)
+            else if (a == "--script" && i + 1 < argc) app->setStartupScript(nut::gui::fromUtf8(argv[++i]));
+            else if (a == "--export-fbx" && i + 1 < argc) app->setStartupFbx(nut::gui::fromUtf8(argv[++i])); // with --model
             else app->openAny(nut::gui::fromUtf8(a));
         }
         while (!app->quitRequested()) {

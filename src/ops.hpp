@@ -85,7 +85,9 @@ std::string entryName(const streambundle::Entry& e);
 std::string entryExt(const streambundle::Entry& e);
 void unpackStreamBundle(const streambundle::StreamBundle& sb, const fs::path& dir);
 streambundle::StreamBundle packStreamBundle(const fs::path& dir);
-void exportWaveBank(const Bytes& data, const fs::path& dir, const std::string& base);
+// The bank (<base>.xwb) and its waves (<base>/NNN_<name>.xma/.wav). With `wav`, waves are decoded
+// to 16-bit WAV (kept as they are when they cannot be). Returns the number decoded.
+int exportWaveBank(const Bytes& data, const fs::path& dir, const std::string& base, bool wav = false);
 Bytes precacheToUtf8(const Bytes& d);
 Bytes utf8ToPrecache(const std::string& text);
 

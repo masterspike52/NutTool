@@ -90,6 +90,21 @@ struct Mesh {
     // The colour map is drawn as texture * textureGain + textureOffset (c:textureGain<slot>...).
     float textureGain[4] = {1, 1, 1, 1};
     float textureOffset[4] = {0, 0, 0, 0};
+    // Where the draw's data is stored, for writing it back (modelimport.hpp). Offsets without a
+    // symbol are in the model's .data symbol.
+    struct Source {
+        int vbSymbol = -1;        // .gpu symbol (0-based) holding the vertex buffer
+        uint32_t vbOffset = 0;    // buffer start in it
+        uint32_t vbCount = 0;     // vertices in the whole buffer
+        uint32_t vbRecord = 0;    // resource record {->header, ->.gpu offset, size}
+        uint32_t vbHeader = 0;    // header {..., stride at -4, ->.gpu offset at +4, size at +8}
+        int ibSymbol = -1;
+        uint32_t ibOffset = 0;
+        uint32_t ibRecord = 0;    // resource record {->header, ->.gpu offset, bytes, format}
+        bool wideIndices = false; // 32-bit indices
+        uint32_t indexCountAt = 0; // the draw's index count
+        std::vector<uint32_t> vertex; // buffer index of each of `vertices`
+    } source;
 };
 
 // A node of the authoring hierarchy.

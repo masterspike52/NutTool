@@ -5,15 +5,35 @@
   "dependencies": [
     {
       "name": "sdl3",
-      "default-features": false
+      "default-features": false,
+      "features": [
+        { "name": "x11", "platform": "linux" },
+        { "name": "wayland", "platform": "linux" }
+      ]
     },
     {
       "name": "imgui",
       "features": ["docking-experimental", "sdl3-binding", "opengl3-binding"]
     },
     {
+      "name": "lua",
+      "features": ["cpp"]
+    },
+    {
       "name": "glad",
       "features": ["gl-api-33"]
+    },
+    {
+      "name": "dbus",
+      "default-features": false,
+      "platform": "linux",
+      "$comment": "SDL3's file dialogs talk to the desktop portal over D-Bus; without this, dbus pulls in libsystemd"
+    },
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": ["avcodec", "avformat", "swresample", "swscale"],
+      "$comment": "XMA audio (the game's wave banks) everywhere; on Linux also the WMV movies"
     }
   ]
 }

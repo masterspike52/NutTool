@@ -182,7 +182,7 @@ std::vector<Bone> readPose(const View& v, uint32_t pose) {
 
 struct Material {
     std::string name;
-    uint32_t program = 0;            // .stream offset of its first program
+    std::vector<uint32_t> programs;  // .stream offsets of its programs (one per pass)
     std::vector<std::string> params; // constant names in register order
 };
 
@@ -271,14 +271,6 @@ Layout detectLayout(const uint8_t* data, uint32_t stride, size_t n) {
         l.skinned = skin > 0.98;
     }
     int at = l.skinned ? base + 12 : base;
-    auto isUnitDec3n = [&](int off) {
-        return fraction([&](const uint8_t* p) {
-            float v[3];
-            dec3n(be32(p + off), v);
-            float len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-            return len > 0.8f && len < 1.2f;
-        }) > 0.9;
-    };
     auto isHalf2 = [&](int off) {
         return fraction([&](const uint8_t* p) {
             float a = half(be16(p + off)), b = half(be16(p + off + 2));
@@ -419,7 +411,9 @@ Model parse(const caff::Caff& c, size_t symbol) {
                             uint32_t blk = v.local(ent + 8);
                             Material mat;
                             mat.name = key.substr(7);
-                            if (v.isLocal(blk) && v.u32(blk + 4)) mat.program = v.u32(v.local(blk));
+                            // {->programs {u32 offset, ->..}[count], count, ...}
+                            if (v.isLocal(blk))
+                                for (uint32_t q = 0, pc = std::min<uint32_t>(v.u32(blk + 4), 16); q < pc; ++q) mat.programs.push_back(v.u32(v.local(blk) + 8 * q));
                             uint32_t np = std::min<uint32_t>(v.u32(blk + 0x20), 64);
                             if (np && v.isLocal(blk + 0x24)) {
                                 uint32_t pa = v.local(blk + 0x24);
@@ -447,6 +441,7 @@ Model parse(const caff::Caff& c, size_t symbol) {
 
     // ---- skeleton (pose)
     if (v.isLocal(rg + 0x104)) m.bones = readPose(v, v.local(rg + 0x104));
+    else if (auto t = v.targetOf(rg + 0x104)) m.bones = readPose(View(c, *t), v.u32(rg + 0x104)); // a skeleton kept elsewhere (copyModel)
 
     // ---- authoring nodes: {count, ->records of 0x50 bytes {->name, ->short name, u32 index, ...}}
     if (v.isLocal(rg + 0x28)) {
@@ -472,8 +467,8 @@ Model parse(const caff::Caff& c, size_t symbol) {
     }
 
     // ---- GPU resources: vertex and index buffer records
-    struct Vb { uint32_t gpu, size, stride; size_t gpuSym; };
-    struct Ib { uint32_t gpu, size, format; size_t gpuSym; };
+    struct Vb { uint32_t gpu, size, stride; size_t gpuSym; uint32_t record, header; };
+    struct Ib { uint32_t gpu, size, format; size_t gpuSym; uint32_t record; };
     std::map<uint32_t, Vb> vbs; // keyed by buffer object offset
     std::map<uint32_t, Ib> ibs;
     if (v.isLocal(rg + 0xFC)) {
@@ -486,7 +481,7 @@ Model parse(const caff::Caff& c, size_t symbol) {
                 if (!v.isLocal(d) || !v.targetOf(d + 4)) continue;
                 uint32_t hdr = v.local(d);          // points at the record's object field
                 uint32_t obj = v.u32(hdr);
-                Vb b{v.u32(d + 4), v.u32(d + 8), v.u32(hdr - 4), *v.targetOf(d + 4)};
+                Vb b{v.u32(d + 4), v.u32(d + 8), v.u32(hdr - 4), *v.targetOf(d + 4), d, hdr};
                 vbs[obj] = b;
                 vbs[hdr] = b;
             }
@@ -496,7 +491,7 @@ Model parse(const caff::Caff& c, size_t symbol) {
             for (uint32_t i = 0; i < nib && i < 4096; ++i) {
                 uint32_t d = arr + 16 * i;
                 if (!v.isLocal(d) || !v.targetOf(d + 4)) continue;
-                ibs[v.local(d)] = Ib{v.u32(d + 4), v.u32(d + 8), v.u32(d + 12), *v.targetOf(d + 4)};
+                ibs[v.local(d)] = Ib{v.u32(d + 4), v.u32(d + 8), v.u32(d + 12), *v.targetOf(d + 4), d};
             }
         }
     }
@@ -576,6 +571,17 @@ Model parse(const caff::Caff& c, size_t symbol) {
                 mesh.layout = src.layout;
                 mesh.buffer = vbObj;
                 mesh.group = int(gi);
+                auto& so = mesh.source;
+                so.vbSymbol = int(vb->second.gpuSym);
+                so.vbOffset = vb->second.gpu;
+                so.vbCount = uint32_t(src.vertices.size());
+                so.vbRecord = vb->second.record;
+                so.vbHeader = vb->second.header;
+                so.ibSymbol = int(ib->second.gpuSym);
+                so.ibOffset = ib->second.gpu;
+                so.ibRecord = ib->second.record;
+                so.wideIndices = wide;
+                so.indexCountAt = pair + 4;
                 std::vector<int32_t> remap(src.vertices.size(), -1);
                 for (uint32_t k = 0; k + 2 < nidx; k += 3) {
                     uint32_t tri[3];
@@ -588,6 +594,7 @@ Model parse(const caff::Caff& c, size_t symbol) {
                         if (remap[x] < 0) {
                             remap[x] = int32_t(mesh.vertices.size());
                             mesh.vertices.push_back(src.vertices[x]);
+                            so.vertex.push_back(x);
                         }
                         mesh.indices.push_back(uint32_t(remap[x]));
                     }
@@ -637,12 +644,12 @@ Model parse(const caff::Caff& c, size_t symbol) {
                 bool ambiguous = false;
                 if (v.isLocal(d + 24)) {
                     uint32_t b = v.local(d + 24);
-                    if (v.u32(b) && v.targetOf(b + 4) && *v.targetOf(b + 4) != v.sym()) {
+                    if (v.targetOf(b + 4) && *v.targetOf(b + 4) != v.sym()) { // untextured draws (count 0) name their program too
                         const Bytes& sd = v.bytes(*v.targetOf(b + 4));
                         uint32_t at = v.u32(b + 4);
                         if (at + 4 <= sd.size())
                             for (auto& [blk, mt] : materials)
-                                if (mt.program == be32(&sd[at])) mat = &mt;
+                                if (std::find(mt.programs.begin(), mt.programs.end(), be32(&sd[at])) != mt.programs.end()) mat = &mt;
                     }
                 }
                 if (!mat && !regs.empty())
@@ -764,7 +771,7 @@ std::string toObj(const Model& m, const std::string& mtlFile, const std::vector<
         if (!use) continue;
         o += "o group" + std::to_string(mesh.group) + "_mesh" + std::to_string(i) + "\n";
         for (auto& v : mesh.vertices) { std::snprintf(t, sizeof t, "v %g %g %g\n", v.pos[0], v.pos[1], v.pos[2]); o += t; }
-        for (auto& v : mesh.vertices) { std::snprintf(t, sizeof t, "vt %g %g\n", v.uv[0], 1.0f - v.uv[1]); o += t; }
+        for (auto& v : mesh.vertices) { std::snprintf(t, sizeof t, "vt %.9g %.9g\n", v.uv[0], 1.0f - v.uv[1]); o += t; }
         for (auto& v : mesh.vertices) { std::snprintf(t, sizeof t, "vn %g %g %g\n", v.normal[0], v.normal[1], v.normal[2]); o += t; }
         int tex = i < meshTexture.size() ? meshTexture[i] : mesh.texture;
         if (tex >= 0) o += "usemtl tex" + std::to_string(tex) + "\n";

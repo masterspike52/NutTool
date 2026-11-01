@@ -92,6 +92,11 @@ struct Caff {
     // Replace a symbol's bytes. Later symbols in the same section shift by the size
     // delta rounded up to the section alignment, so their alignment is preserved.
     void replaceSymbolData(size_t symIndex, const Bytes& data);
+    // A new symbol at the end of a section (1-based `section`, aligned to it); returns its index.
+    // Symbols may be listed in any order, so nothing else is renumbered.
+    size_t appendSymbol(uint32_t nameIndex, uint8_t section, uint8_t kind, const Bytes& data);
+    // 1-based index of `name` in symbolNames, added if missing.
+    uint32_t symbolNameIndex(const std::string& name);
 
     Json toJson() const;              // everything except section bytes
 private:

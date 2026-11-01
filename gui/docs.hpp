@@ -20,6 +20,7 @@ std::unique_ptr<Document> makeIndexDocument(const fs::path& p, const fs::path& r
 std::unique_ptr<Document> makeHexDocument(const fs::path& p, Bytes data, const std::string& kind);
 std::unique_ptr<Document> makeTextureDocument(const TextureInfo& t, const fs::path& root);
 std::unique_ptr<Document> makeModelDocument(const ModelInfo& m, std::shared_ptr<const Catalog> catalog, const fs::path& root);
+std::unique_ptr<Document> makeAudioDocument(const AudioBankInfo& info, const fs::path& root, const std::string& filter);
 
 // "banjox_frontend"-style label from db_index for an asset file (thread-safe, cached per root).
 std::string friendlyName(const fs::path& root, const fs::path& p);

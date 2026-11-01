@@ -8,6 +8,7 @@
 #include "video_player.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <mutex>

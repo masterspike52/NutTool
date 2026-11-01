@@ -1,8 +1,11 @@
 // 3D model viewer: geometry, textures and skeleton of a model from the catalog.
 #include "docs.hpp"
+#include "fbx.hpp"
 
 #include "gl_view.hpp"
 #include "model.hpp"
+#include "modelimport.hpp"
+#include "streambundle.hpp"
 #include "ops.hpp"
 
 #include <algorithm>
@@ -90,8 +93,19 @@ public:
     ModelDocument(const ModelInfo& info, std::shared_ptr<const Catalog> catalog, const fs::path& root)
         : info_(info), catalog_(std::move(catalog)), root_(root) {
         path = info.locs.front().file;
-        caff::Caff& c = cache_.get(info.locs.front());
-        model_ = model::parse(c, info.locs.front().symbol);
+        loadModel(cache_.get(info.locs.front()), info.locs.front().symbol);
+    }
+
+    // (Re)builds everything shown from one copy of the model.
+    void loadModel(const caff::Caff& c, uint32_t symbol) {
+        stopAnimation();
+        view_.reset(); // the next frame uploads the new meshes and textures
+        textures_.clear();
+        ownAnims_.clear();
+        hasFur_ = false;
+        colourGroups_.clear();
+        colourEdited_.clear();
+        model_ = model::parse(c, symbol);
         // Decode every referenced texture (level 0, scaled down to at most 1024 for the viewport).
         for (auto& name : model_.textures) {
             LoadedTex lt;
@@ -135,9 +149,12 @@ public:
         collectColours();
     }
 
+public:
     std::string title() const override { return "model " + shortModelName(model_.name); }
 
     void draw(App& app) override {
+        // A reload asked for while the panel was drawn (it replaces the view the rest of that frame uses).
+        if (deferred_) std::exchange(deferred_, nullptr)();
         if (!view_) {
             view_ = std::make_unique<ModelView>();
             for (auto& t : textures_) {
@@ -162,7 +179,18 @@ public:
         if (!startupChecked_) {
             startupChecked_ = true;
             std::string a = app.takeStartupAnimation();
-            if (!a.empty()) loadAnimation(a);
+            // --replace-with: the same path as picking from "Replace with another model" (then --anim,
+            // since reloading the model stops animations).
+            std::string r = app.takeStartupReplacement();
+            if (!r.empty())
+                deferred_ = [this, &app, r, a] {
+                    if (preview(app, [&](caff::Caff& c, uint32_t sym) { return copyFrom(c, sym, info_.locs.front(), r).notes; })) pendingSwap_ = r;
+                    if (!a.empty()) loadAnimation(a);
+                };
+            else if (!a.empty())
+                loadAnimation(a);
+            fs::path fbxOut = app.takeStartupFbx(); // --export-fbx: as "Export FBX..." with the default choices
+            if (!fbxOut.empty()) exportFbxTo(app, fbxOut);
         }
         updateAnimation();
         view_->draw(ImGui::GetContentRegionAvail(), opt_);
@@ -319,9 +347,14 @@ private:
         ImGui::SameLine();
         if (ImGui::Button("Export OBJ...")) exportObj(app);
         helpMarker("Writes the shown meshes as .obj + .mtl and the textures as PNG into a folder.");
+        ImGui::SameLine();
+        if (ImGui::Button("Export FBX...")) ImGui::OpenPopup("Export FBX");
+        helpMarker("Writes the shown meshes skinned to the skeleton, materials with their textures (embedded) and animations as one .fbx file.");
+        drawFbxExport(app);
         if (!model_.warnings.empty() && ImGui::CollapsingHeader("Warnings"))
             for (auto& w : model_.warnings) ImGui::BulletText("%s", w.c_str());
 
+        drawReplace(app);
         drawAnimation();
         if (model_.groups.size() > 1) drawParts();
         drawColours();
@@ -752,6 +785,98 @@ private:
         });
     }
 
+    // ---- FBX export ---------------------------------------------------------------
+
+    void drawFbxExport(App& app) {
+        if (!ImGui::BeginPopup("Export FBX")) return;
+        ImGui::TextUnformatted("Animations");
+        std::string own = "Named after this model (" + std::to_string(ownAnims_.size()) + ")";
+        ImGui::BeginDisabled(ownAnims_.empty());
+        ImGui::RadioButton(own.c_str(), &fbxAnims_, 1);
+        ImGui::EndDisabled();
+        std::string cur = anim_ ? "Only the one playing (" + shortAnimName(animName_, animPrefix_) + ")" : std::string("Only the one playing (none)");
+        ImGui::BeginDisabled(!anim_);
+        ImGui::RadioButton(cur.c_str(), &fbxAnims_, 2);
+        ImGui::EndDisabled();
+        ImGui::RadioButton("None", &fbxAnims_, 0);
+        if (fbxAnims_ == 1 && ownAnims_.empty()) fbxAnims_ = 0;
+        if (fbxAnims_ == 2 && !anim_) fbxAnims_ = ownAnims_.empty() ? 0 : 1;
+        ImGui::Separator();
+        if (ImGui::Button("Save as...")) {
+            ImGui::CloseCurrentPopup();
+            exportFbx(app);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    void exportFbx(App& app) {
+        app.saveFileDialog("Export FBX", {{"FBX model", "fbx"}}, [this, &app](const fs::path& picked) {
+            fs::path out = picked;
+            if (lower(out.extension().string()) != ".fbx") out += ".fbx";
+            exportFbxTo(app, out);
+        });
+    }
+
+    void exportFbxTo(App& app, const fs::path& out) {
+        // Everything the worker needs, copied: the tab may change or close meanwhile.
+        auto m = std::make_shared<model::Model>(model_);
+        for (size_t i = 0; i < m->meshes.size() && i < meshTex_.size(); ++i) m->meshes[i].texture = meshTex_[i];
+        std::vector<bool> include(m->meshes.size());
+        for (size_t i = 0; i < include.size(); ++i) include[i] = meshShown(i);
+        std::vector<std::string> names;
+        std::shared_ptr<model::Animation> playing;
+        if (fbxAnims_ == 1) names = ownAnims_;
+        if (fbxAnims_ == 2) playing = anim_;
+        std::string playingName = shortAnimName(animName_, animPrefix_), prefix = animPrefix_;
+        auto catalog = catalog_;
+        app.runTask("Exporting " + toUtf8(out.filename()), false,
+                    [&app, m, include, names, playing, playingName, prefix, catalog, out](Task& t) -> std::function<void()> {
+            CaffCache cache;
+            std::vector<std::shared_ptr<model::Animation>> anims;
+            fbx::Options opt;
+            opt.include = include;
+            std::vector<std::string> notes;
+            for (size_t i = 0; i < names.size() && catalog; ++i) {
+                if (t.cancel) return {};
+                t.report(0.8 * double(i) / double(names.size()), "Reading " + names[i]);
+                const ModelInfo* info = catalog->anim(names[i]);
+                if (!info) continue;
+                try {
+                    const AssetLoc& loc = info->locs.front();
+                    anims.push_back(std::make_shared<model::Animation>(model::parseAnimation(cache.get(loc), loc.symbol)));
+                    opt.animations.push_back({shortAnimName(names[i], prefix), anims.back().get()});
+                } catch (std::exception& e) {
+                    notes.push_back(names[i] + ": " + e.what());
+                }
+            }
+            if (playing) opt.animations.push_back({playingName, playing.get()});
+            // Textures at full size, straight from the game files.
+            opt.texture = [&](const std::string& name) -> std::optional<Bytes> {
+                const TextureInfo* ti = catalog ? catalog->texture(name) : nullptr;
+                if (!ti) return std::nullopt;
+                try {
+                    ops::DecodedTexture d = decodeCatalogTexture(*ti, cache);
+                    return image::encodePng(texture::toRgba(d.header, d.levels[0], 0));
+                } catch (std::exception& e) {
+                    notes.push_back(name + ": " + e.what());
+                    return std::nullopt;
+                }
+            };
+            t.report(0.85, "Writing " + toUtf8(out.filename()));
+            fbx::Report r;
+            Bytes data = fbx::write(*m, opt, &r);
+            writeFile(out, data);
+            for (auto& n : r.notes) notes.push_back(n);
+            return [&app, r, notes, out] {
+                for (auto& n : notes) app.log("FBX export: " + n);
+                app.status("Exported " + toUtf8(out.filename()) + ": " + std::to_string(r.meshes) + " meshes, " + std::to_string(r.bones) + " bones, " +
+                           std::to_string(r.textures) + " textures, " + std::to_string(r.animations) + " animations");
+            };
+        });
+    }
+
     // ---- material colours -------------------------------------------------------
     // Colour constants (c:basecolour, c:velvetColour...) that share a material, a name and a value
     // are edited together: every detail level repeats the material with its own copy of the value.
@@ -827,6 +952,181 @@ private:
         ImGui::Checkbox("Include hidden parts and detail levels", &allColours_);
     }
 
+    // ---- replacing geometry ---------------------------------------------------------
+    // Imports and swaps are applied to a copy of the first bundle for the preview, and replayed on
+    // every copy of the model when saving.
+    void drawReplace(App& app) {
+        ImGui::SeparatorText("Replace");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Import OBJ: objects named like the export's (group0_mesh3) edit that mesh in place when the vertex and "
+                           "triangle counts match, otherwise replace its geometry (skinning comes from the nearest original vertex); "
+                           "an object with no faces hides the mesh. Replace copies another game model into this one's place.");
+        ImGui::PopStyleColor();
+        bool coloursPending = !colourEdited_.empty();
+        ImGui::BeginDisabled(coloursPending);
+        if (ImGui::Button("Import OBJ...")) {
+            app.openFileDialog("Import OBJ", {{"Wavefront OBJ", "obj"}}, [this, &app](const fs::path& p) {
+                std::string text;
+                try {
+                    text = readText(p);
+                } catch (std::exception& e) {
+                    app.error(e.what());
+                    return;
+                }
+                std::string name = toUtf8(p.filename());
+                deferred_ = [this, &app, name, text] {
+                    bool ok = preview(app, [&](caff::Caff& c, uint32_t sym) {
+                        model::ImportReport r = model::importObj(c, sym, text);
+                        std::vector<std::string> notes{name + ": " + std::to_string(r.edited) + " mesh(es) edited, " + std::to_string(r.rebuilt) +
+                                                       " rebuilt, " + std::to_string(r.hidden) + " hidden"};
+                        notes.insert(notes.end(), r.notes.begin(), r.notes.end());
+                        return notes;
+                    });
+                    if (ok) pendingObjs_.push_back(text);
+                };
+            });
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Replace with another model...")) {
+            swapFilter_.clear();
+            ImGui::OpenPopup("##swap");
+        }
+        ImGui::EndDisabled();
+        if (coloursPending) ImGui::TextDisabled("Save or revert the colour changes first.");
+        if (ImGui::BeginPopup("##swap")) {
+            ImGui::TextUnformatted("Replace this model with:");
+            ImGui::SetNextItemWidth(em(320));
+            if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+            inputText("##filter", swapFilter_);
+            std::string f = lower(swapFilter_);
+            if (ImGui::BeginChild("##models", ImVec2(em(420), em(300)))) {
+                int listed = 0;
+                if (catalog_)
+                    for (auto& m : catalog_->models) {
+                        if (m.name == info_.name || (!f.empty() && lower(m.name).find(f) == std::string::npos)) continue;
+                        if (++listed > 500) {
+                            ImGui::TextDisabled("... type to narrow the list");
+                            break;
+                        }
+                        if (ImGui::Selectable(shortModelName(m.name).c_str())) {
+                            std::string name = m.name;
+                            deferred_ = [this, &app, name] {
+                                if (preview(app, [&](caff::Caff& c, uint32_t sym) { return copyFrom(c, sym, info_.locs.front(), name).notes; })) {
+                                    pendingSwap_ = name;
+                                    pendingObjs_.clear(); // the new model replaces any imported geometry
+                                }
+                            };
+                            ImGui::CloseCurrentPopup();
+                        }
+                    }
+                if (!catalog_) ImGui::TextDisabled("The model list is still being built.");
+            }
+            ImGui::EndChild();
+            ImGui::EndPopup();
+        }
+        if (!pendingSwap_.empty()) ImGui::BulletText("Replaced by %s", shortModelName(pendingSwap_).c_str());
+        if (!pendingObjs_.empty()) ImGui::BulletText("%zu OBJ import(s)", pendingObjs_.size());
+        if (!replaceNotes_.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            for (auto& n : replaceNotes_) ImGui::TextWrapped("%s", n.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (dirty()) {
+            if (ImGui::Button("Discard changes")) deferred_ = [this] { discard(); };
+            ImGui::SameLine();
+            ImGui::TextDisabled("Not saved yet: Ctrl+S writes them into the bundle(s).");
+        }
+    }
+
+    // Applies `op` to a copy of the previewed CAFF; on success it becomes the preview and is shown.
+    bool preview(App& app, const std::function<std::vector<std::string>(caff::Caff&, uint32_t)>& op) {
+        const AssetLoc& loc = info_.locs.front();
+        try {
+            caff::Caff trial = preview_ ? *preview_ : cache_.get(loc);
+            std::vector<std::string> notes = op(trial, loc.symbol);
+            preview_ = std::make_unique<caff::Caff>(std::move(trial));
+            replaceNotes_.insert(replaceNotes_.end(), notes.begin(), notes.end());
+            loadModel(*preview_, loc.symbol);
+            app.status(notes.empty() ? "Model replaced" : notes.front());
+            return true;
+        } catch (std::exception& e) {
+            app.error(std::string("could not apply it: ") + e.what());
+            return false;
+        }
+    }
+
+    // Copies the model `name` over the one at `symbol` in `c` (a copy of the model at `at`).
+    model::CopyResult copyFrom(caff::Caff& c, uint32_t symbol, const AssetLoc& at, const std::string& name) {
+        const ModelInfo* src = catalog_ ? catalog_->model(name) : nullptr;
+        if (!src || src->locs.empty()) fail(name + " is not in the model list");
+        // A copy in the same file shares its pools: copy within the CAFF.
+        for (auto& l : src->locs)
+            if (l.file == at.file && l.entry == at.entry) return model::copyModel(c, symbol, c, l.symbol, catalogTextures());
+        caff::Caff& sc = cache_.get(src->locs.front());
+        return model::copyModel(c, symbol, sc, src->locs.front().symbol, catalogTextures());
+    }
+
+    // Textures for copyModel, from wherever the catalog found them (whole or mip half in a bundle,
+    // the streamed top level in a stream bundle). Files are read once per copy, not through cache_,
+    // whose entries could be dropped while copyModel still uses them.
+    model::FindTexture catalogTextures() const {
+        auto catalog = catalog_;
+        auto caffs = std::make_shared<std::map<std::pair<fs::path, int>, std::shared_ptr<const caff::Caff>>>();
+        auto indexes = std::make_shared<std::map<fs::path, std::vector<streambundle::IndexEntry>>>();
+        auto indexOf = [indexes](const fs::path& f) -> const std::vector<streambundle::IndexEntry>& {
+            auto it = indexes->find(f);
+            if (it == indexes->end()) {
+                std::vector<streambundle::IndexEntry> idx;
+                streambundle::readIndex(f, idx);
+                it = indexes->emplace(f, std::move(idx)).first;
+            }
+            return it->second;
+        };
+        return [catalog, caffs, indexOf](const std::string& name) -> std::optional<model::TextureSource> {
+            const TextureInfo* ti = catalog ? catalog->texture(name) : nullptr;
+            if (!ti || ti->full.empty()) return std::nullopt;
+            const AssetLoc& loc = ti->full.front();
+            auto& c = (*caffs)[{loc.file, loc.entry}];
+            if (!c) {
+                if (loc.entry < 0) {
+                    Loaded l = loadAsset(loc.file);
+                    if (!l.caff) return std::nullopt;
+                    c = std::make_shared<caff::Caff>(std::move(*l.caff));
+                } else {
+                    auto& idx = indexOf(loc.file);
+                    if (size_t(loc.entry) >= idx.size()) return std::nullopt;
+                    c = std::make_shared<caff::Caff>(caff::Caff::parse(streambundle::readEntry(loc.file, idx[size_t(loc.entry)])));
+                }
+            }
+            model::TextureSource src{c, loc.symbol, std::nullopt};
+            if (!ti->tops.empty()) {
+                const AssetLoc& t = ti->tops.front();
+                auto& idx = indexOf(t.file);
+                if (size_t(t.entry) >= idx.size()) return std::nullopt;
+                src.top = streambundle::Entry{idx[size_t(t.entry)].id, streambundle::readEntry(t.file, idx[size_t(t.entry)])};
+            }
+            return src;
+        };
+    }
+
+    // Returns the stream bundle entries (streamed texture levels) the destination's stream bundle needs.
+    std::vector<streambundle::Entry> applyReplacements(caff::Caff& c, uint32_t symbol, const AssetLoc& at) {
+        std::vector<streambundle::Entry> entries;
+        if (!pendingSwap_.empty()) entries = copyFrom(c, symbol, at, pendingSwap_).streamEntries;
+        for (auto& obj : pendingObjs_) model::importObj(c, symbol, obj);
+        return entries;
+    }
+
+    // Back to what is on disk.
+    void discard() {
+        preview_.reset();
+        pendingObjs_.clear();
+        pendingSwap_.clear();
+        replaceNotes_.clear();
+        cache_ = CaffCache();
+        loadModel(cache_.get(info_.locs.front()), info_.locs.front().symbol);
+    }
+
     // Writes the edited colours into one copy of the model (`symbol` is its .data part in `c`).
     void patchColours(caff::Caff& c, uint32_t symbol) const {
         model::Model m = model::parse(c, symbol);
@@ -849,8 +1149,8 @@ private:
     }
 
 public:
-    bool dirty() const override { return !colourEdited_.empty(); }
-    bool canSave() const override { return !colourEdited_.empty(); }
+    bool dirty() const override { return !colourEdited_.empty() || !pendingObjs_.empty() || !pendingSwap_.empty(); }
+    bool canSave() const override { return dirty(); }
 
     // Every bundle holding the model gets the change (some models ship in several); "save as"
     // writes only the first.
@@ -858,27 +1158,52 @@ public:
         try {
             std::vector<AssetLoc> locs = info_.locs;
             if (saveAs) locs.resize(1);
+            int streamFiles = 0;
             for (const AssetLoc& loc : locs) {
                 fs::path target = saveAs ? *saveAs : loc.file;
                 Loaded l = loadAsset(loc.file);
                 if (loc.entry < 0) {
                     if (!l.caff) fail(toUtf8(loc.file) + " is not a bundle");
+                    auto streamed = applyReplacements(*l.caff, loc.symbol, loc);
                     patchColours(*l.caff, loc.symbol);
+                    // Copied textures' streamed levels go into the bundle's stream bundle, written first.
+                    if (!streamed.empty() && !saveAs) {
+                        fs::path sp = model::pairedStreamBundle(loc.file);
+                        Loaded sl = loadAsset(sp);
+                        if (!sl.sb) fail(toUtf8(sp) + " (the bundle's stream bundle) is missing; the copied textures need it");
+                        if (model::addStreamEntries(*sl.sb, streamed)) {
+                            app.backupBeforeWrite(sp);
+                            writeFile(sp, sl.sb->serialize());
+                            ++streamFiles;
+                        }
+                    }
                     if (!saveAs) app.backupBeforeWrite(loc.file);
                     saveCaff(target, *l.caff);
                 } else {
                     if (!l.sb || size_t(loc.entry) >= l.sb->entries.size()) fail(toUtf8(loc.file) + ": stream bundle entry missing");
                     auto& e = l.sb->entries[size_t(loc.entry)];
                     caff::Caff c = caff::Caff::parse(e.data);
+                    auto streamed = applyReplacements(c, loc.symbol, loc);
                     patchColours(c, loc.symbol);
                     e.data = c.serialize();
+                    model::addStreamEntries(*l.sb, streamed);
                     if (!saveAs) app.backupBeforeWrite(loc.file);
                     writeFile(target, l.sb->serialize());
                 }
             }
             for (size_t gi : colourEdited_) colourGroups_[gi].original = colourOf(colourGroups_[gi]);
             colourEdited_.clear();
-            app.status("Saved material colours to " + std::to_string(locs.size()) + " file(s)");
+            bool replaced = !pendingObjs_.empty() || !pendingSwap_.empty();
+            if (!saveAs) {
+                // What is on disk now matches the preview.
+                preview_.reset();
+                pendingObjs_.clear();
+                pendingSwap_.clear();
+                replaceNotes_.clear();
+                cache_ = CaffCache();
+            }
+            app.status(std::string(replaced ? "Saved the model" : "Saved material colours") + " to " + std::to_string(locs.size() + size_t(streamFiles)) +
+                       " file(s)" + (streamFiles ? " (with the textures it needs)" : ""));
             return true;
         } catch (std::exception& e) {
             app.error(std::string("save failed: ") + e.what());
@@ -890,6 +1215,13 @@ private:
     std::vector<ColourGroup> colourGroups_;
     std::set<size_t> colourEdited_;
     bool allColours_ = false;
+    // Replacements not saved yet: a model copied in, then OBJ imports, in order.
+    std::unique_ptr<caff::Caff> preview_;
+    std::string pendingSwap_;
+    std::vector<std::string> pendingObjs_;
+    std::vector<std::string> replaceNotes_;
+    std::string swapFilter_;
+    std::function<void()> deferred_; // runs at the start of the next frame
 
     ModelInfo info_;
     std::shared_ptr<const Catalog> catalog_;
@@ -908,6 +1240,7 @@ private:
     // Animation.
     std::string animPrefix_;
     std::vector<std::string> ownAnims_;
+    int fbxAnims_ = 1; // FBX export: 0 none, 1 named after the model, 2 the one playing
     std::string animFilter_, animName_, pendingName_, animError_;
     std::future<std::shared_ptr<model::Animation>> pending_;
     std::shared_ptr<model::Animation> anim_;

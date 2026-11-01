@@ -1,4 +1,5 @@
 // Bundle / CAFF and stream bundle documents.
+#include "audio_view.hpp"
 #include "docs.hpp"
 
 #include "assetdb.hpp"
@@ -533,12 +534,17 @@ private:
         commitEntry();
         selected_ = i;
         entryCaff_.reset();
-        waves_.reset();
+        hasWaves_ = false;
+        wavesView_.setBank(nullptr, "");
         view_ = CaffView{};
         const auto& e = l_.sb->entries[size_t(i)];
         try {
             if (caff::isCaff(e.data)) entryCaff_ = caff::Caff::parse(e.data);
-            else if (media::isWaveBank(e.data)) waves_ = media::parseWaveBank(e.data);
+            else if (media::isWaveBank(e.data)) {
+                auto raw = std::make_shared<const Bytes>(e.data);
+                wavesView_.setBank(std::make_shared<const media::WaveBank>(media::parseWaveBank(*raw)), hex32(e.id) + "_" + names_[size_t(i)], raw);
+                hasWaves_ = true;
+            }
         } catch (std::exception& ex) {
             entryError_ = ex.what();
         }
@@ -590,61 +596,11 @@ private:
             ctx_.onChanged = [this] { entryDirty_ = true; };
             ctx_.onStreamChanged = nullptr;
             view_.draw(app, *entryCaff_, ctx_);
-        } else if (waves_) {
-            drawWaves(app, e);
+        } else if (hasWaves_) {
+            wavesView_.draw(app);
         } else {
             if (!entryError_.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1), "%s", entryError_.c_str());
             hexView("##entryhex", e.data, ImGui::GetContentRegionAvail().y);
-        }
-    }
-
-    void drawWaves(App& app, const streambundle::Entry& e) {
-        static const char* fmts[] = {"PCM", "XMA", "ADPCM", "WMA"};
-        ImGui::SameLine();
-        if (ImGui::Button("Export bank + waves...")) {
-            Bytes data = e.data;
-            std::string base = hex32(e.id) + "_" + names_[size_t(selected_)];
-            app.openFolderDialog("Export wave bank to", [&app, data, base](const fs::path& dir) {
-                ops::exportWaveBank(data, dir, base);
-                app.status("Exported wave bank to " + toUtf8(dir));
-            });
-        }
-        ImGui::Text("Wave bank '%s', %zu waves", waves_->name.c_str(), waves_->waves.size());
-        if (ImGui::BeginTable("##waves", 6, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV)) {
-            ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, em(40));
-            ImGui::TableSetupColumn("Format", ImGuiTableColumnFlags_WidthFixed, em(60));
-            ImGui::TableSetupColumn("Channels / rate", ImGuiTableColumnFlags_WidthFixed, em(130));
-            ImGui::TableSetupColumn("Length", ImGuiTableColumnFlags_WidthFixed, em(80));
-            ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, em(80));
-            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableHeadersRow();
-            for (size_t i = 0; i < waves_->waves.size(); ++i) {
-                const auto& w = waves_->waves[i];
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                ImGui::Text("%zu", i);
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted(fmts[w.formatTag & 3]);
-                ImGui::TableNextColumn();
-                ImGui::Text("%u ch, %u Hz", w.channels, w.sampleRate);
-                ImGui::TableNextColumn();
-                ImGui::Text("%.2f s", w.sampleRate ? double(w.durationSamples) / w.sampleRate : 0.0);
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted(formatSize(w.data.size()).c_str());
-                ImGui::TableNextColumn();
-                ImGui::PushID(int(i));
-                if (ImGui::SmallButton("Export...")) {
-                    std::string ext;
-                    Bytes f = media::waveToFile(w, ext);
-                    app.saveFileDialog("Export wave", {{"Audio", ext.substr(1)}}, [&app, f](const fs::path& p) {
-                        writeFile(p, f);
-                        app.status("Exported " + toUtf8(p));
-                    }, fromUtf8(ops::safeName(w.name) + ext));
-                }
-                ImGui::PopID();
-            }
-            ImGui::EndTable();
         }
     }
 
@@ -654,7 +610,8 @@ private:
     std::string filter_;
     int selected_ = -1;
     std::optional<caff::Caff> entryCaff_;
-    std::optional<media::WaveBank> waves_;
+    bool hasWaves_ = false;
+    WaveBankView wavesView_;
     std::string entryError_;
     bool dirty_ = false, entryDirty_ = false;
     CaffContext ctx_;

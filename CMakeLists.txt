@@ -24,12 +24,22 @@ if(VCPKG_TARGET_TRIPLET MATCHES "static")
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# Linux: link the C++ runtime statically so the binaries (and the AppImage) only need the system's glibc.
+option(NUTTOOL_PORTABLE "Link libstdc++/libgcc statically (Linux)" OFF)
+
 function(nuttool_warnings target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /EHsc)
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra)
+        if(WIN32)
+            target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
+        endif()
+    endif()
+    get_target_property(type ${target} TYPE)
+    if(NUTTOOL_PORTABLE AND type STREQUAL "EXECUTABLE" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(${target} PRIVATE -static-libstdc++ -static-libgcc)
     endif()
 endfunction()
 
@@ -49,13 +59,75 @@ add_library(nutcore STATIC
     src/font.cpp
     src/media.cpp
     src/model.cpp
+    src/modelimport.cpp
     src/nbpatch.cpp
     src/ops.cpp
+    src/commands.cpp
+    src/script.cpp
+    src/fbx.cpp
+    src/audio.cpp
 )
 target_include_directories(nutcore PUBLIC src)
 nuttool_warnings(nutcore)
 
-add_executable(nuttool src/main.cpp src/commands.cpp)
+# Lua scripting (vcpkg port "lua" with feature "cpp": Lua compiled as C++, so errors unwind).
+find_package(unofficial-lua CONFIG QUIET)
+if(TARGET unofficial::lua::lua-cpp)
+    target_link_libraries(nutcore PUBLIC unofficial::lua::lua-cpp)
+    target_compile_definitions(nutcore PRIVATE NUTTOOL_LUA=1)
+else()
+    message(STATUS "Lua not found: scripting disabled")
+endif()
+
+# FFmpeg decodes the XMA audio (everywhere) and, outside Windows, the WMV movies: vcpkg's
+# FindFFMPEG wrapper, or the system's libraries via pkg-config.
+set(NUTTOOL_HAVE_FFMPEG FALSE)
+if(WIN32)
+    # vcpkg's FindFFMPEG looks the Windows SDK libraries up with find_library, which fails outside a
+    # Visual Studio prompt. Link vcpkg's static libraries directly and the SDK ones by name (from
+    # the .pc files' Libs lines).
+    find_path(NUTTOOL_FFMPEG_INCLUDE libavcodec/avcodec.h)
+    find_library(NUTTOOL_AVFORMAT avformat)
+    find_library(NUTTOOL_AVCODEC avcodec)
+    find_library(NUTTOOL_SWRESAMPLE swresample)
+    find_library(NUTTOOL_AVUTIL avutil)
+    if(NUTTOOL_FFMPEG_INCLUDE AND NUTTOOL_AVFORMAT AND NUTTOOL_AVCODEC AND NUTTOOL_SWRESAMPLE AND NUTTOOL_AVUTIL)
+        target_include_directories(nutcore PUBLIC ${NUTTOOL_FFMPEG_INCLUDE})
+        target_link_libraries(nutcore PUBLIC ${NUTTOOL_AVFORMAT} ${NUTTOOL_AVCODEC} ${NUTTOOL_SWRESAMPLE} ${NUTTOOL_AVUTIL}
+                              mfuuid ole32 strmiids user32 secur32 ncrypt crypt32 ws2_32 bcrypt)
+        set(NUTTOOL_HAVE_FFMPEG TRUE)
+    endif()
+else()
+    find_package(FFMPEG QUIET)
+endif()
+if(FFMPEG_FOUND)
+    target_include_directories(nutcore PUBLIC ${FFMPEG_INCLUDE_DIRS})
+    target_link_directories(nutcore PUBLIC ${FFMPEG_LIBRARY_DIRS})
+    set(ffmpeg_libs ${FFMPEG_LIBRARIES})
+    if(NUTTOOL_PORTABLE)
+        # libatomic is not on every system; take the static archive.
+        list(FILTER ffmpeg_libs EXCLUDE REGEX "^(-l)?atomic$")
+        list(APPEND ffmpeg_libs "-Wl,--push-state,-Bstatic" atomic "-Wl,--pop-state")
+    endif()
+    target_link_libraries(nutcore PUBLIC ${ffmpeg_libs})
+    set(NUTTOOL_HAVE_FFMPEG TRUE)
+elseif(NOT WIN32)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(LIBAV QUIET IMPORTED_TARGET libavformat libavcodec libswscale libswresample libavutil)
+        if(LIBAV_FOUND)
+            target_link_libraries(nutcore PUBLIC PkgConfig::LIBAV)
+            set(NUTTOOL_HAVE_FFMPEG TRUE)
+        endif()
+    endif()
+endif()
+if(NUTTOOL_HAVE_FFMPEG)
+    target_compile_definitions(nutcore PRIVATE NUTTOOL_FFMPEG=1)
+else()
+    message(STATUS "FFmpeg not found: XMA audio cannot be decoded")
+endif()
+
+add_executable(nuttool src/main.cpp)
 target_link_libraries(nuttool PRIVATE nutcore)
 nuttool_warnings(nuttool)
 
@@ -70,6 +142,9 @@ if(NUTTOOL_HAVE_GUI_DEPS)
         gui/doc_misc.cpp
         gui/doc_texture.cpp
         gui/doc_model.cpp
+        gui/script_window.cpp
+        gui/doc_audio.cpp
+        gui/audio_view.cpp
         gui/gl_view.cpp
         gui/video_player.cpp
     )
@@ -81,10 +156,28 @@ if(NUTTOOL_HAVE_GUI_DEPS)
     target_link_libraries(nuttool-gui PRIVATE nutcore imgui::imgui ${NUTTOOL_SDL} glad::glad)
     if(WIN32)
         # Media Foundation decodes the WMV movies.
+        target_sources(nuttool-gui PRIVATE gui/video_player_mf.cpp)
         target_link_libraries(nuttool-gui PRIVATE opengl32 mfplat mfreadwrite mfuuid shlwapi ole32)
+    else()
+        # Elsewhere FFmpeg does (linked through nutcore, see above).
+        if(NOT NUTTOOL_HAVE_FFMPEG)
+            message(FATAL_ERROR "nuttool-gui needs FFmpeg (libavformat, libavcodec, libswscale, libswresample) outside Windows")
+        endif()
+        target_sources(nuttool-gui PRIVATE gui/video_player_ffmpeg.cpp)
     endif()
     nuttool_warnings(nuttool-gui)
     message(STATUS "nuttool-gui: enabled")
 elseif(NUTTOOL_GUI)
     message(STATUS "nuttool-gui: SDL3/imgui/glad not found (configure with a CMakePresets.json preset), building the CLI only")
+endif()
+
+# `cmake --install` lays out a standard prefix; packaging/linux/build-appimage.sh turns it into an AppImage.
+include(GNUInstallDirs)
+install(TARGETS nuttool RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(NUTTOOL_HAVE_GUI_DEPS)
+    install(TARGETS nuttool-gui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        install(FILES packaging/linux/nuttool.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+        install(FILES packaging/linux/nuttool.png DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/256x256/apps)
+    endif()
 endif()

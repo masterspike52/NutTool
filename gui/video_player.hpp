@@ -1,5 +1,5 @@
-// Plays Windows Media (WMV3 + WMA) movies: Media Foundation decodes on a worker thread, frames
-// go to an OpenGL texture and sound to an SDL audio stream, paced by the audio clock.
+// Plays Windows Media (WMV3 + WMA) movies: a decoder thread (Media Foundation on Windows, FFmpeg
+// elsewhere) feeds frames to an OpenGL texture and sound to an SDL audio stream, paced by the audio clock.
 #pragma once
 
 #include "common.hpp"
@@ -49,7 +49,17 @@ private:
         double time = 0;
         std::vector<uint8_t> rgba;
     };
+    // Provided by the platform decoder (video_player_mf.cpp / video_player_ffmpeg.cpp).
+    bool openSource(); // creates impl_ from data_, sets the size, duration and audio format; error_ on failure
+    void closeSource();
+    void seekSource(double seconds);
     void worker();
+
+    // Shared by the decoders (video_player.cpp).
+    bool openAudio(); // after audioRate_/audioChannels_ are known
+    bool bufferFull();
+    void pushFrame(Frame f);
+    void pushAudio(const uint8_t* pcm, size_t bytes, double time);
     void stopWorker();
     void startWorker();
 

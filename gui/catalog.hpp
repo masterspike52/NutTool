@@ -1,4 +1,4 @@
-// Game-wide index of textures, models and UI icons, built by scanning every bundle and
+// Game-wide index of textures, models, animations, UI icons and audio, built by scanning every bundle and
 // stream bundle once (cached in the settings folder, keyed by file sizes and times).
 #pragma once
 
@@ -34,6 +34,22 @@ struct ModelInfo {
     std::vector<AssetLoc> locs;
 };
 
+// An XACT wave bank in a stream bundle (AssetLoc::symbol unused) and its waves' details.
+struct AudioWaveInfo {
+    std::string name;
+    uint8_t format = 0, channels = 0; // format: media::Wave::formatTag
+    uint32_t rate = 0, samples = 0;
+    bool loops = false;
+    double seconds() const { return rate ? double(samples) / rate : 0; }
+};
+
+struct AudioBankInfo {
+    std::string name;
+    std::vector<AssetLoc> locs;
+    std::vector<AudioWaveInfo> waves;
+    double seconds() const;
+};
+
 struct Catalog {
     std::vector<TextureInfo> textures; // sorted by name
     std::vector<ModelInfo> models;
@@ -41,10 +57,13 @@ struct Catalog {
     std::map<std::string, size_t> modelIndex;
     std::vector<ModelInfo> anims; // animations (name and locations, like models)
     std::map<std::string, size_t> animIndex;
+    std::vector<AudioBankInfo> audio; // wave banks, sorted by name
+    std::map<std::string, size_t> audioIndex;
 
     const TextureInfo* texture(const std::string& name) const;
     const ModelInfo* model(const std::string& name) const;
     const ModelInfo* anim(const std::string& name) const;
+    const AudioBankInfo* audioBank(const std::string& name) const;
 
     static std::shared_ptr<Catalog> build(const fs::path& root, const fs::path& cacheFile, const ops::Progress& progress);
 };

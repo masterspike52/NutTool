@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 namespace nut::gui {
 
@@ -52,6 +53,24 @@ int inputTextResize(ImGuiInputTextCallbackData* data) {
     }
     return 0;
 }
+
+#ifndef _WIN32
+// Linux has no single font folder: try the files common packages install, then ask fontconfig.
+fs::path findFont(std::initializer_list<const char*> candidates, const char* pattern) {
+    for (const char* c : candidates)
+        if (fs::exists(c)) return c;
+    std::string out;
+    if (FILE* p = popen((std::string("fc-match -f '%{file}' '") + pattern + "' 2>/dev/null").c_str(), "r")) {
+        char t[512];
+        while (size_t n = std::fread(t, 1, sizeof t, p)) out.append(t, n);
+        pclose(p);
+    }
+    fs::path f = fromUtf8(out);
+    std::string ext = lower(f.extension().string());
+    if ((ext == ".ttf" || ext == ".ttc" || ext == ".otf") && fs::exists(f)) return f;
+    return {};
+}
+#endif
 
 } // namespace
 
@@ -142,11 +161,22 @@ App::App(SDL_Window* window) : window_(window) {
 }
 
 App::~App() {
-    for (auto& t : tasks_) {
-        t->cancel = true;
-        if (t->thread.joinable()) t->thread.join();
-    }
+    // The window goes at once; background work stops at its next check.
+    SDL_HideWindow(window_);
+    for (auto& t : tasks_) t->cancel = true;
     saveSettings();
+    saveScriptText();
+    // Work that writes files is waited for. Read-only work can be stuck in one long read (a network
+    // or WSL drive): give it a moment, then end the process without it.
+    bool stuck = false;
+    uint64_t deadline = SDL_GetTicks() + 1500;
+    for (auto& t : tasks_) {
+        if (t->readOnly)
+            while (!t->finished && SDL_GetTicks() < deadline) SDL_Delay(10);
+        if (t->readOnly && !t->finished) stuck = true;
+        else if (t->thread.joinable()) t->thread.join();
+    }
+    if (stuck) std::_Exit(0);
     instance_ = nullptr;
 }
 
@@ -275,7 +305,7 @@ void App::buildCatalog() {
     fs::path root = root_;
     fs::path cache = settingsPath_.empty() ? fs::path() : settingsPath_.parent_path() / "catalog.json";
     indexing_ = true;
-    runTask("Indexing textures and models", false, [this, root, cache](Task& t) -> std::function<void()> {
+    runReadOnlyTask("Indexing textures and models", false, [this, root, cache](Task& t) -> std::function<void()> {
         ops::Progress pr;
         pr.log = [this](const std::string& s) { log(s); };
         pr.step = [&t](double f, const std::string& s) { t.report(f, s); };
@@ -297,7 +327,7 @@ void App::buildCatalog() {
 
 void App::addCatalogGroups() {
     groups_.erase(std::remove_if(groups_.begin(), groups_.end(),
-                                 [](const BrowserGroup& g) { return g.name == "Textures" || g.name == "UI icons" || g.name == "Models"; }),
+                                 [](const BrowserGroup& g) { return g.name == "Textures" || g.name == "UI icons" || g.name == "Models" || g.name == "Audio"; }),
                   groups_.end());
     if (!catalog_) return;
     auto strip = [](const std::string& n, std::initializer_list<const char*> prefixes) {
@@ -327,15 +357,61 @@ void App::addCatalogGroups() {
         it.lower = lower(m.name);
         models.items.push_back(std::move(it));
     }
+    // Audio: wave banks grouped by the first word of their names (ImpactsPropBigAlBox -> Impacts).
+    // Searching also finds the banks holding a matching wave.
+    BrowserGroup audio{"Audio", {}, {}};
+    {
+        static const std::map<std::string, std::string> rename = {
+            {"Ambi", "Ambience"}, {"Bolt", "Bolt-ons"}, {"Object", "Objects"}, {"Footstep", "Footsteps"}, {"Engine", "Engines"},
+            {"Tyre", "Tyres"}, {"Cutscene", "Cutscenes"}, {"Impact", "Impacts"}, {"Task", "Tasks"}, {"Vocal", "Vocals"}};
+        auto category = [](const std::string& n) {
+            size_t e = 1;
+            while (e < n.size() && !std::isupper(uint8_t(n[e])) && n[e] != '_') ++e;
+            std::string c = n.substr(0, e);
+            auto it = rename.find(c);
+            return it != rename.end() ? it->second : c;
+        };
+        std::map<std::string, std::vector<BrowserItem>> byCat;
+        for (auto& b : catalog_->audio) {
+            BrowserItem it;
+            it.kind = BrowserItem::Audio;
+            it.key = b.name;
+            it.label = b.name;
+            char line[96];
+            std::snprintf(line, sizeof line, "%zu wave%s, %d:%02d", b.waves.size(), b.waves.size() == 1 ? "" : "s", int(b.seconds()) / 60,
+                          int(b.seconds()) % 60);
+            it.tooltip = b.name + "\n" + line;
+            it.lower = lower(b.name);
+            for (auto& w : b.waves) it.lower += "\n" + lower(w.name);
+            byCat[category(b.name)].push_back(std::move(it));
+        }
+        std::vector<BrowserItem> other;
+        for (auto& [c, items] : byCat) {
+            if (items.size() < 2) {
+                for (auto& it : items) other.push_back(std::move(it));
+                continue;
+            }
+            audio.children.push_back({c, std::move(items), {}});
+        }
+        if (!other.empty()) {
+            std::sort(other.begin(), other.end(), [](auto& a, auto& b) { return a.label < b.label; });
+            audio.children.push_back({"Other", std::move(other), {}});
+        }
+    }
     // Right after Bundles and Stream bundles.
     auto at = groups_.begin() + long(std::min<size_t>(2, groups_.size()));
-    groups_.insert(at, {std::move(textures), std::move(ui), std::move(models)});
+    std::vector<BrowserGroup> add;
+    add.push_back(std::move(textures));
+    add.push_back(std::move(ui));
+    add.push_back(std::move(models));
+    if (!audio.children.empty()) add.push_back(std::move(audio));
+    groups_.insert(at, std::make_move_iterator(add.begin()), std::make_move_iterator(add.end()));
 }
 
 void App::collectGlyphs() {
     // The game text uses thousands of CJK characters; only those are added to the UI font.
     fs::path root = root_;
-    runTask("Loading text glyphs", false, [this, root](Task& t) -> std::function<void()> {
+    runReadOnlyTask("Loading text glyphs", false, [this, root](Task& t) -> std::function<void()> {
         auto glyphs = std::make_shared<std::set<uint32_t>>();
         std::vector<fs::path> files;
         auto addDir = [&](const fs::path& d) {
@@ -418,13 +494,26 @@ void App::rebuildFonts() {
     cjk.BuildRanges(&cjkRanges);
     hangul.BuildRanges(&hangulRanges);
 
+#ifdef _WIN32
     const char* windir = SDL_getenv("WINDIR");
     fs::path fonts = fromUtf8(windir ? windir : "C:\\Windows") / "Fonts";
+    fs::path mainFont = fonts / "segoeui.ttf", cjkFont = fonts / "msyh.ttc", hangulFont = fonts / "malgun.ttf";
+#else
+    fs::path mainFont = findFont({"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                                  "/usr/share/fonts/google-noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                                  "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"},
+                                 "sans-serif:lang=en");
+    // Noto Sans CJK covers Chinese, Japanese and Hangul.
+    auto cjkFiles = {"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"};
+    fs::path cjkFont = cjkRanges.Size > 1 ? findFont(cjkFiles, "sans-serif:lang=zh-cn") : fs::path();
+    fs::path hangulFont = hangulRanges.Size > 1 ? findFont(cjkFiles, "sans-serif:lang=ko") : fs::path();
+#endif
     float size = std::round(16.0f * uiScale_);
     ImFontConfig cfg;
     cfg.OversampleH = 2;
     ImFont* main = nullptr;
-    if (fs::exists(fonts / "segoeui.ttf")) main = io.Fonts->AddFontFromFileTTF(toUtf8(fonts / "segoeui.ttf").c_str(), size, &cfg, baseRanges.Data);
+    if (!mainFont.empty() && fs::exists(mainFont)) main = io.Fonts->AddFontFromFileTTF(toUtf8(mainFont).c_str(), size, &cfg, baseRanges.Data);
     if (!main) {
         ImFontConfig def;
         def.SizePixels = size;
@@ -433,8 +522,9 @@ void App::rebuildFonts() {
     ImFontConfig merge;
     merge.MergeMode = true;
     merge.OversampleH = 1;
-    if (cjkRanges.Size > 1 && fs::exists(fonts / "msyh.ttc")) io.Fonts->AddFontFromFileTTF(toUtf8(fonts / "msyh.ttc").c_str(), size, &merge, cjkRanges.Data);
-    if (hangulRanges.Size > 1 && fs::exists(fonts / "malgun.ttf")) io.Fonts->AddFontFromFileTTF(toUtf8(fonts / "malgun.ttf").c_str(), size, &merge, hangulRanges.Data);
+    if (cjkRanges.Size > 1 && !cjkFont.empty() && fs::exists(cjkFont)) io.Fonts->AddFontFromFileTTF(toUtf8(cjkFont).c_str(), size, &merge, cjkRanges.Data);
+    if (hangulRanges.Size > 1 && !hangulFont.empty() && fs::exists(hangulFont))
+        io.Fonts->AddFontFromFileTTF(toUtf8(hangulFont).c_str(), size, &merge, hangulRanges.Data);
     io.Fonts->Build();
     ImGui_ImplOpenGL3_DestroyFontsTexture();
     ImGui_ImplOpenGL3_CreateFontsTexture();
@@ -491,7 +581,7 @@ void App::openDocument(const std::string& key, const std::string& label, std::fu
             return;
         }
     }
-    runTask("Opening " + label, true, [this, key, load = std::move(load)](Task&) -> std::function<void()> {
+    runReadOnlyTask("Opening " + label, true, [this, key, load = std::move(load)](Task&) -> std::function<void()> {
         auto holder = std::make_shared<std::unique_ptr<Document>>(load());
         return [this, holder, key] {
             auto& d = *holder;
@@ -528,6 +618,18 @@ void App::openWhenIndexed(const std::string& key) {
     }
     if (startsWith(key, "tex:")) openTexture(key.substr(4));
     else if (startsWith(key, "model:")) openModel(key.substr(6));
+    else if (startsWith(key, "audio:")) openAudio(key.substr(6));
+}
+
+void App::openAudio(const std::string& name, const std::string& filter) {
+    const AudioBankInfo* a = catalog_ ? catalog_->audioBank(name) : nullptr;
+    if (!a) {
+        error(indexing_ ? "Still indexing, try again in a moment" : "Wave bank not found: " + name);
+        return;
+    }
+    AudioBankInfo copy = *a;
+    fs::path root = root_;
+    openDocument("audio:" + name, name, [copy, root, filter] { return makeAudioDocument(copy, root, filter); });
 }
 
 void App::openModel(const std::string& name) {
@@ -639,10 +741,15 @@ void App::pumpDialogs() {
 
 // ---- tasks ------------------------------------------------------------------------------
 
-void App::runTask(const std::string& label, bool modal, std::function<std::function<void()>(Task&)> work) {
+void App::runReadOnlyTask(const std::string& label, bool modal, std::function<std::function<void()>(Task&)> work) {
+    runTask(label, modal, std::move(work), true);
+}
+
+void App::runTask(const std::string& label, bool modal, std::function<std::function<void()>(Task&)> work, bool readOnly) {
     auto t = std::make_unique<Task>();
     t->label = label;
     t->modal = modal;
+    t->readOnly = readOnly;
     Task* raw = t.get();
     tasks_.push_back(std::move(t));
     raw->thread = std::thread([raw, work = std::move(work)] {
@@ -720,6 +827,8 @@ void App::frame() {
     drawTasks();
     drawExtractDialog();
     drawModExport();
+    drawRestore();
+    drawScript();
     drawIdTool();
     drawAbout();
     drawCloseConfirm();
@@ -748,9 +857,13 @@ void App::drawMenu() {
     if (ImGui::BeginMenu("Tools")) {
         if (ImGui::MenuItem("Extract everything...", nullptr, false, !root_.empty())) showExtract_ = true;
         if (ImGui::MenuItem("Export mod package (.nbpatch)...", nullptr, false, !root_.empty())) showModExport_ = true;
+        if (ImGui::MenuItem("Restore original files (revert all)...", nullptr, false, !root_.empty())) {
+            showRestore_ = true;
+            restoreScanned_ = false;
+        }
         if (ImGui::MenuItem("Verify all files", nullptr, false, !root_.empty())) {
             fs::path root = root_;
-            runTask("Verifying all files", false, [this, root](Task& t) -> std::function<void()> {
+            runReadOnlyTask("Verifying all files", false, [this, root](Task& t) -> std::function<void()> {
                 ops::Progress pr;
                 pr.log = [this](const std::string& s) { log(s); };
                 pr.step = [&t](double f, const std::string& s) { t.report(f, s); };
@@ -762,6 +875,7 @@ void App::drawMenu() {
                 };
             });
         }
+        if (ImGui::MenuItem("Script (Lua)...")) showScript_ = true;
         if (ImGui::MenuItem("Asset ID calculator...")) showIdTool_ = true;
         ImGui::EndMenu();
     }
@@ -801,7 +915,7 @@ void App::drawBrowser(float) {
         ImGui::GetWindowDrawList()->AddText(ImVec2(pos.x + ImGui::GetStyle().FramePadding.x, pos.y + ImGui::GetStyle().FramePadding.y),
                                             ImGui::GetColorU32(ImGuiCol_TextDisabled), "Search assets...");
     }
-    if (indexing_) ImGui::TextDisabled("Indexing textures and models...");
+    if (indexing_) ImGui::TextDisabled("Indexing textures, models and audio...");
     ImGui::Separator();
     ImGui::BeginChild("##tree");
     for (auto& g : groups_) drawBrowserGroup(g, true);
@@ -831,13 +945,17 @@ void App::drawBrowserGroup(const BrowserGroup& g, bool topLevel) {
     while (clip.Step()) {
         for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
             const BrowserItem& it = *shown[size_t(i)];
-            std::string key = it.kind == BrowserItem::Texture ? "tex:" + it.key : it.kind == BrowserItem::Model ? "model:" + it.key : toUtf8(it.path);
+            std::string key = it.kind == BrowserItem::Texture ? "tex:" + it.key
+                              : it.kind == BrowserItem::Model ? "model:" + it.key
+                              : it.kind == BrowserItem::Audio ? "audio:" + it.key
+                                                              : toUtf8(it.path);
             bool open = false;
             for (auto& d : docs_) if (d->key == key) open = true;
             ImGui::PushID(&it);
             if (ImGui::Selectable(it.label.c_str(), open)) {
                 if (it.kind == BrowserItem::Texture) openTexture(it.key);
                 else if (it.kind == BrowserItem::Model) openModel(it.key);
+                else if (it.kind == BrowserItem::Audio) openAudio(it.key, needle.empty() || lower(it.key).find(needle) != std::string::npos ? std::string() : needle);
                 else openPath(it.path);
             }
             if (ImGui::BeginItemTooltip()) {
@@ -1052,7 +1170,7 @@ void App::drawModExport() {
     if (ImGui::Button("Find changed files")) {
         fs::path root = root_, orig = modSource_ == 1 ? fromUtf8(modOriginal_) : fs::path();
         saveSettings();
-        runTask("Looking for changed files", true, [this, root, orig](Task& t) -> std::function<void()> {
+        runReadOnlyTask("Looking for changed files", true, [this, root, orig](Task& t) -> std::function<void()> {
             ops::Progress pr;
             pr.log = [this](const std::string& s) { log(s); };
             pr.step = [&t](double f, const std::string& s) { t.report(f, s); };
@@ -1124,6 +1242,91 @@ void App::drawModExport() {
     if (trim(mod_.name).empty()) {
         ImGui::SameLine();
         ImGui::TextDisabled("Give the mod a name.");
+    }
+    ImGui::End();
+}
+
+// Puts the .bak backups back over the files saved since, undoing the edits.
+void App::drawRestore() {
+    if (!showRestore_) return;
+    ImGui::SetNextWindowSize(ImVec2(em(600), em(420)), ImGuiCond_Appearing);
+    if (!ImGui::Begin("Restore original files", &showRestore_)) {
+        ImGui::End();
+        return;
+    }
+    ImGui::TextWrapped("NutTool backs a file up as <file>.bak the first time it saves over it. Restoring copies that backup "
+                       "back, undoing every change saved to the file since. The backups are kept. Open tabs are closed "
+                       "and the assets re-indexed afterwards.");
+    ImGui::BeginDisabled(busy());
+    // Look as soon as the window opens, and again on request.
+    if (ImGui::Button("Look again") || (!restoreScanned_ && !busy())) {
+        fs::path root = root_;
+        runReadOnlyTask("Looking for edited files", true, [this, root](Task& t) -> std::function<void()> {
+            ops::Progress pr;
+            pr.log = [this](const std::string& s) { log(s); };
+            pr.step = [&t](double f, const std::string& s) { t.report(f, s); };
+            pr.cancel = &t.cancel;
+            auto found = std::make_shared<std::vector<nbpatch::Change>>(nbpatch::findChanges(root, {}, pr));
+            return [this, found] {
+                restoreChanges_ = std::move(*found);
+                restorePick_.assign(restoreChanges_.size(), 1);
+                restoreScanned_ = true;
+            };
+        });
+    }
+    ImGui::EndDisabled();
+    if (restoreScanned_) {
+        ImGui::SameLine();
+        if (restoreChanges_.empty()) ImGui::TextDisabled("No file differs from its backup.");
+        else ImGui::Text("%zu edited file(s)", restoreChanges_.size());
+    }
+    float listH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() - ImGui::GetStyle().ItemSpacing.y;
+    if (ImGui::BeginChild("##restorefiles", ImVec2(0, std::max(listH, em(60))), ImGuiChildFlags_Borders)) {
+        for (size_t i = 0; i < restoreChanges_.size(); ++i) {
+            bool on = restorePick_[i] != 0;
+            if (ImGui::Checkbox(restoreChanges_[i].path.c_str(), &on)) restorePick_[i] = on;
+        }
+    }
+    ImGui::EndChild();
+    size_t picked = size_t(std::count(restorePick_.begin(), restorePick_.end(), 1));
+    ImGui::BeginDisabled(busy() || picked == 0);
+    std::string label = "Restore " + std::to_string(picked) + " file(s)...";
+    if (ImGui::Button(label.c_str())) ImGui::OpenPopup("Restore?");
+    ImGui::EndDisabled();
+    if (ImGui::BeginPopupModal("Restore?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Undo every saved change to %zu file(s)? This cannot be undone.", picked);
+        bool anyDirty = false;
+        for (auto& d : docs_) anyDirty |= d->dirty();
+        if (anyDirty) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Unsaved changes in open tabs are discarded.");
+        if (ImGui::Button("Restore")) {
+            std::vector<nbpatch::Change> todo;
+            for (size_t i = 0; i < restoreChanges_.size(); ++i)
+                if (restorePick_[i]) todo.push_back(restoreChanges_[i]);
+            docs_.clear(); // tabs may show what is about to change
+            runTask("Restoring original files", true, [this, todo](Task& t) -> std::function<void()> {
+                int done = 0;
+                std::string failed;
+                for (size_t i = 0; i < todo.size(); ++i) {
+                    t.report(double(i) / double(todo.size()), todo[i].path);
+                    std::error_code ec;
+                    fs::copy_file(longPath(todo[i].original), longPath(todo[i].modified), fs::copy_options::overwrite_existing, ec);
+                    if (ec) failed += "\n" + todo[i].path + ": " + ec.message();
+                    else ++done;
+                }
+                return [this, done, failed] {
+                    restoreScanned_ = false;
+                    restoreChanges_.clear();
+                    restorePick_.clear();
+                    if (!failed.empty()) error("Some files were not restored:" + failed);
+                    status("Restored " + std::to_string(done) + " file(s) from their backups");
+                    buildCatalog();
+                };
+            });
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
     }
     ImGui::End();
 }

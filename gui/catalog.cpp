@@ -4,6 +4,7 @@
 #include "assetdb.hpp"
 #include "container.hpp"
 #include "json.hpp"
+#include "media.hpp"
 #include "model.hpp"
 #include "streambundle.hpp"
 #include "texture.hpp"
@@ -17,7 +18,7 @@
 namespace nut::gui {
 namespace {
 
-constexpr int kCacheVersion = 3;
+constexpr int kCacheVersion = 4;
 
 struct Found {
     struct Tex {
@@ -30,7 +31,19 @@ struct Found {
     std::vector<std::pair<std::string, AssetLoc>> models;
     std::vector<std::pair<std::string, AssetLoc>> anims;
     std::vector<uint32_t> uiIds;
+    std::vector<AudioBankInfo> audio;
 };
+
+// A wave bank's tables (`d` may stop after them: the wave data is not needed).
+void scanWaveBank(const Bytes& d, const fs::path& file, int entry, uint32_t id, Found& out) {
+    media::WaveBank wb = media::parseWaveBank(d, false);
+    AudioBankInfo b;
+    b.name = wb.name.empty() ? "wavebank_" + hex32(id) : wb.name;
+    b.locs.push_back({file, entry, 0});
+    for (auto& w : wb.waves)
+        b.waves.push_back({w.name, uint8_t(w.formatTag), uint8_t(w.channels), w.sampleRate, w.durationSamples, w.loopLength != 0});
+    out.audio.push_back(std::move(b));
+}
 
 void scanCaff(caff::Caff& c, const fs::path& file, int entry, Found& out) {
     for (auto& t : ops::findTextures(c)) {
@@ -49,7 +62,7 @@ void scanCaff(caff::Caff& c, const fs::path& file, int entry, Found& out) {
             try {
                 Bytes d = c.symbolData(i);
                 for (size_t k = 0; k + 12 <= d.size(); k += 12)
-                    if ((d[k + 8] == assetdb::kTypeTexture)) out.uiIds.push_back(be32(&d[k + 8]));
+                    if (d[k + 8] == assetdb::kTypeTexture) out.uiIds.push_back(be32(&d[k + 8]));
             } catch (...) {
             }
         }
@@ -76,6 +89,12 @@ bool scanStreamBundle(const fs::path& f, Found& out) {
         if (index[e].size < 4) continue;
         try {
             Bytes head = read(index[e], 64 * 1024);
+            if (media::isWaveBank(head)) {
+                size_t need = media::waveBankHeaderBytes(head);
+                if (need > head.size() && need <= index[e].size) head = read(index[e], need);
+                scanWaveBank(head, f, int(e), index[e].id, out);
+                continue;
+            }
             if (!caff::isCaff(head)) continue;
             size_t need = 0;
             std::optional<caff::Caff> c = caff::Caff::parsePartial(head, keep, need);
@@ -146,6 +165,13 @@ Found scanFile(const fs::path& f) {
     else if (l.sb) {
         for (size_t e = 0; e < l.sb->entries.size(); ++e) {
             const Bytes& d = l.sb->entries[e].data;
+            if (media::isWaveBank(d)) {
+                try {
+                    scanWaveBank(d, f, int(e), l.sb->entries[e].id, out);
+                } catch (...) {
+                }
+                continue;
+            }
             if (!caff::isCaff(d)) continue;
             try {
                 caff::Caff c = caff::Caff::parse(d);
@@ -175,6 +201,17 @@ const TextureInfo* Catalog::texture(const std::string& name) const {
 const ModelInfo* Catalog::model(const std::string& name) const {
     auto it = modelIndex.find(name);
     return it == modelIndex.end() ? nullptr : &models[it->second];
+}
+
+const AudioBankInfo* Catalog::audioBank(const std::string& name) const {
+    auto it = audioIndex.find(name);
+    return it == audioIndex.end() ? nullptr : &audio[it->second];
+}
+
+double AudioBankInfo::seconds() const {
+    double s = 0;
+    for (auto& w : waves) s += w.seconds();
+    return s;
 }
 
 const ModelInfo* Catalog::anim(const std::string& name) const {
@@ -207,6 +244,8 @@ std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& ca
         for (size_t i = 0; i < cat->textures.size(); ++i) cat->textureIndex[cat->textures[i].name] = i;
         for (size_t i = 0; i < cat->models.size(); ++i) cat->modelIndex[cat->models[i].name] = i;
         for (size_t i = 0; i < cat->anims.size(); ++i) cat->animIndex[cat->anims[i].name] = i;
+        std::sort(cat->audio.begin(), cat->audio.end(), [](auto& a, auto& b) { return a.name < b.name; });
+        for (size_t i = 0; i < cat->audio.size(); ++i) cat->audioIndex[cat->audio[i].name] = i;
         return cat;
     };
     auto readLoc = [&](const Json& j) { return AssetLoc{root / fromUtf8Generic(j[size_t(0)].asString()), int(j[size_t(1)].asNumber()), j[size_t(2)].asU32()}; };
@@ -235,6 +274,15 @@ std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& ca
                         for (auto& l : m["l"].items()) mi.locs.push_back(readLoc(l));
                         (std::string(key) == "models" ? cat->models : cat->anims).push_back(std::move(mi));
                     }
+                }
+                for (auto& a : j["audio"].items()) {
+                    AudioBankInfo b;
+                    b.name = a["n"].asString();
+                    for (auto& l : a["l"].items()) b.locs.push_back(readLoc(l));
+                    for (const Json& w : a["w"].items())
+                        b.waves.push_back({w[size_t(0)].asString(), uint8_t(w[size_t(1)].asU32()), uint8_t(w[size_t(2)].asU32()), w[size_t(3)].asU32(),
+                                           w[size_t(4)].asU32(), w[size_t(5)].asBool()});
+                    cat->audio.push_back(std::move(b));
                 }
                 progress.at(1.0, "loaded from cache");
                 return finish();
@@ -269,6 +317,7 @@ std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& ca
     for (auto& r : results) uiIds.insert(r.uiIds.begin(), r.uiIds.end());
     std::map<std::string, TextureInfo> texMap;
     std::map<std::string, ModelInfo> modelMap, animMap;
+    std::map<std::string, AudioBankInfo> audioMap;
     for (auto& r : results) {
         for (auto& t : r.textures) {
             bool top = endsWith(t.name, "top") && ops::fullName(t.name) != t.name;
@@ -296,10 +345,16 @@ std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& ca
             ai.name = n;
             ai.locs.push_back(loc);
         }
+        for (auto& b : r.audio) {
+            AudioBankInfo& ab = audioMap[b.name];
+            if (ab.name.empty()) ab = b;
+            else ab.locs.insert(ab.locs.end(), b.locs.begin(), b.locs.end());
+        }
     }
     for (auto& [n, t] : texMap) cat->textures.push_back(std::move(t));
     for (auto& [n, m] : modelMap) cat->models.push_back(std::move(m));
     for (auto& [n, a] : animMap) cat->anims.push_back(std::move(a));
+    for (auto& [n, a] : audioMap) cat->audio.push_back(std::move(a));
 
     // Save the cache.
     try {
@@ -337,6 +392,27 @@ std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& ca
         };
         j["models"] = named(cat->models);
         j["anims"] = named(cat->anims);
+        Json audio = Json::array();
+        for (auto& b : cat->audio) {
+            Json o = Json::object();
+            o["n"] = b.name;
+            Json l = Json::array(), w = Json::array();
+            for (auto& x : b.locs) l.push(locJson(x, root));
+            for (auto& x : b.waves) {
+                Json e = Json::array();
+                e.push(x.name);
+                e.push(uint32_t(x.format));
+                e.push(uint32_t(x.channels));
+                e.push(x.rate);
+                e.push(x.samples);
+                e.push(x.loops);
+                w.push(e);
+            }
+            o["l"] = l;
+            o["w"] = w;
+            audio.push(o);
+        }
+        j["audio"] = audio;
         if (!cacheFile.empty()) writeText(cacheFile, j.dump(0));
     } catch (std::exception& e) {
         progress.info(std::string("could not save the index cache: ") + e.what());
