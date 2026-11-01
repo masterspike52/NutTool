@@ -1,0 +1,19 @@
+{
+  "name": "nuttool",
+  "version-string": "0.2.0",
+  "description": "Read, unpack and edit Banjo-Kazooie: Nuts & Bolts assets",
+  "dependencies": [
+    {
+      "name": "sdl3",
+      "default-features": false
+    },
+    {
+      "name": "imgui",
+      "features": ["docking-experimental", "sdl3-binding", "opengl3-binding"]
+    },
+    {
+      "name": "glad",
+      "features": ["gl-api-33"]
+    }
+  ]
+}
