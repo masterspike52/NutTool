@@ -59,7 +59,7 @@ public:
             app.saveFileDialog("Export video", {{"Windows Media Video", "wmv"}}, [&app, d](const fs::path& p) {
                 writeFile(p, d);
                 app.status("Exported " + toUtf8(p));
-            }, fromUtf8(toUtf8(path.filename()) + ".wmv"));
+            }, fromUtf8(toUtf8(path.stem()) + ".wmv"));
         }
         ImGui::SameLine();
         if (ImGui::Button("Replace with...")) {

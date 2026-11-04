@@ -33,6 +33,13 @@ struct ImportReport {
 // Meshes not named in the file are left alone. Throws when the file names no mesh or does not fit.
 ImportReport importObj(caff::Caff& c, size_t symbol, const std::string& objText);
 
+// The same from a binary FBX file's mesh objects, named the same way. Skin weights on bones named
+// like the model's (exactly, or ignoring case and underscores) replace the weights copied from the
+// nearest original vertex; the fur shells FBX export adds are ignored.
+ImportReport importFbx(caff::Caff& c, size_t symbol, const Bytes& fbxFile);
+// OBJ or FBX, told apart by the file's content.
+ImportReport importMeshFile(caff::Caff& c, size_t symbol, const Bytes& file);
+
 // Where copyModel gets a texture the destination lacks: the CAFF holding it (a whole texture, or
 // the "mip" half of a split one) and, for a split texture, its streamed top level: a stream
 // bundle entry ("<name>top"), which belongs in the destination's stream bundle.

@@ -481,7 +481,9 @@ public:
         }
         ImGui::SameLine();
         if (ImGui::Button("Unpack to folder...")) {
-            app.openFolderDialog("Unpack into", [this, &app](const fs::path& dir) {
+            app.openFolderDialog("Unpack into", [this, &app](const fs::path& picked) {
+                // Into a folder named after the bundle file, unless that is the folder picked.
+                fs::path dir = path.empty() || picked.filename() == path.filename() ? picked : picked / path.filename();
                 app.runTask("Unpacking", true, [this, dir, &app](Task&) -> std::function<void()> {
                     ops::unpackCaff(*l_.caff, l_.xctd, dir);
                     return [&app, dir] { app.status("Unpacked to " + toUtf8(dir) + " (rebuild with: nuttool caff-pack)"); };
@@ -561,7 +563,8 @@ public:
         ImGui::SameLine();
         if (ImGui::Button("Unpack all...")) {
             commitEntry();
-            app.openFolderDialog("Unpack into", [this, &app](const fs::path& dir) {
+            app.openFolderDialog("Unpack into", [this, &app](const fs::path& picked) {
+                fs::path dir = path.empty() || picked.filename() == path.filename() ? picked : picked / path.filename();
                 app.runTask("Unpacking", true, [this, dir, &app](Task&) -> std::function<void()> {
                     ops::unpackStreamBundle(*l_.sb, dir);
                     return [&app, dir] { app.status("Unpacked to " + toUtf8(dir) + " (rebuild with: nuttool sb-pack)"); };

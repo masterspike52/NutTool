@@ -16,8 +16,9 @@ New to NutTool? Start with the tutorials:
 - **[Starter tutorial](docs/tutorial-starter.md)**: finding your way around, texture swaps
   and upscaling, recolouring, text, audio, and packaging a mod for reNut.
 - **[Advanced tutorial](docs/tutorial-advanced.md)**: replacing characters with other
-  game characters or your own models, split and animated textures, menus and the title
-  update, vehicle parts, game scripts, fonts, the command line, Lua and raw assets.
+  game characters or your own models, working in Blender with FBX (fur included), new
+  animations, split and animated textures, menus and the title update, vehicle parts, game
+  scripts, fonts, the command line, Lua and raw assets.
 
 ## What it handles
 
@@ -135,7 +136,9 @@ the command line, or drag one onto the window.
   - **Export FBX** writes one `.fbx`: the shown meshes skinned to the skeleton, the
     materials with their colour maps embedded at full size, and animations as takes. You
     can include every animation named after the model, only the one playing, or none.
-  - **Replace**: **Import OBJ** applies an edited export or new geometry (see
+    Furry models also get their fur (**Fur shells**, on by default), using the viewer's
+    fur length and tiling.
+  - **Replace**: **Import OBJ / FBX** applies an edited export or new geometry (see
     "Models" below), and **Replace with another model** copies any other game model into
     this one's place. Both show in the viewport straight away; **Ctrl+S** writes them into
     every bundle holding the model, and **Discard changes** goes back to what is on disk.
@@ -512,7 +515,7 @@ XMV files are ordinary WMV: `nuttool xmv-info <file> copy.wmv`.
 
 ```
 nuttool model-export assets\Bundle\4f\685374 models          # then edit the OBJ in Blender
-nuttool model-import assets\Bundle\4f\685374 banjox_actor_banjotuxedo models\edited.obj
+nuttool model-import assets\Bundle\4f\685374 banjox_actor_banjotuxedo models\edited.obj   # or edited.fbx
 nuttool model-swap assets\Bundle\4f\685374 banjox_actor_banjotuxedo assets\Bundle\4f\685374 banjox_actor_banjo
 nuttool model-fbx assets\Bundle\4f\685374 banjox_actor_banjo banjo.fbx   # for Blender, Maya, Unity...
 ```
@@ -524,7 +527,11 @@ nuttool model-fbx assets\Bundle\4f\685374 banjox_actor_banjo banjo.fbx   # for B
 - **Meshes**: the meshes shown by default (`--all-groups` for every detail level and
   switch state), each named `group<G>_mesh<N>` like the OBJ export. Each has a skin with
   the original bone weights, normals, and one or two UV sets.
-- **Materials**: diffuse colour and specular, with the colour map embedded as PNG.
+- **Materials**: diffuse colour and specular, with the colour map embedded as PNG. A
+  material's colour gain and offset (`c:textureGain<slot>`, `c:textureOffset<slot>`, which
+  the shaders apply as texture × gain + offset) are baked into a copy of its texture
+  (`<texture>_tint<N>`), so parts that share one plain texture keep their own colours.
+  `--no-tint` (or **Material tint** off in the viewer) keeps the textures as stored.
   Textures come from the bundle and its paired stream bundle (`Bundle/50/<same name>`),
   so split textures are full size. `--no-textures` leaves them out.
 - **Animations**: the ones named after the model (`aid_anim_<model>_*`), one take each.
@@ -533,6 +540,14 @@ nuttool model-fbx assets\Bundle\4f\685374 banjox_actor_banjo banjo.fbx   # for B
   second the way the viewer plays them. Keys that linear interpolation reproduces are
   dropped, and so are channels that stay at the bone's rest transform. Rotations are XYZ
   Euler angles.
+- **Fur**: meshes that draw fur (Banjo's, for one) get one extra mesh per layer of the fur
+  volume, `group<G>_mesh<N>_fur<K>`. Each is pushed out along the surface, skinned like its
+  mesh, and has a baked PNG layer embedded in the file: the fur colour, blended from root
+  to tip, with alpha where that layer has strands. Any program shows it as an ordinary
+  alpha-tested material. `--fur-length` (percent of the model's radius, default 1.5),
+  `--fur-tiling` (default 6) and `--fur-size` (baked texture size, default 512) match the
+  viewer's sliders. `--no-fur` leaves the fur out. The game draws fur itself, so
+  `model-import` ignores these shell meshes.
 
 The GUI's **Export FBX** finds animations and textures anywhere in the game through its
 index, so it can include more than the command line, which sees only the bundles you
@@ -540,8 +555,13 @@ give it. Units are metres (the file says 1 unit = 100 cm), Y up. The file is lai
 as Blender's own exporter writes FBX. In Blender, *Automatic Bone Orientation* makes the
 bones point along the limbs.
 
-`model-import` matches OBJ objects to meshes by the `mesh<N>` in their names, as the
-export writes them (`group0_mesh13`), so keep those names. For each object:
+`model-import` takes a Wavefront OBJ or a binary FBX (7.x; text FBX files are refused,
+so export binary). It matches objects to meshes by the `mesh<N>` in their names, as the
+exports write them (`group0_mesh13`), so keep those names. FBX files are read in the
+game's space: node transforms, the file's axes and its unit scale are applied. Where an
+FBX mesh has a skin, its weights on bones named like the model's (exactly, or ignoring
+case and underscores) are written into the vertices: the four largest per vertex. Weights
+on bones the skeleton lacks are dropped and listed. For each object:
 
 - **Same vertex and triangle count** (moved, scaled or reshaped vertices, new UVs or
   normals): the mesh is edited in place. Nothing else changes, and an unedited export
@@ -549,8 +569,9 @@ export writes them (`group0_mesh13`), so keep those names. For each object:
   order (do not merge or delete vertices), and export with *Triangulated Mesh* off or on.
 - **Any other geometry**: the mesh gets new vertex and index buffers, appended to the
   model's `.gpu` part. The draw keeps its material and textures. Each new vertex takes
-  its bone weights, tangent and extra texture coordinates from the nearest original vertex
-  of that mesh, so a replacement that sits where the old part was follows the same bones.
+  its tangent and extra texture coordinates from the nearest original vertex of that
+  mesh, and its bone weights too unless the FBX gives them, so a replacement that sits
+  where the old part was follows the same bones.
   A vertex buffer holds at most 65,535 vertices (counting the old ones other draws use).
 - **An object with no faces** (just a vertex) hides the mesh.
 
@@ -586,6 +607,25 @@ same parts (Banjo's outfits) to keep those.
 **[docs/model-swaps.md](docs/model-swaps.md)** walks through a swap step by step: what
 the swap notes mean, testing in reNut, and what to do when a swapped character crashes the
 game, T-poses or looks distorted.
+
+### Animations
+
+```
+nuttool anim-import assets\Bundle\4f\685374 banjox_actor_banjo_stand docs\examples\banjo-macarena.json
+```
+
+`anim-import` gives an existing animation new motion from a JSON timeline of poses: bone
+rotations in Euler degrees and offsets in metres, eased between keys. Bones without keys
+keep the animation's own motion. The animation's length, frame count, pose and facial
+channels stay, so the game plays the new motion wherever it played the old one.
+**[docs/animation-keys.md](docs/animation-keys.md)** describes the format; the example
+replaces Banjo's idle with the Macarena.
+
+The rotation track (`QUAT_BITSTREAM`, decoded at `0x8220A6A8` / `0x829FBF00`) is
+re-encoded: per bone a mask byte per channel triple (present / constant bits), 16-bit
+bases and nibble widths, then one bit-packed record per stored frame, starting at
+`data + bases + widths` with a word-aligned stride. The new tables are appended to the
+animation's symbol and the track's pointers moved to them.
 
 How the game reads this: at load it builds each vertex and index buffer from the
 rendergraph's resource records (`0x82BC32D0`): vertex buffers `{->header, ->.gpu offset,

@@ -2,22 +2,24 @@
 
 This tutorial assumes you have done the [starter tutorial](tutorial-starter.md): you can
 open the assets, swap a texture, and package a mod. Here you'll replace characters with
-other characters from the game, bring in characters you made yourself, and use the deeper
-editors: split and animated textures, menus and the title update, vehicle parts, game
-scripts, fonts, raw assets, the command line and Lua.
+other characters from the game, bring in characters you made yourself, give characters
+new animations, and use the deeper editors: split and animated textures, menus and the
+title update, vehicle parts, game scripts, fonts, raw assets, the command line and Lua.
 
 - [1. How the game's files fit together](#1-how-the-games-files-fit-together)
 - [2. Replace a character with another one from the game](#2-replace-a-character-with-another-one-from-the-game)
 - [3. Bring your own character](#3-bring-your-own-character)
-- [4. Textures in depth](#4-textures-in-depth)
-- [5. Menus and the title update](#5-menus-and-the-title-update)
-- [6. Vehicle parts](#6-vehicle-parts)
-- [7. Game scripts](#7-game-scripts)
-- [8. Fonts](#8-fonts)
-- [9. The command line](#9-the-command-line)
-- [10. Automate with Lua](#10-automate-with-lua)
-- [11. Raw assets](#11-raw-assets)
-- [12. Mods in depth](#12-mods-in-depth)
+- [4. Work in Blender with FBX](#4-work-in-blender-with-fbx)
+- [5. Make new animations](#5-make-new-animations)
+- [6. Textures in depth](#6-textures-in-depth)
+- [7. Menus and the title update](#7-menus-and-the-title-update)
+- [8. Vehicle parts](#8-vehicle-parts)
+- [9. Game scripts](#9-game-scripts)
+- [10. Fonts](#10-fonts)
+- [11. The command line](#11-the-command-line)
+- [12. Automate with Lua](#12-automate-with-lua)
+- [13. Raw assets](#13-raw-assets)
+- [14. Mods in depth](#14-mods-in-depth)
 
 ## 1. How the game's files fit together
 
@@ -162,6 +164,24 @@ Use any 3D program. In Blender:
 7. **Export as OBJ** (*File > Export > Wavefront (.obj)*) with the same axis settings, with
    normals, and with or without UVs (see 3.5).
 
+**Or work in FBX and paint your own weights.** With OBJ, every vertex copies its bone
+weights from the nearest original vertex. With FBX you choose them yourself:
+
+1. Export the target with **Export FBX** (or `nuttool model-fbx`) and import it into
+   Blender. You get the skeleton, the meshes and the animations.
+2. Name your objects after the target's meshes as above, and parent them to the imported
+   armature (*Ctrl+P > With Automatic Weights*, then fix the weights by hand).
+3. Play the imported animations to check how it bends.
+4. Export as **FBX** (binary, the default) with the armature and your meshes selected.
+   Turn off *Add Leaf Bones*. Leaf bones aren't in the game's skeleton, so their weights
+   would be dropped.
+
+When you import the FBX, its weights are written into your vertices for every bone whose
+name matches the target's skeleton. Other bones are listed in the report and left out.
+Fur shells from an exported FBX (`..._fur1`, `..._fur2`...) are skipped, because the game
+draws fur itself. FBX keeps an object with a single vertex and no faces, so hiding meshes
+(3.4) works the same way.
+
 How to choose the mesh for each part of your model:
 
 | Part of your model | Put it into |
@@ -228,8 +248,8 @@ across the meshes' textures.
 
 ### 3.6 Import, check, save
 
-**In the GUI** (recommended): open the target's model tab, click **Import OBJ...** in the
-**Replace** section and pick your file. The view shows the result straight away.
+**In the GUI** (recommended): open the target's model tab, click **Import OBJ / FBX...** in
+the **Replace** section and pick your file. The view shows the result straight away.
 
 - **Play animations.** A part that stretches or swings the wrong way copied its weights
   from the wrong bones. Move it into a different mesh, or reshape it so it sits closer to
@@ -240,7 +260,7 @@ across the meshes' textures.
 **From the command line:**
 
 ```
-nuttool model-import <bundle> <model> my_character.obj -o <test copy>
+nuttool model-import <bundle> <model> my_character.obj -o <test copy>   # or .fbx
 ```
 
 The report lists each mesh rebuilt (new vertex and triangle counts) and how many were
@@ -278,7 +298,216 @@ unsaved import; after saving, restore the model first.
 triangle counts. NutTool then edits the mesh in place, and nothing else changes. Keep the
 vertex order in your editor for that (no merging or deleting vertices).
 
-## 4. Textures in depth
+## 4. Work in Blender with FBX
+
+FBX carries everything a 3D program needs to show a character as the game does: its
+skeleton, its skinned meshes, its textures, its animations and its fur. NutTool can also
+read FBX back in.
+
+### 4.1 Export
+
+In the model tab, click **Export FBX...**. The options:
+
+- **Animations**: every animation named after the model, only the one playing in the
+  viewer, or none. Each one becomes a take (an *action* in Blender).
+- **Fur shells** (furry characters only, on by default): adds the fur as the viewer draws it.
+  Set **Fur length** and **Tiling** in the viewer first; the export uses the same values.
+
+From the command line:
+
+```
+nuttool model-fbx <bundle> <model> out.fbx [--all-groups] [--no-anims] [--no-fur] [--fur-length 1.5] [--fur-tiling 6]
+```
+
+What's in the file:
+
+- the bones, under an empty named after the model, in their bind pose;
+- one object per mesh, named `group<G>_mesh<N>` like the OBJ export, skinned to the bones;
+- one material per colour map, with the textures **embedded** in the .fbx (no loose PNGs);
+- the fur: for each furry mesh, one extra object per fur layer, named
+  `group<G>_mesh<N>_fur<K>`. Each layer has its own texture: the fur colour, with
+  transparency where that layer has no strands.
+
+Sizes are in metres, with Y up, as the game uses them.
+
+### 4.2 Open it in Blender
+
+1. **File > Import > FBX (.fbx)**, and pick the file. The default settings are fine.
+   *Automatic Bone Orientation* makes the bones point along the limbs, which is easier to
+   pose; it doesn't change the mesh.
+2. **Textures don't show at first.** Blender opens in *Solid* view, which draws everything
+   grey. Press **Z** and choose **Material Preview** (or click the third sphere at the top
+   right of the 3D view) to see the textures. Renders use them too.
+3. **Animations** are actions. Select the armature, open the *Action Editor* (in the Dope
+   Sheet) and pick one, then press Space to play it.
+4. **Fur** shows as transparent layers in Material Preview and renders. In Blender versions
+   before 4.2, set each fur material's *Blend Mode* to *Alpha Clip* (Material properties >
+   Settings) if the layers look solid. Hide the `_fur` objects while you work on the meshes
+   under them.
+
+What looks different from the game:
+
+- **Colours match the viewer.** Many parts share one plain texture (a grey metal, say) and
+  get their colour from their material's tint, which the game's shaders multiply in. The
+  export bakes each tint into a copy of the texture (`..._tint1`, `..._tint2`), the way
+  the viewer shows it with **Material tint** on. With it off, the export keeps the textures
+  as stored.
+- **Metal and shiny parts look flat.** The FBX carries colour maps only. The game's shine
+  comes from its shaders (specular, normal maps, reflections). For renders, give those
+  materials *Metallic* about 1 and *Roughness* about 0.3.
+- **Untextured parts** (many clothes) use their material's colour, which is the same colour
+  the model tab's **Material colours** shows.
+
+### 4.3 Bring it back
+
+Click **Import OBJ / FBX...** in the model tab's **Replace** section (or
+`nuttool model-import <bundle> <model> file.fbx`). For FBX:
+
+- **Export binary FBX** (Blender's default). Text (ASCII) FBX files are refused.
+- **Keep the object names** (`group1_mesh30`): they say which mesh each object replaces,
+  exactly as with OBJ (section 3).
+- **Axes and units are converted for you**, whatever the file uses, and object transforms
+  are applied. You don't need *Apply Transform* in Blender.
+- **Skin weights are read** for bones whose names match the target's skeleton (exactly, or
+  ignoring case and underscores). This is the way to paint your own weights (3.3). Weights
+  on other bones are dropped and listed in the report, so turn off *Add Leaf Bones* when you
+  export.
+- **Fur shells are skipped.** The game draws the fur itself, from the mesh under it.
+- An object with a vertex but no faces still hides its mesh (3.4).
+
+The skeleton itself is not read back: moving, adding or renaming bones in Blender has no
+effect in game. Animations aren't read back from FBX either; the next section shows how to
+make new ones.
+
+## 5. Make new animations
+
+You can give any of the game's animations new motion. Replacing an animation keeps its
+name, so the game plays your motion wherever it played the original: replace a
+character's idle and it does your motion whenever it stands still; replace a cheer and it
+plays when the character cheers.
+
+You describe the motion in a JSON text file, a **timeline of poses**: which bones turn or
+move, and when. NutTool eases between your poses and writes the result into the
+animation. This is done from the command line:
+
+```
+nuttool anim-import <bundle> <animation> my_motion.json
+```
+
+The full format is in [animation-keys.md](animation-keys.md), and
+[examples/banjo-macarena.json](examples/banjo-macarena.json) is a complete example: a
+dance routine over a character's idle.
+
+### 5.1 Choose the animation
+
+- **Find it.** Animations are named after their character:
+  `aid_anim_<character>_<action>`, for example `..._stand`, `..._walk`, `..._cheer`. In the
+  model tab, the **Animation** list shows the character's own animations; play one to see
+  what it is and how long it lasts. `nuttool list <bundle>` lists them all.
+- **Find its file.** A character's animations usually sit in one bundle with its model
+  (`nuttool list <bundle>` shows them). If the animation is in several bundles, edit each
+  of them.
+- **Its length stays.** Your timeline runs over the animation's own length and frame rate.
+  To make a longer routine, pick a longer animation (idles are often 10 seconds or more).
+- **Loops.** Idles, walks and runs loop, so end in the pose you start with.
+
+### 5.2 Learn the skeleton
+
+- **Bone names**: the model tab's **Skeleton** tree, or the `.bones.txt` file that
+  `nuttool model-export` writes. Typical names: `BASE` (the hips and whole body), `BACK`
+  (spine), `NECK`, and per side (`LF_` left, `RT_` right) `_C` collarbone, `_S` shoulder,
+  `_E` elbow, `_W` wrist, `_H` hip, `_K` knee, `_A` ankle.
+- **The rest pose.** In `.bones.txt`, the last four numbers of a bone are its rest rotation.
+  `0 0 0 1` means none, which is the case for most of the game's characters: their rest
+  pose is a T-pose, arms straight out to the sides, and every bone's axes are the
+  model's. **+X** is the character's left, **+Y** up, **+Z** forward.
+
+### 5.3 Write poses
+
+A pose sets bones' rotations (`"rot"`, in degrees) and, for `BASE`, its offset (`"move"`, in
+metres). A rotation turns about X first, then Y, then Z. Each bone's rotation is measured
+from the rest pose and is relative to its parent bone. On a T-posed character:
+
+| To | Bone | rot |
+|---|---|---|
+| lower an arm to the side | `RT_S` / `LF_S` | `[0, 0, 80]` / `[0, 0, -80]` |
+| point an arm forward | `RT_S` / `LF_S` | `[0, 90, 0]` / `[0, -90, 0]` |
+| raise an arm straight up | `RT_S` / `LF_S` | `[0, 0, -85]` / `[0, 0, 85]` |
+| turn the palm over (arm forward) | `RT_S` / `LF_S` | `[180, 90, 0]` / `[180, -90, 0]` |
+| bend an elbow (arm out, palm down) | `RT_E` / `LF_E` | `[0, 90, 0]` / `[0, -90, 0]` |
+| lift a thigh forward | `RT_H` / `LF_H` | `[-30, 0, 0]` |
+| bend a knee | `RT_K` / `LF_K` | `[60, 0, 0]` |
+| lean or nod forward | `BACK`, `NECK` | `[20, 0, 0]` |
+| turn the head to its left | `NECK` | `[0, 30, 0]` |
+| lean to its right | `BACK` | `[0, 0, 15]` |
+| hop | `BASE` | `"move": [0, 0.15, 0]` |
+
+Combine them: the X part turns a limb about its own length (the palm), then Y and Z aim it.
+For poses where both the shoulder and the elbow bend (hands on hips, behind the head),
+expect to adjust the numbers a few times. Small changes of 10 to 20 degrees are easy to
+see in game.
+
+Also key:
+
+- **The bones above the ones you pose.** An arm hangs from the collarbone and the spine. If
+  you don't key those, they keep the original animation's movement, and your arm poses lean
+  and sway with it. Key `BACK`, `BACKA`, `BACKB` and the collarbones (`_C`) to `[0, 0, 0]`
+  for a steady upper body.
+- **The legs when you lower the body.** Moving `BASE` down without bending the knees pushes
+  the feet into the floor. Bend the hips, knees and ankles, and lower `BASE` by the height
+  that takes away (about 4 to 5 cm for a medium crouch).
+
+Bones you never key keep playing the original animation: the face, blinking, fingers, a
+backpack companion. Use `"rot": "base"` to hand a bone back to the original motion at a
+key.
+
+### 5.4 Put them on the timeline
+
+```json
+"timeline": [
+  { "time": 0.0, "pose": ["upright", "armsDown"], "hold": 0.4 },
+  { "time": 0.6, "pose": ["upright", "rightArmForward"], "hold": 0.3 },
+  { "time": 1.2, "pose": ["upright", "bothArmsForward"] }
+]
+```
+
+- **time** is when the pose is reached, and **hold** keeps it that long before easing to the
+  next one. A quick move followed by a hold reads as a dance step; keys with no hold flow
+  into each other.
+- **Each bone eases between its own keys.** A bone left out of an entry doesn't stop
+  there: it keeps easing from its previous key toward its next one. So **name every moving
+  bone in every entry** of a sequence (both arms, even when only one changes). Reusable
+  poses make that easy: list the poses for both sides in each entry.
+- Before a bone's first key and after its last it holds still.
+- Rotations take the shortest way round, so give a turn of more than 180 degrees an extra
+  key halfway.
+
+### 5.5 Import, check, repeat
+
+Always start from the original animation, so a second try doesn't build on the first:
+
+```
+nuttool anim-import <bundle>.bak <animation> my_motion.json -o <bundle>
+```
+
+(The first time, run it without `.bak` and `-o`: NutTool makes the `.bak` itself.)
+
+- The report says how many bones were keyed and how many timeline entries were used. It
+  notes any key past the animation's end.
+- **Check it in NutTool**: open the character's model tab (close and reopen it if it was
+  already open), pick the animation in the **Animation** list and play it.
+- **Check it in game**: package the mod (section 14) and load it in reNut.
+
+### 5.6 Limits
+
+- The animation's length and frame count stay. Very fast moves can fall between the
+  stored frames (many animations store 15 frames a second).
+- `move` reaches at most 1 m from a bone's rest position.
+- The skeleton stays the same: you can't add bones.
+- Facial animation channels are left as they are.
+- Motion can't be read from Blender or other programs yet; you write the timeline by hand.
+
+## 6. Textures in depth
 
 - **Split textures and stream bundles.** A texture whose name ends in `mip` has its
   full-size level in the paired stream bundle (`Bundle\50\<same name>`). The texture tab and
@@ -301,7 +530,7 @@ vertex order in your editor for that (no merging or deleting vertices).
   shimmer without them. Importing an image again rebuilds them.
 - **Cube maps and volume textures** can be viewed and exported, not imported.
 
-## 5. Menus and the title update
+## 7. Menus and the title update
 
 The menus (XUI scenes, in `aid_xuipackage_*` assets) draw many images at the image's own
 pixel size. When you enlarge a menu texture, NutTool fits every menu element that uses it so
@@ -329,7 +558,7 @@ nuttool menu-fix assets --update F:\NutTool\update
 Limit: **nine-grid** elements (stretchable panels) aren't adjusted; the log names any that
 use a resized texture. The Start button in the full button menu is one.
 
-## 6. Vehicle parts
+## 8. Vehicle parts
 
 Every garage part's settings are in an objparams asset
 (`aid_objparams_banjox_vehicleblock_*`). Open one from the **Vehicle parts** group (sorted
@@ -359,7 +588,7 @@ text files, then `nuttool objparams-import assets\Bundle\4f\685374 parts`. Any
 `aid_objparams_` asset (not just parts) opens the same way from a bundle tab, with its
 fields by offset.
 
-## 7. Game scripts
+## 9. Game scripts
 
 The **Scripts** group lists the game's scene scripts (`aid_script_`), actor goal lists
 (`aid_actorgoals_`, what characters do), script tables and state tables. A script tab shows:
@@ -388,7 +617,7 @@ Editing:
 
 Command line: `nuttool gamescript-export <bundle> <folder>` and `gamescript-import`.
 
-## 8. Fonts
+## 10. Fonts
 
 Open a font from **Fonts** to see every glyph. Select one to see it large, change its
 **Metrics** (spacing), or **Replace from PNG...**. **Export...** writes the glyph pages as
@@ -396,7 +625,7 @@ PNGs (white letters, transparency = coverage) plus `font.json`, a TrueType `.ttf
 BMFont `.fnt`. Edit the pages and **Import pages...** to bring them back. The `.ttf` and
 `.fnt` are for using the game's font elsewhere; NutTool doesn't read them back.
 
-## 9. The command line
+## 11. The command line
 
 `nuttool.exe` does everything the editor does, for batch work and scripting. `nuttool help`
 lists every command. The ones you'll use most:
@@ -409,9 +638,10 @@ nuttool extract-all assets out --png         # unpack everything
 nuttool tex-export <bundle> tex --png        # textures
 nuttool tex-import <bundle> <texture> <image> [--stream <stream bundle>]
 nuttool model-export <bundle> models [--all-groups] [--png]
-nuttool model-fbx <bundle> <model> out.fbx   # skinned, with animations, for Blender/Maya
-nuttool model-import <bundle> <model> <file.obj>
+nuttool model-fbx <bundle> <model> out.fbx   # skinned, with animations and fur, for Blender/Maya
+nuttool model-import <bundle> <model> <file.obj|file.fbx>
 nuttool model-swap <bundle> <target> <source bundle> <source>
+nuttool anim-import <bundle> <animation> <motion.json>   # new motion for an animation
 nuttool menu-fix assets [--update <dir>]
 nuttool make-nbpatch assets mymod.nbpatch --name "My mod"
 nuttool verify assets                        # can every file be read back exactly?
@@ -422,7 +652,7 @@ nuttool verify assets                        # can every file be read back exact
 - The command line changes **one file at a time**. The GUI's tabs change every copy of an
   asset, so prefer them for anything that lives in several bundles.
 
-## 10. Automate with Lua
+## 12. Automate with Lua
 
 **Tools > Script (Lua)...** opens an editor that runs Lua scripts over the game files
 (Ctrl+Enter runs). Scripts can open bundles, read and replace assets, inspect models,
@@ -439,7 +669,7 @@ end
 From the command line: `nuttool script my.lua --assets F:\game\assets`. The full
 reference and recipes are in [scripting.md](scripting.md).
 
-## 11. Raw assets
+## 13. Raw assets
 
 For assets NutTool has no editor for yet, work with the raw bytes:
 
@@ -455,14 +685,14 @@ Assets can change size; later assets move and their pointers stay valid. But poi
 *inside* an asset are listed in `caff.json` (`relocsA`): if you change an asset's
 internal layout, update those offsets too. Same-layout edits (changing values) are safe.
 
-## 12. Mods in depth
+## 14. Mods in depth
 
 - **Two ways to find your changes.** **Files that have a .bak backup** (the default) packs
   every file you saved with backups on. **Files that differ from a clean copy of the game
   folder** compares with an untouched copy instead, useful if you edited files outside
   NutTool.
 - **Title update files** go in as `update/<file>` entries, which reNut serves in place of
-  the update's own (see [5](#5-menus-and-the-title-update)).
+  the update's own (see [7](#7-menus-and-the-title-update)).
 - **Ship pairs together.** A changed bundle often has a changed stream bundle (split
   textures, model swaps). Both have backups, so both are listed; keep both ticked.
 - **Mods are tied to the original files.** Each entry records the original's checksum, and

@@ -65,6 +65,20 @@ bool inputTextMultiline(const char* label, std::string& s, const ImVec2& size, I
     return ImGui::InputTextMultiline(label, s.data(), s.capacity() + 1, size, flags | ImGuiInputTextFlags_CallbackResize, inputTextResize, &s);
 }
 
+fs::path exportName(const std::string& asset, const std::string& ext) {
+    std::string n = asset;
+    size_t slash = n.find_last_of("/\\");
+    if (slash != std::string::npos) n = n.substr(slash + 1);
+    if (startsWith(n, "aid_")) {
+        size_t type = n.find('_', 4);
+        if (type != std::string::npos) n = n.substr(type + 1);
+    }
+    for (const char* p : {"banjoxdlc_", "banjox_"})
+        if (startsWith(n, p) && n.size() > std::strlen(p)) n = n.substr(std::strlen(p));
+    n = ops::safeName(n, 150);
+    return fromUtf8(ext.empty() ? n : n + "." + ext);
+}
+
 void helpMarker(const char* text) {
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");

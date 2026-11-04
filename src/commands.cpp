@@ -1,6 +1,7 @@
 #include "commands.hpp"
 #include "script.hpp"
 
+#include "animkeys.hpp"
 #include "assetdb.hpp"
 #include "container.hpp"
 #include "audio.hpp"
@@ -439,6 +440,7 @@ int modelFbx(const Args& a) {
 
     fbx::Options opt;
     if (a.flag("--all-groups")) opt.include.assign(m.meshes.size(), true);
+    opt.tint = !a.flag("--no-tint");
 
     // Textures: whole ones and mip halves here, streamed top levels in the paired stream bundle.
     std::vector<caff::Caff> streamCaffs;
@@ -471,6 +473,26 @@ int modelFbx(const Args& a) {
                 return std::nullopt;
             }
         };
+    // Fur shells: every slice of the fur volumes and colour maps; length in percent of the model's radius, as the viewer shows it.
+    if (!a.flag("--no-fur")) {
+        opt.fur = true;
+        if (!a.opt("--fur-length").empty()) opt.furLength = std::stof(a.opt("--fur-length")) / 100;
+        if (!a.opt("--fur-tiling").empty()) opt.furTiling = std::stof(a.opt("--fur-tiling"));
+        if (!a.opt("--fur-size").empty()) opt.furSize = uint32_t(std::clamp(std::stoi(a.opt("--fur-size")), 16, 4096));
+        opt.pixels = [&](const std::string& tex) -> std::optional<std::vector<image::Rgba>> {
+            auto it = textures.find(tex);
+            if (it == textures.end()) return std::nullopt;
+            try {
+                ops::DecodedTexture d = ops::decodeTexture(it->second, streams);
+                std::vector<image::Rgba> slices;
+                for (uint32_t s = 0; s < d.levels[0].slices.size(); ++s) slices.push_back(texture::toRgba(d.header, d.levels[0], s));
+                return slices;
+            } catch (std::exception& e) {
+                print("warning: texture %s: %s\n", tex.c_str(), e.what());
+                return std::nullopt;
+            }
+        };
+    }
 
     // Animations: "aid_anim_<model>_*" in --anims <file> (default: the same bundle), or all of them with --all-anims.
     std::vector<model::Animation> anims;
@@ -503,9 +525,9 @@ int modelFbx(const Args& a) {
     Bytes data = fbx::write(m, opt, &r);
     if (out.has_parent_path()) fs::create_directories(longPath(out.parent_path()));
     writeFile(out, data);
-    print("%s: %zu meshes, %zu vertices, %zu triangles, %zu bones, %zu materials, %zu textures (%zu embedded), %zu animations -> %s (%zu KB)\n",
-          m.name.c_str(), r.meshes, r.vertices, r.triangles, r.bones, r.materials, r.textures, r.embedded, r.animations, out.string().c_str(),
-          data.size() / 1024);
+    print("%s: %zu meshes, %zu vertices, %zu triangles, %zu bones, %zu materials, %zu textures (%zu embedded), %zu animations, %zu fur shells -> %s (%zu KB)\n",
+          m.name.c_str(), r.meshes, r.vertices, r.triangles, r.bones, r.materials, r.textures, r.embedded, r.animations, r.furShells,
+          out.string().c_str(), data.size() / 1024);
     for (auto& n : r.notes) print("  note: %s\n", n.c_str());
     return 0;
 }
@@ -565,12 +587,55 @@ void editModel(const Args& a, const fs::path& p, const std::string& name, const 
 
 } // namespace
 
+// nuttool anim-import <file> <anim> <keys.json>: new keys for every copy of an animation in a bundle
+// or stream bundle (animkeys.hpp has the file format).
+int animImport(const Args& a) {
+    fs::path p = a.at(0, "file");
+    std::string name = lower(a.at(1, "animation name"));
+    std::string text = readText(a.at(2, "keys .json"));
+    Loaded l = loadAsset(p);
+    int copies = 0;
+    auto apply = [&](caff::Caff& c) {
+        for (size_t i = 0; i < c.symbols.size(); ++i) {
+            if (!model::isAnimationSymbol(c, i)) continue;
+            std::string n = lower(assetdb::baseAssetName(c.symbolName(i)));
+            if (n != name && n != "aid_anim_" + name) continue;
+            model::Animation an = model::parseAnimation(c, i);
+            model::KeysReport r;
+            std::vector<model::Key> keys = model::keysFromJson(an, text, &r);
+            model::writeAnimationKeys(c, i, keys);
+            print("%s: %zu bones keyed from %zu timeline entries, %d frames over %.2f s\n", an.name.c_str(), r.bones, r.entries, an.frames, an.duration);
+            for (auto& n2 : r.notes) print("  note: %s\n", n2.c_str());
+            ++copies;
+        }
+    };
+    if (l.caff) {
+        apply(*l.caff);
+    } else if (l.sb) {
+        for (auto& e : l.sb->entries) {
+            if (!caff::isCaff(e.data)) continue;
+            caff::Caff c = caff::Caff::parse(e.data);
+            int before = copies;
+            apply(c);
+            if (copies != before) e.data = c.serialize();
+        }
+    } else {
+        fail(p.string() + " is not a bundle or stream bundle (" + kindName(l.kind) + ")");
+    }
+    if (!copies) fail("no animation '" + a.at(1, "animation name") + "' in " + p.string());
+    fs::path out = prepareOutput(p, a.opt("-o"));
+    if (l.caff) saveCaff(out, *l.caff, a.flag("--xctd"));
+    else writeFile(out, l.sb->serialize());
+    print("wrote %s (%d cop%s of the animation)\n", out.string().c_str(), copies, copies == 1 ? "y" : "ies");
+    return 0;
+}
+
 int modelImport(const Args& a) {
     fs::path p = a.at(0, "file");
     std::string name = a.at(1, "model name");
-    std::string obj = readText(a.at(2, "OBJ file"));
+    Bytes mesh = readFile(a.at(2, "OBJ or FBX file"));
     editModel(a, p, name, [&](caff::Caff& c, size_t s) {
-        model::ImportReport r = model::importObj(c, s, obj);
+        model::ImportReport r = model::importMeshFile(c, s, mesh);
         print("%s: %d mesh(es) edited in place, %d rebuilt, %d hidden\n", c.symbolName(s).c_str(), r.edited, r.rebuilt, r.hidden);
         for (auto& n : r.notes) print("  %s\n", n.c_str());
         return std::vector<streambundle::Entry>{};
@@ -1048,18 +1113,28 @@ const std::vector<Command>& commands() {
         {"model-export", "<file> <dir> [--all-groups] [--png]",
          "Export models as OBJ + MTL with a bone list; --all-groups includes every LOD and alternative part, --png writes the file's textures",
          modelExport},
-        {"model-import", "<file> <model name> <in.obj> [-o out] [--xctd]",
-         "Apply an OBJ to a model: objects named like the export (group0_mesh3) edit that mesh in place when vertex and triangle counts match, "
-         "otherwise replace its geometry (skinning copied from the nearest original vertex); an object without faces hides the mesh",
+        {"model-import", "<file> <model name> <in.obj|in.fbx> [-o out] [--xctd]",
+         "Apply an OBJ or binary FBX to a model: objects named like the export (group0_mesh3) edit that mesh in place when vertex and "
+         "triangle counts match, otherwise replace its geometry (skinning from the FBX's weights on bones named like the model's, else "
+         "copied from the nearest original vertex); an object without faces hides the mesh",
          modelImport},
         {"model-swap", "<file> <model name> <source file> <source model> [-o out] [--stream-out out] [--xctd]",
          "Replace a model with a copy of another one (from the same or another bundle); the name stays, so the game loads it in its place. "
          "Textures it needs that the bundle lacks are copied in from the source bundle, their streamed levels into the paired stream bundle",
          modelSwap},
-        {"model-fbx", "<file> <model name> <out.fbx> [--all-groups] [--no-textures] [--no-anims] [--anims <bundle>] [--all-anims]",
-         "Export a model as FBX: meshes skinned to its skeleton, materials with embedded PNG textures, and its animations as takes "
-         "(those named after it, from the same bundle or --anims; --all-anims for every animation there)",
+        {"model-fbx",
+         "<file> <model name> <out.fbx> [--all-groups] [--no-textures] [--no-anims] [--anims <bundle>] [--all-anims] [--no-fur] "
+         "[--fur-length pct] [--fur-tiling n] [--fur-size px] [--no-tint]",
+         "Export a model as FBX: meshes skinned to its skeleton, materials with embedded PNG textures (tinted by their material's "
+         "colour gain and offset as the game draws them; --no-tint keeps them as stored), its animations as takes "
+         "(those named after it, from the same bundle or --anims; --all-anims for every animation there), and its fur as skinned "
+         "shell meshes with embedded baked alpha textures (--no-fur leaves it out; length in percent of the model's radius, default "
+         "1.5; tiling default 6; size default 512)",
          modelFbx},
+        {"anim-import", "<file> <animation name> <keys.json> [-o out] [--xctd]",
+         "Give an animation new motion from a JSON timeline of poses (bone rotations in Euler degrees, offsets in metres); bones "
+         "without keys keep its own motion, and its length and frame count stay (see docs/animation-keys.md)",
+         animImport},
         {"make-nbpatch",
          "<game dir> <out.nbpatch> --name <name> [--original <clean game dir>] [--update <title update dir>] [--version v] [--author a] "
          "[--category c] [--description d] [--id id]",
@@ -1097,7 +1172,7 @@ namespace {
 Args parseArgs(const std::vector<std::string>& argv) {
     static const std::set<std::string> valued = {"-o", "--out", "--stream", "--stream-out", "--base", "--section", "--only",
                                                 "--name", "--id", "--version", "--author", "--category", "--description", "--original", "--anims", "--filter",
-                                                "--assets", "--update"};
+                                                "--assets", "--update", "--fur-length", "--fur-tiling", "--fur-size"};
     Args a;
     for (size_t i = 1; i < argv.size(); ++i) {
         std::string s = argv[i];

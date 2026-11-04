@@ -292,6 +292,8 @@ inline float em(float v) { return v * ImGui::GetFontSize() / 16.0f; }
 void splitter(const char* id, float& width, float minWidth, float maxWidth, float height);
 void hexView(const char* id, const Bytes& data, float height);
 void helpMarker(const char* text);
+// Suggested save name for an asset: its name without "aid_<type>_" and the game prefix, plus `ext`.
+fs::path exportName(const std::string& asset, const std::string& ext);
 bool inputText(const char* label, std::string& s, ImGuiInputTextFlags flags = 0);
 bool inputTextMultiline(const char* label, std::string& s, const ImVec2& size, ImGuiInputTextFlags flags = 0);
 

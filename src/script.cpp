@@ -497,14 +497,14 @@ int f_set_colour(lua_State* L) {
     });
 }
 
-// f:import_obj(model, obj path) -> {edited, rebuilt, hidden, notes}
+// f:import_obj(model, obj or fbx path) -> {edited, rebuilt, hidden, notes}
 int f_import_obj(lua_State* L) {
     File& f = checkFile(L);
     caff::Caff& c = checkBundle(L, f);
     size_t s = modelArg(L, c, 2);
     fs::path obj = resolve(L, luaL_checkstring(L, 3));
     return guarded(L, [&] {
-        model::ImportReport r = model::importObj(c, s, readText(obj));
+        model::ImportReport r = model::importMeshFile(c, s, readFile(obj));
         f.changed = true;
         lua_createtable(L, 0, 4);
         lua_pushinteger(L, r.edited);

@@ -55,6 +55,7 @@ add_library(nutcore STATIC
     src/gamescript.cpp
     src/media.cpp
     src/model.cpp
+    src/animkeys.cpp
     src/modelimport.cpp
     src/nbpatch.cpp
     src/objparams.cpp

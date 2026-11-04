@@ -34,8 +34,11 @@ public:
         if (ImGui::Button("Find") || go) find(app);
         ImGui::SameLine();
         if (ImGui::Button("Export...")) {
-            app.openFolderDialog("Export glyph pages and font to", [this, &app](const fs::path& dir) {
+            app.openFolderDialog("Export glyph pages and font to", [this, &app](const fs::path& picked) {
+                // Into a folder named after the font, which also names the .ttf and its family.
+                fs::path dir = picked.filename() == path.stem() ? picked : picked / path.stem();
                 app.runTask("Exporting font", true, [this, dir, &app](Task&) -> std::function<void()> {
+                    fs::create_directories(dir);
                     font::exportTo(font_, dir);
                     return [&app, dir] { app.status("Exported glyph pages, font.json, font.fnt and the .ttf to " + toUtf8(dir)); };
                 });

@@ -63,6 +63,7 @@ int modelExport(const Args& a);
 int modelImport(const Args& a);
 int modelSwap(const Args& a);
 int modelFbx(const Args& a);
+int animImport(const Args& a);
 int textExport(const Args& a);
 int textImport(const Args& a);
 int gamescriptExport(const Args& a);

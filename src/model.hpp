@@ -172,4 +172,9 @@ using Key = Animation::Key;
 bool isAnimationSymbol(const caff::Caff& c, size_t symbol);
 Animation parseAnimation(const caff::Caff& c, size_t symbol);
 
+// Replaces the keys of the animation whose .data part is `symbol` (frames * bones, laid out as
+// Animation::keys). Its length, frame count, pose and other tracks stay; the rotation track's
+// tables are re-encoded and appended to the symbol, and its pointers moved to them.
+void writeAnimationKeys(caff::Caff& c, size_t symbol, const std::vector<Key>& keys);
+
 } // namespace nut::model

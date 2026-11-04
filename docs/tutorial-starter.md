@@ -211,4 +211,5 @@ game.
 | put files back | Tools > Restore original files |
 
 Next: the [advanced tutorial](tutorial-advanced.md), for replacing characters, bringing
-your own models, vehicle parts, scripts and the command line.
+your own models, working in Blender, new animations, vehicle parts, scripts and the
+command line.

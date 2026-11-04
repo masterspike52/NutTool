@@ -801,6 +801,14 @@ private:
         ImGui::RadioButton("None", &fbxAnims_, 0);
         if (fbxAnims_ == 1 && ownAnims_.empty()) fbxAnims_ = 0;
         if (fbxAnims_ == 2 && !anim_) fbxAnims_ = ownAnims_.empty() ? 0 : 1;
+        if (hasFur_) {
+            ImGui::Separator();
+            ImGui::Checkbox("Fur shells", &fbxFur_);
+            helpMarker("Adds the fur as the viewer draws it: one shell mesh per layer of the fur volume, pushed out along the "
+                       "surface by the Fur length and tiled by the Tiling set in the viewer, skinned like its mesh. Each layer "
+                       "gets a baked texture (the fur colour, with alpha = where the layer has fur), so any program shows it "
+                       "with an ordinary alpha-tested material.");
+        }
         ImGui::Separator();
         if (ImGui::Button("Save as...")) {
             ImGui::CloseCurrentPopup();
@@ -816,7 +824,7 @@ private:
             fs::path out = picked;
             if (lower(out.extension().string()) != ".fbx") out += ".fbx";
             exportFbxTo(app, out);
-        });
+        }, exportName(model_.name, "fbx"));
     }
 
     void exportFbxTo(App& app, const fs::path& out) {
@@ -831,12 +839,19 @@ private:
         if (fbxAnims_ == 2) playing = anim_;
         std::string playingName = shortAnimName(animName_, animPrefix_), prefix = animPrefix_;
         auto catalog = catalog_;
+        bool fur = hasFur_ && fbxFur_;
+        float furLength = opt_.furLength, furTiling = opt_.furTiling;
+        bool tint = opt_.tint;
         app.runTask("Exporting " + toUtf8(out.filename()), false,
-                    [&app, m, include, names, playing, playingName, prefix, catalog, out](Task& t) -> std::function<void()> {
+                    [&app, m, include, names, playing, playingName, prefix, catalog, out, fur, furLength, furTiling, tint](Task& t) -> std::function<void()> {
             CaffCache cache;
             std::vector<std::shared_ptr<model::Animation>> anims;
             fbx::Options opt;
             opt.include = include;
+            opt.fur = fur;
+            opt.tint = tint;
+            opt.furLength = furLength;
+            opt.furTiling = furTiling;
             std::vector<std::string> notes;
             for (size_t i = 0; i < names.size() && catalog; ++i) {
                 if (t.cancel) return {};
@@ -864,6 +879,20 @@ private:
                     return std::nullopt;
                 }
             };
+            // Every slice of level 0, for baking fur.
+            opt.pixels = [&](const std::string& name) -> std::optional<std::vector<image::Rgba>> {
+                const TextureInfo* ti = catalog ? catalog->texture(name) : nullptr;
+                if (!ti) return std::nullopt;
+                try {
+                    ops::DecodedTexture d = decodeCatalogTexture(*ti, cache);
+                    std::vector<image::Rgba> slices;
+                    for (uint32_t s = 0; s < d.levels[0].slices.size(); ++s) slices.push_back(texture::toRgba(d.header, d.levels[0], s));
+                    return slices;
+                } catch (std::exception& e) {
+                    notes.push_back(name + ": " + e.what());
+                    return std::nullopt;
+                }
+            };
             t.report(0.85, "Writing " + toUtf8(out.filename()));
             fbx::Report r;
             Bytes data = fbx::write(*m, opt, &r);
@@ -872,7 +901,8 @@ private:
             return [&app, r, notes, out] {
                 for (auto& n : notes) app.log("FBX export: " + n);
                 app.status("Exported " + toUtf8(out.filename()) + ": " + std::to_string(r.meshes) + " meshes, " + std::to_string(r.bones) + " bones, " +
-                           std::to_string(r.textures) + " textures, " + std::to_string(r.animations) + " animations");
+                           std::to_string(r.textures) + " textures, " + std::to_string(r.animations) + " animations" +
+                           (r.furShells ? ", " + std::to_string(r.furShells) + " fur shells" : std::string()));
             };
         });
     }
@@ -958,17 +988,18 @@ private:
     void drawReplace(App& app) {
         ImGui::SeparatorText("Replace");
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::TextWrapped("Import OBJ: objects named like the export's (group0_mesh3) edit that mesh in place when the vertex and "
-                           "triangle counts match, otherwise replace its geometry (skinning comes from the nearest original vertex); "
-                           "an object with no faces hides the mesh. Replace copies another game model into this one's place.");
+        ImGui::TextWrapped("Import OBJ / FBX: objects named like the export's (group0_mesh3) edit that mesh in place when the vertex "
+                           "and triangle counts match, otherwise replace its geometry (skinning comes from the FBX's weights on "
+                           "bones named like this model's, else from the nearest original vertex); an object with no faces hides "
+                           "the mesh. Replace copies another game model into this one's place.");
         ImGui::PopStyleColor();
         bool coloursPending = !colourEdited_.empty();
         ImGui::BeginDisabled(coloursPending);
-        if (ImGui::Button("Import OBJ...")) {
-            app.openFileDialog("Import OBJ", {{"Wavefront OBJ", "obj"}}, [this, &app](const fs::path& p) {
-                std::string text;
+        if (ImGui::Button("Import OBJ / FBX...")) {
+            app.openFileDialog("Import OBJ / FBX", {{"OBJ or FBX", "obj;fbx"}}, [this, &app](const fs::path& p) {
+                Bytes text;
                 try {
-                    text = readText(p);
+                    text = readFile(p);
                 } catch (std::exception& e) {
                     app.error(e.what());
                     return;
@@ -976,7 +1007,7 @@ private:
                 std::string name = toUtf8(p.filename());
                 deferred_ = [this, &app, name, text] {
                     bool ok = preview(app, [&](caff::Caff& c, uint32_t sym) {
-                        model::ImportReport r = model::importObj(c, sym, text);
+                        model::ImportReport r = model::importMeshFile(c, sym, text);
                         std::vector<std::string> notes{name + ": " + std::to_string(r.edited) + " mesh(es) edited, " + std::to_string(r.rebuilt) +
                                                        " rebuilt, " + std::to_string(r.hidden) + " hidden"};
                         notes.insert(notes.end(), r.notes.begin(), r.notes.end());
@@ -1025,7 +1056,7 @@ private:
             ImGui::EndPopup();
         }
         if (!pendingSwap_.empty()) ImGui::BulletText("Replaced by %s", shortModelName(pendingSwap_).c_str());
-        if (!pendingObjs_.empty()) ImGui::BulletText("%zu OBJ import(s)", pendingObjs_.size());
+        if (!pendingObjs_.empty()) ImGui::BulletText("%zu mesh import(s)", pendingObjs_.size());
         if (!replaceNotes_.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
             for (auto& n : replaceNotes_) ImGui::TextWrapped("%s", n.c_str());
@@ -1113,7 +1144,7 @@ private:
     std::vector<streambundle::Entry> applyReplacements(caff::Caff& c, uint32_t symbol, const AssetLoc& at) {
         std::vector<streambundle::Entry> entries;
         if (!pendingSwap_.empty()) entries = copyFrom(c, symbol, at, pendingSwap_).streamEntries;
-        for (auto& obj : pendingObjs_) model::importObj(c, symbol, obj);
+        for (auto& obj : pendingObjs_) model::importMeshFile(c, symbol, obj);
         return entries;
     }
 
@@ -1218,7 +1249,7 @@ private:
     // Replacements not saved yet: a model copied in, then OBJ imports, in order.
     std::unique_ptr<caff::Caff> preview_;
     std::string pendingSwap_;
-    std::vector<std::string> pendingObjs_;
+    std::vector<Bytes> pendingObjs_; // OBJ or FBX files
     std::vector<std::string> replaceNotes_;
     std::string swapFilter_;
     std::function<void()> deferred_; // runs at the start of the next frame
@@ -1241,6 +1272,7 @@ private:
     std::string animPrefix_;
     std::vector<std::string> ownAnims_;
     int fbxAnims_ = 1; // FBX export: 0 none, 1 named after the model, 2 the one playing
+    bool fbxFur_ = true;
     std::string animFilter_, animName_, pendingName_, animError_;
     std::future<std::shared_ptr<model::Animation>> pending_;
     std::shared_ptr<model::Animation> anim_;

@@ -1,6 +1,7 @@
 #include "modelimport.hpp"
 
 #include "assetdb.hpp"
+#include "fbx.hpp"
 
 #include <algorithm>
 #include <array>
@@ -105,6 +106,7 @@ struct Obj {
     std::vector<Vec3> v, vn;
     std::vector<Vec2> vt;
     std::vector<Object> objects;
+    std::vector<std::vector<std::pair<int, float>>> skin; // per v (FBX): skeleton bone and weight; may be empty
 };
 
 Obj parseObj(const std::string& text) {
@@ -191,7 +193,31 @@ struct NewVertex {
     Vec3 pos, normal;
     Vec2 uv; // as stored (OBJ v already flipped)
     bool hasUv = false;
+    std::vector<std::pair<int, float>> skin; // skeleton bone and weight; empty keeps the vertex's own
 };
+
+// Up to four bone weights, largest first, quantised to sum to 255 as the game's buffers store them.
+void writeSkin(uint8_t* p, const Layout& l, std::vector<std::pair<int, float>> skin, bool onlyChanged) {
+    std::sort(skin.begin(), skin.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (skin.size() > 4) skin.resize(4);
+    float sum = 0;
+    for (auto& s : skin) sum += std::max(0.0f, s.second);
+    if (sum <= 0) return;
+    int q[4] = {}, total = 0;
+    for (size_t k = 0; k < skin.size(); ++k) total += q[k] = int(std::lround(std::max(0.0f, skin[k].second) / sum * 255));
+    q[0] += 255 - total;
+    std::map<int, int> want, have;
+    for (size_t k = 0; k < skin.size(); ++k)
+        if (q[k] > 0) want[skin[k].first] += q[k];
+    for (int k = 0; k < 4; ++k)
+        if (int w = p[l.attributes + 8 + 3 - k]) have[be16(p + l.attributes + 2 * k)] += w;
+    if (onlyChanged && want == have) return;
+    for (int k = 0; k < 4; ++k) {
+        bool used = size_t(k) < skin.size() && q[k] > 0;
+        putBe16(p + l.attributes + 2 * k, uint16_t(used ? skin[size_t(k)].first : skin[0].first));
+        p[l.attributes + 8 + 3 - k] = uint8_t(used ? q[k] : 0);
+    }
+}
 
 // Writes position, normal and first texture coordinate into a vertex laid out as `l`, keeping every
 // other field. With `onlyChanged`, a field is left untouched when it already decodes to the value.
@@ -249,18 +275,21 @@ void encodeVertex(uint8_t* p, const Layout& l, const NewVertex& nv, bool onlyCha
             putBe16(q + 2, toHalf(nv.uv[1]));
         }
     }
+    if (l.skinned && !nv.skin.empty()) writeSkin(p, l, nv.skin, onlyChanged);
 }
 
 uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 
 } // namespace
 
-// ---- OBJ import ---------------------------------------------------------------------------------
+// ---- OBJ / FBX import ---------------------------------------------------------------------------
 
-ImportReport importObj(caff::Caff& c, size_t symbol, const std::string& objText) {
+namespace {
+
+ImportReport applyObj(caff::Caff& c, size_t symbol, const Obj& obj) {
     Model m = parse(c, symbol);
-    Obj obj = parseObj(objText);
     ImportReport rep;
+    auto skinOf = [&](size_t v) { return v < obj.skin.size() ? obj.skin[v] : std::vector<std::pair<int, float>>(); };
 
     // Objects -> meshes.
     std::map<size_t, const Obj::Object*> byMesh;
@@ -328,6 +357,7 @@ ImportReport importObj(caff::Caff& c, size_t symbol, const std::string& objText)
                 nvs[k].normal = {old.normal[0], old.normal[1], old.normal[2]};
                 nvs[k].uv = {old.uv[0], old.uv[1]};
                 nvs[k].hasUv = true;
+                nvs[k].skin = skinOf(ob->firstV + k);
             }
             // A vertex's normal: its corners' normal when they agree (exactly as written, so an
             // untouched one keeps its bytes), otherwise their normalised mean.
@@ -382,6 +412,7 @@ ImportReport importObj(caff::Caff& c, size_t symbol, const std::string& objText)
                         v.hasUv = true;
                     }
                     v.normal = cn.vn >= 0 ? obj.vn[size_t(cn.vn)] : Vec3{0, 0, 0};
+                    v.skin = skinOf(size_t(cn.v));
                     rb.verts.push_back(v);
                 }
                 rb.tris.push_back(it->second);
@@ -524,6 +555,111 @@ ImportReport importObj(caff::Caff& c, size_t symbol, const std::string& objText)
     return rep;
 }
 
+// Fur shells the FBX export adds ("group0_mesh3_fur2"): not meshes of the model.
+bool isFurShell(const std::string& name) {
+    size_t k = name.rfind("_fur");
+    if (k == std::string::npos || k + 4 == name.size()) return false;
+    for (size_t i = k + 4; i < name.size(); ++i)
+        if (name[i] < '0' || name[i] > '9') return false;
+    return true;
+}
+
+// Bone names compared ignoring case and underscores.
+std::string boneKey(const std::string& n) {
+    std::string out;
+    for (char ch : n)
+        if (ch != '_') out += char(std::tolower(uint8_t(ch)));
+    return out;
+}
+
+} // namespace
+
+ImportReport importObj(caff::Caff& c, size_t symbol, const std::string& objText) { return applyObj(c, symbol, parseObj(objText)); }
+
+ImportReport importFbx(caff::Caff& c, size_t symbol, const Bytes& file) {
+    std::vector<fbx::MeshData> meshes = fbx::readMeshes(file);
+    const Model m = parse(c, symbol);
+    std::map<std::string, int> exact, loose;
+    for (size_t i = 0; i < m.bones.size(); ++i) {
+        exact.emplace(m.bones[i].name, int(i));
+        loose.emplace(boneKey(m.bones[i].name), int(i));
+    }
+    std::set<std::string> unknownBones;
+    auto boneIndex = [&](const std::string& name) {
+        auto e = exact.find(name);
+        if (e != exact.end()) return e->second;
+        auto l = loose.find(boneKey(name));
+        return l != loose.end() ? l->second : -1;
+    };
+
+    Obj o;
+    size_t shells = 0, skinned = 0;
+    for (auto& md : meshes) {
+        if (isFurShell(md.name)) {
+            ++shells;
+            continue;
+        }
+        Obj::Object ob;
+        ob.name = md.name;
+        ob.firstV = o.v.size();
+        o.v.insert(o.v.end(), md.points.begin(), md.points.end());
+        ob.endV = o.v.size();
+        ob.vSet = !md.points.empty();
+        o.skin.resize(o.v.size());
+        bool anySkin = false;
+        for (size_t k = 0; k < md.points.size() && k < md.skin.size(); ++k)
+            for (auto& [name, w] : md.skin[k]) {
+                int b = boneIndex(name);
+                if (b < 0) {
+                    unknownBones.insert(name);
+                    continue;
+                }
+                o.skin[ob.firstV + k].push_back({b, w});
+                anySkin = true;
+            }
+        skinned += anySkin;
+        // Shared corner values become one vt / vn line, so corners of a vertex stay one vertex.
+        std::map<Vec2, int> uvAt;
+        std::map<Vec3, int> nAt;
+        for (auto& poly : md.polygons) {
+            std::vector<Obj::Corner> cs;
+            for (int k : poly) {
+                Obj::Corner cn;
+                cn.v = int(ob.firstV) + md.cornerPoint[size_t(k)];
+                if (size_t(k) < md.cornerUv.size()) {
+                    auto [it, fresh] = uvAt.emplace(md.cornerUv[size_t(k)], int(o.vt.size()));
+                    if (fresh) o.vt.push_back(md.cornerUv[size_t(k)]);
+                    cn.vt = it->second;
+                }
+                if (size_t(k) < md.cornerNormal.size()) {
+                    auto [it, fresh] = nAt.emplace(md.cornerNormal[size_t(k)], int(o.vn.size()));
+                    if (fresh) o.vn.push_back(md.cornerNormal[size_t(k)]);
+                    cn.vn = it->second;
+                }
+                cs.push_back(cn);
+            }
+            for (size_t k = 1; k + 1 < cs.size(); ++k) ob.tris.push_back({cs[0], cs[k], cs[k + 1]});
+        }
+        o.objects.push_back(std::move(ob));
+    }
+    if (o.objects.empty()) fail(shells ? "the file holds only fur shells" : "the file has no meshes");
+    ImportReport rep = applyObj(c, symbol, o);
+    if (skinned) rep.notes.push_back(std::to_string(skinned) + " mesh(es) took their skin weights from the file");
+    if (!unknownBones.empty()) {
+        std::string list;
+        size_t n = 0;
+        for (auto& b : unknownBones) list += (n++ ? ", " : "") + b;
+        rep.notes.push_back("weights on bones the model's skeleton lacks were dropped: " + list);
+    }
+    if (shells) rep.notes.push_back(std::to_string(shells) + " fur shell mesh(es) ignored (the game draws fur itself)");
+    return rep;
+}
+
+ImportReport importMeshFile(caff::Caff& c, size_t symbol, const Bytes& file) {
+    if (fbx::isFbx(file)) return importFbx(c, symbol, file);
+    return importObj(c, symbol, std::string(file.begin(), file.end()));
+}
+
 // ---- copying a model -----------------------------------------------------------------------------
 
 namespace {
@@ -662,13 +798,6 @@ std::optional<uint32_t> rendergraphIn(const Bytes& d) {
             if (rg + 0x108 <= d.size() && std::memcmp(&d[rg], "rendergraph", 11) == 0) return rg;
         }
     return std::nullopt;
-}
-
-std::string boneKey(std::string n) {
-    std::string out;
-    for (char ch : n)
-        if (ch != '_') out += char(std::tolower(uint8_t(ch)));
-    return out;
 }
 
 int sectionIndex(const caff::Caff& c, const std::string& name) {
