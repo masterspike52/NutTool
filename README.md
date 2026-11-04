@@ -11,6 +11,14 @@ It comes in two forms that share the same code:
 
 Both are Windows programs.
 
+New to NutTool? Start with the tutorials:
+
+- **[Starter tutorial](docs/tutorial-starter.md)**: finding your way around, texture swaps
+  and upscaling, recolouring, text, audio, and packaging a mod for reNut.
+- **[Advanced tutorial](docs/tutorial-advanced.md)**: replacing characters with other
+  game characters or your own models, split and animated textures, menus and the title
+  update, vehicle parts, game scripts, fonts, the command line, Lua and raw assets.
+
 ## What it handles
 
 | Location | Format | Read / unpack | Edit / repack |
