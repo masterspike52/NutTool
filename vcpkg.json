@@ -5,11 +5,7 @@
   "dependencies": [
     {
       "name": "sdl3",
-      "default-features": false,
-      "features": [
-        { "name": "x11", "platform": "linux" },
-        { "name": "wayland", "platform": "linux" }
-      ]
+      "default-features": false
     },
     {
       "name": "imgui",
@@ -24,16 +20,14 @@
       "features": ["gl-api-33"]
     },
     {
-      "name": "dbus",
-      "default-features": false,
-      "platform": "linux",
-      "$comment": "SDL3's file dialogs talk to the desktop portal over D-Bus; without this, dbus pulls in libsystemd"
+      "name": "stb",
+      "$comment": "stb_image reads JPG (and BMP, TGA, 16-bit PNG...) for texture import"
     },
     {
       "name": "ffmpeg",
       "default-features": false,
       "features": ["avcodec", "avformat", "swresample", "swscale"],
-      "$comment": "XMA audio (the game's wave banks) everywhere; on Linux also the WMV movies"
+      "$comment": "decodes the XMA audio in the game's wave banks"
     }
   ]
 }

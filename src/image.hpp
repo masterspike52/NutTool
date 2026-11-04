@@ -1,4 +1,4 @@
-// PNG and DDS file helpers.
+// Image file helpers: PNG and DDS, plus JPG and others for reading.
 #pragma once
 
 #include "common.hpp"
@@ -13,6 +13,10 @@ struct Rgba {
 
 Bytes encodePng(const Rgba& img);
 Rgba decodePng(const Bytes& file);
+// PNG, JPG, BMP, TGA, GIF (first frame), PSD (composite), told apart by their contents. Without
+// stb_image in the build, only the PNGs decodePng reads.
+Rgba decodeImage(const Bytes& file);
+bool canDecodeImages(); // whether decodeImage reads more than PNG
 
 // DDS container. `fourcc` is used for block-compressed data; otherwise the
 // RGBA bit masks describe the pixel layout (little-endian, as on PC).

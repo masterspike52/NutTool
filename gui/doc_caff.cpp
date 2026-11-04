@@ -4,6 +4,7 @@
 
 #include "assetdb.hpp"
 #include "media.hpp"
+#include "objparams.hpp"
 #include "ops.hpp"
 #include "xctd.hpp"
 
@@ -99,6 +100,8 @@ public:
         namesLower_.clear();
         texFor_ = -2;
         hexFor_ = -1;
+        refsFor_ = -2;
+        localNamesFor_ = size_t(-1);
     }
 
     void draw(App& app, caff::Caff& c, CaffContext& ctx) {
@@ -223,6 +226,8 @@ private:
             }
         }
 
+        drawScriptAndRefs(app, c, ctx, si, base, valid);
+
         // Texture preview.
         if (texFor_ != selected_) {
             texFor_ = selected_;
@@ -268,13 +273,13 @@ private:
                     }, fromUtf8(ops::safeName(tex_->name, 150) + ".dds"));
                 }
                 ImGui::SameLine();
-                bool canImport = h.kind == texture::Kind::Tex2D;
+                bool canImport = h.kind == texture::Kind::Tex2D || h.kind == texture::Kind::Array;
                 ImGui::BeginDisabled(!canImport);
                 if (ImGui::Button("Import image...")) {
                     caff::Caff* cp = &c;
                     CaffContext* cx = &ctx;
                     ops::TexRef ref = *texRef_;
-                    app.openFileDialog("Import texture image", {{"Images", "png;dds"}}, [this, &app, cp, cx, ref](const fs::path& p) {
+                    app.openFileDialog("Import texture image", {{"Images", ops::textureImagePattern()}}, [this, &app, cp, cx, ref](const fs::path& p) {
                         bool streamChanged = false;
                         std::string summary = ops::importTexture(*cp, ref, p, cx->pairedStream, &streamChanged);
                         invalidate();
@@ -284,8 +289,29 @@ private:
                     });
                 }
                 ImGui::EndDisabled();
-                helpMarker("PNG: must be the size shown above; it is compressed to the texture's format and the mip chain is regenerated.\n"
-                           "DDS: must use the same format; its data is used as-is.\nCube maps, arrays and volumes cannot be imported.");
+                helpMarker("PNG/JPG/BMP/TGA: compressed to the texture's format, and the mip chain is regenerated. An image of another "
+                           "size (a higher resolution, say) resizes the texture; for a split texture that needs the matching stream bundle.\n"
+                           "DDS: must use the same format; its data is used as-is.\nArray textures (several slices, such as the animated "
+                           "action buttons) take one image for every slice here; Bulk import takes one per slice (<name>_slice0.png, "
+                           "<name>_slice1.png...). Cube maps and volumes cannot be imported.");
+                ImGui::SameLine();
+                // Levels stored in this bundle: a split texture keeps level 1 here, a whole one level 0.
+                size_t stored = tex_->levels.size() - (tex_->merged ? 1 : 0);
+                ImGui::BeginDisabled(stored <= 1);
+                if (ImGui::Button("Remove mipmaps")) {
+                    bool changed = false;
+                    std::string summary = ops::removeMipmaps(c, *texRef_, &changed);
+                    std::string name = texRef_->name;
+                    if (changed) {
+                        invalidate();
+                        if (ctx.onChanged) ctx.onChanged();
+                    }
+                    app.status(name + ": " + summary);
+                }
+                ImGui::EndDisabled();
+                helpMarker("Drops the mip chain (the smaller copies the game shows at a distance), keeping the full-size picture as "
+                           "it is. A split texture keeps level 1 too: the game streams level 0 into it, and a split texture needs two "
+                           "levels; its stream bundle is not changed.");
                 float ph = std::max(em(160), ImGui::GetContentRegionAvail().y - em(140));
                 preview_.draw(app, h, tex_->levels, ph);
             }
@@ -302,6 +328,92 @@ private:
             hexView("##hex", hex_, std::max(em(120), ImGui::GetContentRegionAvail().y));
         }
     }
+
+    // Asset names for ids: the game-wide index once it is built, else this bundle's own symbols.
+    gamescript::NameLookup nameLookup(App& app, const caff::Caff& c) {
+        if (auto cat = app.catalog()) return [cat](uint32_t id) { return cat->nameOf(id); };
+        if (localNamesFor_ != c.symbols.size()) {
+            localNames_ = assetdb::Names();
+            for (size_t i = 0; i < c.symbols.size(); ++i) localNames_.add(c.symbolName(i));
+            localNamesFor_ = c.symbols.size();
+        }
+        return [this](uint32_t id) { return localNames_.lookup(id); };
+    }
+
+    // A game script symbol gets a text editor; every .data symbol lists the scripts and other assets it points at.
+    void drawScriptAndRefs(App& app, caff::Caff& c, CaffContext& ctx, size_t si, const std::string& base, bool valid) {
+        const auto& s = c.symbols[si];
+        bool isData = valid && c.sections[s.section - 1].name == ".data";
+        auto kind = gamescript::kindOf(base);
+        bool params = startsWith(base, "aid_objparams_");
+        // The index finishing adds names; reload then, unless that would drop edits.
+        if (refsFor_ != selected_ || (refsCatalog_ != app.catalog().get() && !(script_ && script_->modified()))) {
+            refsFor_ = selected_;
+            refsCatalog_ = app.catalog().get();
+            script_.reset();
+            scriptError_.clear();
+            usesScripts_.clear();
+            usesOther_.clear();
+            if (isData && s.size <= 4 * 1024 * 1024) {
+                Bytes d = c.symbolData(si);
+                auto names = nameLookup(app, c);
+                if (kind || (params && objparams::isObjParams(d))) {
+                    try {
+                        script_.emplace();
+                        script_->loadAsset(base, d, names);
+                    } catch (std::exception& e) {
+                        script_.reset();
+                        scriptError_ = e.what();
+                    }
+                }
+                for (uint32_t id : gamescript::referencedIds(d, names, assetdb::idFromName(base).value_or(0)))
+                    (gamescript::kindOfId(id) ? usesScripts_ : usesOther_).push_back(names(id));
+            }
+        }
+        if (!script_ && scriptError_.empty() && usesScripts_.empty() && usesOther_.empty()) return;
+        ImGui::SeparatorText(kind ? "Game script" : script_ ? "Object parameters" : "Uses");
+        if (!scriptError_.empty()) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Cannot show it as text: %s", scriptError_.c_str());
+        if (script_) {
+            ImGui::BeginDisabled(!script_->problem.empty() || !script_->modified());
+            if (ImGui::Button("Apply")) {
+                try {
+                    c.replaceSymbolData(si, script_->build(script_->text));
+                    invalidate();
+                    if (ctx.onChanged) ctx.onChanged();
+                    app.status("Applied " + base + " (save the bundle to keep it)");
+                } catch (std::exception& e) {
+                    app.error(base + ": " + e.what());
+                }
+            }
+            ImGui::EndDisabled();
+            if (auto cat = app.catalog(); cat && (cat->script(base) || cat->part(base))) {
+                ImGui::SameLine();
+                if (ImGui::Button("Open in its own tab")) app.openScript(base);
+            }
+            helpMarker(kind ? "Apply changes this bundle only (save it to keep the change). The script tab edits every bundle that holds "
+                              "this asset and shows what uses it. One record per line; # starts a comment."
+                            : "Apply changes this bundle only (save it to keep the change). One field per line, name = value; fields "
+                              "without a name go by offset, and words that are 0 are not listed (add a line such as 0x3C4 = 1.5 to set one). "
+                              "Vehicle parts have their own tabs under Vehicle parts, which edit every copy.");
+            if (script_) script_->draw("##scripttext", ImVec2(0, std::min(em(320), std::max(em(140), ImGui::GetContentRegionAvail().y * 0.5f))));
+        }
+        if (!usesScripts_.empty()) {
+            ImGui::Text("Scripts it uses (%zu)", usesScripts_.size());
+            assetList(app, "##usesscripts", usesScripts_, std::min(em(120), ImGui::GetTextLineHeightWithSpacing() * float(usesScripts_.size() + 1)));
+        }
+        if (!usesOther_.empty() && ImGui::TreeNode("##usesother", "Other assets it points at (%zu)", usesOther_.size())) {
+            assetList(app, "##usesotherlist", usesOther_, std::min(em(160), ImGui::GetTextLineHeightWithSpacing() * float(usesOther_.size() + 1)));
+            ImGui::TreePop();
+        }
+    }
+
+    int refsFor_ = -2;
+    const Catalog* refsCatalog_ = nullptr;
+    std::optional<ScriptEditor> script_;
+    std::string scriptError_;
+    std::vector<std::string> usesScripts_, usesOther_;
+    assetdb::Names localNames_;
+    size_t localNamesFor_ = size_t(-1);
 
     std::string filter_;
     bool texturesOnly_ = false;

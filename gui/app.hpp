@@ -81,7 +81,7 @@ struct Task {
 };
 
 struct BrowserItem {
-    enum Kind { File, Texture, Model, Audio };
+    enum Kind { File, Texture, Model, Audio, Script };
     std::string label;
     std::string tooltip;
     fs::path path;
@@ -114,6 +114,8 @@ public:
     void error(const std::string& msg);
     void log(const std::string& msg);
     const fs::path& assetsRoot() const { return root_; }
+    // The title update's folder (chosen in the File menu, else found beside the assets folder); empty when none.
+    fs::path updateRoot() const;
     bool makeBackups() const { return backups_; }
     // Writes a file the user is editing in place: one-time "<file>.bak" first when enabled.
     void backupBeforeWrite(const fs::path& p);
@@ -123,8 +125,12 @@ public:
     void openModel(const std::string& name);
     // A wave bank; `filter` pre-fills its wave filter.
     void openAudio(const std::string& name, const std::string& filter = {});
+    // A game script, actor goal list, script table or state table.
+    void openScript(const std::string& name);
+    // Opens whatever the catalog knows `name` as: a script, model, texture or wave bank. False when it knows none.
+    bool openAsset(const std::string& name);
     std::shared_ptr<const Catalog> catalog() const { return catalog_; }
-    // Opens a catalog item now, or as soon as indexing finishes ("tex:" / "model:" / "audio:" + name).
+    // Opens a catalog item now, or as soon as indexing finishes ("tex:" / "model:" / "audio:" / "script:" + name).
     void openWhenIndexed(const std::string& key);
     // Animation to play in the next model tab that opens (--anim on the command line).
     void setStartupAnimation(const std::string& name) { startupAnim_ = name; }
@@ -178,6 +184,8 @@ private:
     void saveDocument(Document& d, bool saveAs);
     void closeDocument(size_t i);
     void drawRestore();
+    void drawBulkImport();
+    void drawChangedMips();
     // Scripting (script_window.cpp)
     void drawScript();
     void runScript();
@@ -190,12 +198,14 @@ private:
     bool quitPending_ = false;
 
     fs::path root_;
+    fs::path updateDir_; // chosen title update folder; empty finds it beside the assets folder
     fs::path settingsPath_;
     bool backups_ = true;
     bool showLog_ = false;
     bool darkTheme_ = true;
     float browserWidth_ = 270;
     std::string browserFilter_;
+    bool browserFilterChanged_ = false; // the search text changed this frame
     std::vector<BrowserGroup> groups_;
     std::map<std::string, std::string> labels_; // file path -> friendly label
     std::shared_ptr<const Catalog> catalog_;
@@ -235,6 +245,8 @@ private:
     std::string extractOut_;
     fs::path lastDir_; // folder of the last file or folder picked in a dialog
     bool extractPng_ = false;
+    bool extractTexturesOnly_ = false, extractDds_ = false;
+    std::string extractFilter_;
     bool extractCats_[7] = {true, true, true, true, true, true, true};
     std::string idToolInput_;
     bool showModExport_ = false;
@@ -248,6 +260,9 @@ private:
     bool showRestore_ = false, restoreScanned_ = false;
     std::vector<nbpatch::Change> restoreChanges_;
     std::vector<char> restorePick_;
+    // Texture jobs over many textures
+    bool showBulkImport_ = false, showChangedMips_ = false;
+    std::string bulkFolder_;
     // Scripting: the editor text is kept in script.lua next to settings.txt.
     struct ScriptOutput {
         std::mutex m;

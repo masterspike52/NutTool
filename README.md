@@ -9,7 +9,7 @@ It comes in two forms that share the same code:
 - **`nuttool-gui`**: a desktop editor (Dear ImGui + SDL3).
 - **`nuttool`**: a command-line tool for scripting and batch work.
 
-Both build on Windows and Linux; Linux also gets an AppImage (see Building).
+Both are Windows programs.
 
 ## What it handles
 
@@ -18,11 +18,13 @@ Both build on Windows and Linux; Linux also gets an AppImage (see Building).
 | `Bundle\4f\*` | Bundles: XCTD-compressed (LZX) CAFF containers | yes, plus every asset as a separate file | yes (lossless repack, resize assets) |
 | `Bundle\50\*` | Stream bundles: archives of standalone CAFF assets and XACT wave banks | yes | yes |
 | `Debug\11\*`, `loctext\<lang>\*` | Localised string tables (CAFF + LSBL) | to UTF-8 JSON | edit, add and remove strings |
-| textures inside bundles/stream bundles | Xbox 360 tiled GPU textures (DXT1/3/5, DXN, DXT5A, 8888, A8, L8; 2D, cube, array) | to DDS / PNG, with streamed top mips merged | import DDS or PNG (mips regenerated) |
+| textures inside bundles/stream bundles | Xbox 360 tiled GPU textures (DXT1/3/5, DXN, DXT5A, 8888, A8, L8; 2D, cube, array) | to DDS / PNG, with streamed top mips merged | import DDS, PNG, JPG, BMP or TGA (mips regenerated; another size resizes the texture) |
 | `Debug\36\*` | XMV movies (plain WMV/ASF) | info, copy out as `.wmv` | replace the file |
 | wave banks in stream bundles | XACT wave banks (XMA / PCM / ADPCM) | `.xwb` plus per-wave `.xma` / `.wav` | replace a whole bank entry |
-| `xuifontcachefont\*.sbp` | XUI glyph caches (zlib, 4 bpp) | PNG pages + `font.json` | edit glyphs and metrics |
+| `xuifontcachefont\*.sbp` | XUI glyph caches (zlib, 4 bpp) | PNG pages + `font.json`, and as a font (`.ttf` + BMFont `.fnt`) | edit glyphs and metrics |
 | `xuifontcachemeta\*.ini` | font metadata (ASCII / UTF-16BE) | yes | yes |
+| game scripts inside bundles | scene scripts, actor goal lists, script and state tables | to editable text, with what uses each one | edit the text (any number of commands) |
+| objparams inside bundles | object parameters, including every vehicle part | to editable text (named fields for parts) | edit any field |
 | `Debug\db_index.txt` | asset index | resolves every name to its file | — |
 | `tile.bmp` | plain BMP | copied | any image editor |
 
@@ -32,11 +34,13 @@ reports **16,663 passed, 0 failed**.
 
 ## Building
 
-The GUI uses SDL3, Dear ImGui (docking branch, SDL3 + OpenGL 3 backends) and glad, and
-scripting uses Lua 5.5 (built as C++), and audio uses FFmpeg to decode XMA, all declared
-in `vcpkg.json` and fetched in vcpkg manifest mode. Without Lua the tools still build, but
-scripts cannot run; without FFmpeg only the few PCM waves play. You need clang, Ninja and
-the `VCPKG_ROOT` environment variable pointing at a vcpkg checkout:
+The GUI uses SDL3, Dear ImGui (docking branch, SDL3 + OpenGL 3 backends) and glad.
+Scripting uses Lua 5.5 (built as C++), audio uses FFmpeg to decode XMA, and texture import
+uses stb_image to read JPG and other images. All of them are declared in `vcpkg.json` and
+fetched in vcpkg manifest mode. Without Lua the tools still build, but scripts cannot run;
+without FFmpeg only the few PCM waves play; without stb only PNG and DDS can be imported.
+You need clang, Ninja and the `VCPKG_ROOT` environment variable pointing at a vcpkg
+checkout:
 
 ```
 cmake --preset win-release
@@ -46,41 +50,6 @@ cmake --build out/build/win-release
 This produces `out/build/win-release/nuttool-gui.exe` and `nuttool.exe`. They link
 statically (`x64-windows-static`), so there are no DLLs to ship. Use `win-debug` for a
 debug build.
-
-### Linux and the AppImage
-
-On Linux FFmpeg also plays the movies (Windows uses Media Foundation for those). vcpkg
-compiles everything from source, so you need a few tools and the X11/Wayland headers SDL3
-builds against. On Debian/Ubuntu:
-
-```
-sudo apt install build-essential cmake ninja-build git curl zip unzip tar pkg-config nasm \
-    libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev \
-    libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl-dev libdecor-0-dev \
-    libdbus-1-dev libpulse-dev libpipewire-0.3-dev
-git clone https://github.com/microsoft/vcpkg ~/vcpkg && ~/vcpkg/bootstrap-vcpkg.sh
-export VCPKG_ROOT=~/vcpkg
-```
-
-Then either build normally:
-
-```
-cmake --preset linux-release
-cmake --build --preset linux-release
-```
-
-which gives `out/build/linux-release/nuttool-gui` and `nuttool`, or build and pack an
-AppImage in one go:
-
-```
-packaging/linux/build-appimage.sh
-```
-
-That writes `out/NutTool-<version>-x86_64.AppImage`. Run it directly to start the GUI, or
-pass `--cli` first for the command-line tool (`./NutTool-0.2.0-x86_64.AppImage --cli info <file>`).
-The C++ runtime is linked statically, so the AppImage only needs the system's glibc,
-which means it runs on distributions at least as new as the one it was built on. Settings
-are kept in `~/.local/share/NutTool/NutTool/`.
 
 The first vcpkg build takes a while: FFmpeg alone is several minutes.
 
@@ -108,9 +77,12 @@ the command line, or drag one onto the window.
     `*_ui_*` textures).
   - **Models**: every model, once each.
 - **Texture tabs**: preview with mip/channel controls, the files and entries holding
-  each copy (with **Open** buttons), **Export PNG / DDS**, and **Import image**, which
-  writes the new image into every copy (bundles, stream bundle entries and the
-  streamed top level of split textures).
+  each copy (with **Open** buttons), **Export PNG / DDS**, and **Import image** (PNG,
+  JPG, BMP, TGA or DDS), which writes the new image into every copy (bundles, stream
+  bundle entries and the streamed top level of split textures). An image of another
+  size, such as a higher-resolution repaint, resizes the texture in every copy. If any
+  copy can't take it, no file is changed. **Remove mipmaps** drops the mip chain from
+  every copy (see [Removing mipmaps](#removing-mipmaps)).
 - **Model tabs**: a 3D viewer (OpenGL) with textures, material colours, fur shells,
   wireframe, the skeleton with optional bone names, and a grid.
   - **Camera**: left-drag orbits, right-drag turns the camera in place, middle-drag
@@ -163,7 +135,7 @@ the command line, or drag one onto the window.
   models and textures.
 - **Bundles**: every asset inside with a filter. Selecting one shows a hex view and
   **Export raw / Replace raw**. Selecting a texture shows a preview with mip/face/channel
-  controls and **Export PNG / Export DDS / Import image**. Streamed top levels from the
+  controls and **Export PNG / Export DDS / Import image / Remove mipmaps**. Streamed top levels from the
   matching stream bundle are merged automatically, and importing updates both files.
   There are also buttons for **Export all textures** and **Unpack to folder**.
 - **Stream bundles**: an entry list. CAFF entries open in the same asset view; wave banks
@@ -184,14 +156,28 @@ the command line, or drag one onto the window.
   languages, plus wrapped previews, add/delete string, and JSON import/export.
   CJK text uses the system fonts (Microsoft YaHei, Malgun Gothic).
 - **Fonts**: a grid of every glyph. Select one to see it large, edit its metrics, or
-  replace it from a PNG. Glyph pages can be exported and imported.
-- **Videos**: a player (Media Foundation on Windows, FFmpeg on Linux, decodes the WMV3 video and WMA audio)
-  with play/pause (Space or click the picture), seeking, volume and loop, plus
-  export/replace.
+  replace it from a PNG. Glyph pages can be exported and imported; the export also
+  writes the font as a `.ttf` and a BMFont `.fnt`.
+- **Scripts** (once indexing is done): every scene script, actor goal list, script table
+  and state table in the game, by kind. Searching also matches the assets that use them.
+  A script tab shows its text in an editor, the assets it points at (*Uses*) and the
+  assets that point at it (*Used by*); click a name to open it. *Save to every copy*
+  writes each bundle that holds it. In a bundle tab, a script symbol shows the same
+  editor (*Apply* changes that bundle only), and every symbol lists the scripts it uses.
+- **Vehicle parts** (once indexing is done): all 153 parts, by category (wheels, weapon,
+  propulsion...). A part's tab shows its objparams as named fields (mass, health, shop
+  ratings, model, animations...) in an editor; *Save to every copy* writes each bundle
+  that holds it. Any `aid_objparams_` symbol in a bundle tab shows the same editor.
+- **Videos**: a player (Media Foundation decodes the WMV3 video and WMA audio) with
+  play/pause (Space or click the picture), seeking, volume and loop, plus export/replace.
 - **Font metadata, tile.bmp, asset index**: a text editor, an image view, and a
   searchable index (double-click opens the file).
-- **Tools**: *Extract everything* (with progress and cancel), *Export mod package* (a
-  `.nbpatch` of your edits for reNut, see below), *Restore original files* (puts each
+- **Tools**: *Extract everything* (with progress and cancel; **Textures only** writes
+  just the textures as PNG into one folder, and **Only names containing** keeps only what
+  is named with some text, such as `ui_`), *Export mod package* (a
+  `.nbpatch` of your edits for reNut, see below), *Bulk import textures* and *Remove
+  mipmaps from changed textures* (see [Bulk texture jobs](#bulk-texture-jobs)), *Fit menus
+  to resized textures* (see [Resized menu textures](#resized-menu-textures)), *Restore original files* (puts each
   file's `.bak` back, undoing everything saved to it; pick which files), *Verify all
   files*, *Script (Lua)* (see "Scripting" below), and an *Asset ID calculator*.
 
@@ -199,6 +185,12 @@ Edited documents are marked in their tab. **Ctrl+S** saves, writing a plain
 (uncompressed) file and keeping a one-time `.bak` of the original; the backup can be
 turned off in the File menu. **View > UI size** (or Ctrl+= / Ctrl+-) scales the
 interface. Settings live in `%APPDATA%\NutTool\NutTool`.
+
+**File > Title update folder** picks the title update's files (the `4f...` bundles,
+`db_index.txt` and `default.xexp` that a title update adds); by default NutTool looks for
+an `update` folder beside the assets folder. Its bundles show under **Title update**, are
+indexed with the game's (textures, scripts, menus), and are included by *Fit menus to
+resized textures*, *Remove mipmaps from changed textures* and *Restore original files*.
 
 Command-line arguments: a folder or file to open, plus `--model <name>` and
 `--texture <name>` (full `aid_` names), which open those tabs once indexing finishes.
@@ -214,6 +206,8 @@ nuttool info assets\Bundle\4f\01ca49            # what is this file?
 nuttool list assets\Bundle\4f\01ca49            # every asset inside it
 nuttool index assets                            # every named asset and where it lives
 nuttool extract-all assets out --png            # unpack everything
+nuttool extract-all assets tex --textures-only  # just the textures, as PNG in tex\textures
+nuttool extract-all assets ui --filter ui_      # only what is named with "ui_"
 nuttool model-export assets\Bundle\4f\0a04d0 models   # models as OBJ + MTL + bone list
 ```
 
@@ -245,7 +239,7 @@ Use `--prune` to delete strings that are missing from the JSON. Markup such as
 
 ```
 nuttool tex-export assets\Bundle\4f\01ca49 tex --stream assets\Bundle\50\01ca49 --png
-# edit tex\<name>.png (same size)
+# edit tex\<name>.png, or paint a higher-resolution version (PNG or JPG)
 nuttool tex-import assets\Bundle\4f\01ca49 jinjo_body_0x0332d095 tex\<name>.png --stream assets\Bundle\50\01ca49
 ```
 
@@ -256,7 +250,118 @@ stream bundle and the remaining mips to the bundle.
 
 - **DDS input** must use the texture's format (the tool tells you which one). Its
   data is used as-is, so a DDS round trip is lossless.
-- **PNG input** is compressed by the tool and the mip chain is regenerated.
+- **PNG, JPG, BMP or TGA input** is compressed to the texture's format by the tool and
+  the mip chain is regenerated. JPG has no transparency, so use PNG for textures with
+  alpha.
+- **A different size resizes the texture.** Import a 1024x1024 image over a 512x512
+  texture and it becomes 1024x1024, with one more mip level, so its smallest mips stay
+  as small as before. The format stays the same, and the model's UVs need no change.
+  - Only 2D textures can be resized (not cube maps, arrays or volumes), up to 8192x8192.
+  - A split texture changes size only together with its streamed top level, so pass
+    `--stream`. The GUI finds the stream bundle itself.
+  - Larger textures use more memory in game. A 2048x2048 DXT1 texture is 2.7 MB with its
+    mips, four times a 1024x1024 one. Raising a few character or prop textures is fine;
+    raising a whole level's textures may not fit in the Xbox 360's memory.
+  - The resized textures match the layout of the game's own textures of that size, but
+    larger textures have not been tested in game yet.
+  - Menu textures (button icons and such) need their menus fitted too; see
+    [Resized menu textures](#resized-menu-textures).
+
+#### Resized menu textures
+
+The menus (XUI scenes in the `aid_xuipackage_*` assets) draw many textures at the
+texture's own pixel size inside a fixed box. A button icon resized from 64x64 to 256x256
+then shows only its top-left corner, cropped. NutTool fixes the menus to match:
+
+- An image element whose box is the texture's original size is set to stretch the
+  texture over its box.
+- A shape with a texture fill (the A/B/X/Y buttons are these) gets a fill scale (and,
+  for fills not centred on their box, an offset) that covers the box with the whole
+  texture again.
+
+So a sharper, larger icon shows at the same size on screen. In the GUI this happens
+after any import that changes a texture's size, from a texture tab or **Bulk import
+textures**. **Tools > Fit menus to resized textures** runs it by hand, for textures
+resized earlier or after restoring files. From the command line:
+
+```
+nuttool menu-fix assets                          # finds the bundles with menus (reads them all)
+nuttool menu-fix assets assets\Bundle\4f\685374  # only this bundle
+nuttool menu-fix assets --update F:\renut2\update  # with the title update somewhere else
+```
+
+- **Title update**: TU3 brings menus of its own (`aid_xuipackage_banjoxdlc_tu15`,
+  `_skins`, `_mp`, `_ingame` in `aid_bundle_banjoxdlc_titleupdatecommon`, the update's
+  `4f3ef5f9`), and a game running TU3 draws the front end and button legends from them.
+  Their buttons crop too unless they are fixed. NutTool fixes them along with the rest:
+  the title update folder is found beside the assets folder (`<assets>\..\update`, files
+  named like `4f3ef5f9`), or given with `--update` (in the GUI: **File > Title update
+  folder**). The update's bundles also show in the GUI under **Title update** and are
+  indexed with the rest. Mod packages (`make-nbpatch`, *Export mod package*) take the
+  update's edited files too, as `update/<file>` entries, which reNut serves as `UPDATE:`
+  files.
+- Textures are compared with their `.bak` backups, so keep backups on.
+- Each menu is rebuilt from its own backup each time, so running it twice changes
+  nothing, and a texture put back to its original size gets its original menus back.
+- Nine-grids and other elements are not adjusted. The log names any that use a resized
+  texture.
+- The changes follow the game's own drawing code, but they have not been tested in game yet.
+
+#### Removing mipmaps
+
+Mipmaps are the smaller copies of a texture (half size, quarter size...) that the game
+shows on distant surfaces. **Remove mipmaps** in a texture tab (every copy, saved at once)
+or a bundle view (saved with Ctrl+S), or from the command line:
+
+```
+nuttool tex-remove-mips assets\Bundle\4f\01ca49 particles_spanglewhite
+```
+
+- The full-size picture is kept byte for byte; nothing is recompressed.
+- A **split texture** keeps level 1 as well. The game streams level 0 into a split
+  texture from the stream bundle, and a split texture needs at least two levels, so its
+  bundle half keeps level 1 and the stream bundle is not changed. The game never ships a
+  split texture with only two levels, so this case has not been tested in game.
+- Without mipmaps, distant surfaces can shimmer, and the game reads the full-size
+  texture even where it is tiny on screen. Mipmaps cost a third more memory, so removing
+  them saves that.
+- To put mipmaps back, import an image (PNG, JPG...) of the texture: import always
+  builds a fresh mip chain. Or restore the file from its `.bak`.
+
+#### Bulk texture jobs
+
+**Tools > Bulk import textures** imports a whole folder of images at once. Each image
+goes into the texture it is named after, as **Export PNG** and *Extract everything* name
+them (`aid_texture_banjox_particles_spanglewhite.png`), in every copy of that texture,
+the same way **Import image** does (including resizing).
+
+- Only images directly in the folder are read, not subfolders.
+- Images identical to their texture are skipped. Export every texture into a folder, edit a
+  few, and bulk import the folder: only the edited ones change. Unedited exports are not
+  recompressed.
+- Images named after no texture are ignored (an upscaler's renamed output, such as
+  `name-gigapixel-4x.png`, is among these: rename it back).
+- **Array textures** hold several slices, such as the two animation frames of each action
+  button (`aid_texture_banjox_ui_buttons_actionbuttons_*`). They export as `<name>_slice0.png`,
+  `<name>_slice1.png`..., and bulk import takes those names back, one image per slice, at any
+  size as long as all slices match. A slice without its own image repeats slice 0, and so does
+  every slice of an image named after the texture itself (its animation then stands still);
+  the log says when. Slices must be PNG (or another image), not DDS. Cube faces and volume
+  slices cannot be imported.
+- Two images for the same texture (a `.png` and a `.jpg`, say) are both skipped, since it
+  is not clear which one you meant.
+- Each texture is all or nothing across its copies. A texture that fails (a DDS in the
+  wrong format, say) is listed in the log, and the others are still imported.
+- Changed files are saved with a `.bak` backup, and open tabs are closed first.
+
+**Tools > Remove mipmaps from changed textures** removes the mipmaps (as above) of every
+texture you have changed: those that differ from their file's `.bak` backup. The other
+textures in those files are left alone. From the command line:
+
+```
+nuttool tex-remove-mips-changed assets
+nuttool tex-remove-mips-changed assets --original D:\clean\assets   # compare with a clean copy instead
+```
 
 ### Any asset inside a bundle
 
@@ -296,6 +401,96 @@ nuttool font-import euro euro_new.sbp --base assets\xuifontcachefont\euro.sbp
 
 `--base` points at the original file so that unchanged glyphs keep their original
 compressed data. Copy `euro_new.sbp` over the original when you are done.
+
+The export also writes the font itself, ready to install or load elsewhere:
+
+- `euro\euro.ttf` (named after the folder): a TrueType font with one square per glyph
+  pixel (coverage of 8/15 or more). 1 em is the cache's line height, so at that pixel
+  size (34 px for the shipped caches) it matches the game pixel for pixel, spacing included.
+  The 16-level anti-aliasing is not kept.
+- `euro\font.fnt`: a BMFont text descriptor over the `page_NNN.png` files, which keeps
+  the anti-aliasing (for engines and tools that read BMFont).
+
+Spacing follows the game: the pen moves right by `metrics[1]` before the cell is drawn and
+advances by `metrics[1] + metrics[2] + metrics[3]`. The caches store no baseline, so it is
+read off flat-bottomed letters (row 25 of the 48-pixel cell in the shipped caches) and
+written to `font.json` as `baseline`. `font-import` ignores the `.ttf` and `.fnt`.
+
+### Game scripts
+
+```
+nuttool gamescript-export assets\Bundle\4f\01ede7 na_scripts
+# edit na_scripts\aid_script_banjox_nuttyacres_act6_game4.txt (and the others)
+nuttool gamescript-import assets\Bundle\4f\01ede7 na_scripts
+```
+
+`gamescript-export` writes one `<asset>.txt` per scene script (`aid_script_`), actor
+goal list (`aid_actorgoals_`), script table (`aid_scripttable_`) and state table
+(`aid_statetable_`) in the bundle; `--name text` keeps those whose name contains the
+text. `gamescript-import` takes one file or a folder of them; the file name says which
+asset it replaces. Asset ids are written as `@aid_name` when the name is known (from the
+bundle and `db_index.txt`; the GUI knows every name in the game).
+
+The text has one record per line, and `#` starts a comment:
+
+```
+# a scene script: op_XX (the opcode in hex), then its arguments; op_00 ends it
+op_60 "Nutty Acres Act 6 Game 4 Nuts To Go" @aid_challenge_banjox_nuttyacres_act6_game4 1
+op_00
+# actor goals: the goal, then its arguments
+actorMindGoalId_Wait 1.5 3.0
+```
+
+Values are ints (`12`, `-3`), floats (`1.5`), hex words (`0x1A2B3C4D`), asset ids
+(`@aid_...`), strings (`"text"`, padded to the field's size, or `"text":64` to give the
+size) and raw bytes (`<0a0b>`). Commands and goals can be added, removed and reordered.
+Each opcode and goal has a fixed argument layout, read off every script in the game;
+the tool refuses text whose arguments don't fill it. The game has no names for the
+opcodes, so they are shown by number.
+
+### Vehicle parts and other objparams
+
+```
+nuttool objparams-export assets\Bundle\4f\685374 parts --parts
+# edit parts\aid_objparams_banjox_vehicleblock_wheels_monster.txt
+nuttool objparams-import assets\Bundle\4f\685374 parts
+```
+
+Every object's parameters (`aid_objparams_`) are one fixed-size struct, so the text lists
+fields, one per line, and only values change:
+
+```
+name               = "wheelmonster"  # 0x0A0
+mass               = 40.0  # 0x190
+health             = 40.0  # 0x194
+ratingGrip         = 3  # 0x1B4
+0x3C8              = 1.5
+```
+
+Fields without a name are listed by offset, and words that are 0 are left out; a line such
+as `0x3C4 = 1.5` sets one. Lines left out of the file keep their value. `--parts` exports
+only the vehicle parts, `--name text` those whose name contains the text.
+
+Named fields of every part (the 960-byte base the game reads at 0x82607A38):
+
+| Field | What it is |
+|---|---|
+| `blockType` | the part's type number (the game special-cases some) |
+| `name`, `description` | the part's name (some are internal, like `wheelmonster`) and a blurb; the shop's text comes from `garageDescription` |
+| `garageDescription`, `model`, `havok`, `physics`, `texture` | the assets it uses |
+| `paintColour` | default paint (a name from `paint_colours`) |
+| `shopSeenFlag` | game flag set once the shop has shown it |
+| `mass` | mass, which scales the part's physics shape |
+| `health` | hit points |
+| `power` | engine and jet power (0 for other parts) |
+| `ratingPower` ... `ratingWeight` | the parts shop's 0-5 stars: power, fuel, fuel use, ammo, ammo use, firepower, grip, strength, weight. Display only |
+| `anim1`...`anim10` | animations |
+| `shopCategory`, `shopSubcategory`, `shopItem`, `partId` | where it sits in the shop, and its id |
+| `surface`, `material` | collision surface and material names |
+| `flags` | bit flags |
+
+Fuel tanks add `fuelCapacity` and ammo boxes `ammoCapacity`. The other class fields
+(engines, wheels, weapons...) are listed by offset with their values.
 
 ### Audio and video
 
@@ -432,6 +627,12 @@ nuttool make-nbpatch assets mymod.nbpatch --name "My mod" --original D:\clean\ga
 In the GUI, use **Tools > Export mod package (.nbpatch)...**: name the mod, find the
 changed files, untick any you want to leave out, and build.
 
+Edited title update files (the TU3 menus that `menu-fix` adapts, say) go in as
+`update/<file>` (`update/4f3ef5f9`), which reNut serves in place of its `UPDATE:` files.
+The title update folder is the one in **File > Title update folder**, or `--update`;
+with `--original`, the clean copy's own `update` folder (beside it) is compared, else the
+update's `.bak` backups.
+
 How files are stored:
 
 - A changed game file becomes a small binary delta (NBDL) against the original. NBDL is
@@ -541,14 +742,30 @@ level keeps the full depth.
 
 **SBP fonts**: `01 01 lineHeight bpp u16 count`, then `{u16 code, u32 offset, i8 metrics[4]}`
 per glyph, then one zlib stream per glyph (48×48 cells at 4 bpp, low nibble first).
+`metrics` are `{unused, A, B, C}` ABC widths in pixels at the line height: the game
+draws the cell at pen + A (cell row 0 = top of the line) and advances by A + B + C.
+
+**Game scripts** are flat big-endian records with no pointers or relocations, so they
+can change size:
+
+- scene script: `{u32 size, u32 opcode, args}` per command, ending with opcode 0. Every
+  opcode has one size; strings are fixed fields of 32, 64 or 256 bytes.
+- actor goals: `{u16 size, u16 flags, char goal[64], args}` per goal, the goal named by
+  its `actorMindGoalId_` enum name.
+- script table: `{char name[64], u32 asset id}` per entry (names such as `carried`,
+  `evade`, pointing at actor goal lists).
+- state table: `{char state[64], u32 asset id, u32 asset id, char name[64]}` per entry.
+
+Objects point at these by asset id: an `objparams` asset holds its script table's id, the
+script table the actor goals' ids. Some scene scripts are started by the game's code.
 
 ## Limitations
 
 - **Untested on hardware or emulators.** Nothing has been run in the game. The
   formats round-trip byte-for-byte and edited files parse correctly, but they have not
   been loaded by the game.
-- **Cube, array and volume textures** can be viewed and exported (one image per slice)
-  but not imported.
+- **Cube and volume textures** can be viewed and exported (one image per slice) but not
+  imported. Array textures can be imported and resized from images (not from DDS).
 - **Models**: imported geometry replaces existing meshes only (no new parts or
   materials), skinning is copied from the nearest original vertex rather than painted, and
   bounding volumes are not updated, so geometry far outside the original may be culled.
@@ -565,7 +782,13 @@ per glyph, then one zlib stream per glyph (48×48 cells at 4 bpp, low nibble fir
 - **Animations** play one at a time. The game layers some of them, for example Kazooie's
   idles on top of Banjo's. Their float tracks (facial and other custom channels) and
   animation events are not used. They can be viewed and exported (FBX), not edited.
-- **Havok data, scripts, objparams and other gameplay assets** are unpacked as raw
+- **Game scripts**: the opcodes have no names (the game keeps none), and argument types
+  were inferred from the shipped scripts, so an argument that is always 0 shows as an
+  int even where the game reads a float.
+- **Objparams**: only vehicle parts have named fields, and only their shared base (plus
+  fuel and ammo capacity); class fields and other objects' fields go by offset, with
+  types guessed per value (a field that is 0 shows as `0`).
+- **Havok data and other gameplay assets** are unpacked as raw
   binary files together with their relocation tables. No converter to standard formats
   exists for them yet. Same-layout edits (values, hex edits) work.
 - **Textures embedded in models** (named like `_0x05B6FB15.bin`) live inside the

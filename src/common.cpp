@@ -8,15 +8,11 @@ namespace nut {
 void fail(const std::string& msg) { throw Error(msg); }
 
 fs::path longPath(const fs::path& p) {
-#ifdef _WIN32
     // Asset names are long; extended-length paths lift Windows' 260-character limit.
     std::wstring s = fs::absolute(p).wstring();
     if (s.size() < 240 || s.rfind(L"\\\\?\\", 0) == 0) return p;
     for (auto& c : s) if (c == L'/') c = L'\\';
     return fs::path(L"\\\\?\\" + s);
-#else
-    return p;
-#endif
 }
 
 Bytes readFile(const fs::path& path) {

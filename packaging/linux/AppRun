@@ -1,8 +1,0 @@
-#!/bin/sh
-# NutTool AppImage entry point: the GUI, or the command-line tool when the first argument is --cli.
-here=$(dirname "$(readlink -f "$0")")
-if [ "$1" = "--cli" ]; then
-    shift
-    exec "$here/usr/bin/nuttool" "$@"
-fi
-exec "$here/usr/bin/nuttool-gui" "$@"

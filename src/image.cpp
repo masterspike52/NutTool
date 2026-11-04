@@ -2,7 +2,32 @@
 
 #include "deflate.hpp"
 
+#include <climits>
 #include <cstdlib>
+#include <cstring>
+
+#ifndef NUTTOOL_STB
+#define NUTTOOL_STB 0
+#endif
+
+#if NUTTOOL_STB
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Weverything"
+#elif defined(_MSC_VER)
+#pragma warning(push, 0)
+#endif
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#define STBI_NO_STDIO
+#define STBI_FAILURE_USERMSG
+#include <stb_image.h>
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+#endif
 
 namespace nut::image {
 
@@ -122,6 +147,35 @@ Rgba decodePng(const Bytes& file) {
         std::swap(cur, prev);
     }
     return img;
+}
+
+bool canDecodeImages() { return NUTTOOL_STB != 0; }
+
+Rgba decodeImage(const Bytes& file) {
+    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    bool png = file.size() >= 8 && std::memcmp(file.data(), sig, 8) == 0;
+#if NUTTOOL_STB
+    // Our own decoder covers the PNGs we write; stb takes 16-bit and interlaced ones, and the rest.
+    if (png) {
+        try {
+            return decodePng(file);
+        } catch (std::exception&) {
+        }
+    }
+    if (file.size() > size_t(INT_MAX)) fail("the image file is too large");
+    int w = 0, h = 0, n = 0;
+    stbi_uc* px = stbi_load_from_memory(file.data(), int(file.size()), &w, &h, &n, 4);
+    if (!px) fail(std::string("cannot read the image (") + stbi_failure_reason() + ")");
+    Rgba img;
+    img.width = uint32_t(w);
+    img.height = uint32_t(h);
+    img.pixels.assign(px, px + size_t(w) * size_t(h) * 4);
+    stbi_image_free(px);
+    return img;
+#else
+    if (!png) fail("this build reads only PNG images (it was built without stb_image)");
+    return decodePng(file);
+#endif
 }
 
 // ---- DDS ----------------------------------------------------------------

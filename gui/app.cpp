@@ -6,6 +6,7 @@
 #include "loctext.hpp"
 #include "nbpatch.hpp"
 #include "ops.hpp"
+#include "texture_edit.hpp"
 
 #include <glad/glad.h>
 #include <imgui_impl_opengl3.h>
@@ -53,24 +54,6 @@ int inputTextResize(ImGuiInputTextCallbackData* data) {
     }
     return 0;
 }
-
-#ifndef _WIN32
-// Linux has no single font folder: try the files common packages install, then ask fontconfig.
-fs::path findFont(std::initializer_list<const char*> candidates, const char* pattern) {
-    for (const char* c : candidates)
-        if (fs::exists(c)) return c;
-    std::string out;
-    if (FILE* p = popen((std::string("fc-match -f '%{file}' '") + pattern + "' 2>/dev/null").c_str(), "r")) {
-        char t[512];
-        while (size_t n = std::fread(t, 1, sizeof t, p)) out.append(t, n);
-        pclose(p);
-    }
-    fs::path f = fromUtf8(out);
-    std::string ext = lower(f.extension().string());
-    if ((ext == ".ttf" || ext == ".ttc" || ext == ".otf") && fs::exists(f)) return f;
-    return {};
-}
-#endif
 
 } // namespace
 
@@ -167,7 +150,7 @@ App::~App() {
     saveSettings();
     saveScriptText();
     // Work that writes files is waited for. Read-only work can be stuck in one long read (a network
-    // or WSL drive): give it a moment, then end the process without it.
+    // drive): give it a moment, then end the process without it.
     bool stuck = false;
     uint64_t deadline = SDL_GetTicks() + 1500;
     for (auto& t : tasks_) {
@@ -188,6 +171,7 @@ void App::loadSettings() {
             if (eq == std::string::npos) continue;
             std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
             if (k == "assets") root_ = fromUtf8(v);
+            else if (k == "update") updateDir_ = fromUtf8(v);
             else if (k == "backups") backups_ = v == "1";
             else if (k == "dark") darkTheme_ = v == "1";
             else if (k == "browserWidth") browserWidth_ = std::max(150.0f, std::stof(v));
@@ -195,6 +179,7 @@ void App::loadSettings() {
             else if (k == "lastDir") lastDir_ = fromUtf8(v);
             else if (k == "modAuthor") mod_.author = v;
             else if (k == "modOriginal") modOriginal_ = v;
+            else if (k == "bulkFolder") bulkFolder_ = v;
             else if (k == "zoom") userZoom_ = std::clamp(std::stof(v), 0.5f, 3.0f);
         }
     } catch (...) {
@@ -203,11 +188,13 @@ void App::loadSettings() {
 
 void App::saveSettings() {
     if (settingsPath_.empty()) return;
-    std::string s = "assets=" + toUtf8(root_) + "\nbackups=" + (backups_ ? "1" : "0") + "\ndark=" + (darkTheme_ ? "1" : "0") +
+    std::string s = "assets=" + toUtf8(root_) + "\nupdate=" + toUtf8(updateDir_) + "\nbackups=" + (backups_ ? "1" : "0") + "\ndark=" + (darkTheme_ ? "1" : "0") +
                     "\nbrowserWidth=" + std::to_string(int(browserWidth_)) + "\nextractOut=" + extractOut_ + "\nlastDir=" + toUtf8(lastDir_) + "\nzoom=" + std::to_string(userZoom_) +
-                    "\nmodAuthor=" + mod_.author + "\nmodOriginal=" + modOriginal_ + "\n";
+                    "\nmodAuthor=" + mod_.author + "\nmodOriginal=" + modOriginal_ + "\nbulkFolder=" + bulkFolder_ + "\n";
     try { writeText(settingsPath_, s); } catch (...) {}
 }
+
+fs::path App::updateRoot() const { return ops::updateFolder(root_, updateDir_); }
 
 void App::setAssetsRoot(const fs::path& p) {
     root_ = p;
@@ -295,6 +282,25 @@ void App::scanAssets() {
         other.items.push_back(std::move(it));
     }
     groups_.push_back(std::move(other));
+    // The title update's bundles, named from its own db_index.txt (TU3 brings menus of its own).
+    if (fs::path update = updateRoot(); !update.empty()) {
+        try {
+            for (auto& e : assetdb::readDbIndex(update / "db_index.txt")) names.add(e.name);
+        } catch (...) {
+        }
+        BrowserGroup tu{"Title update", {}, {}};
+        for (auto& f : ops::updateBundles(update)) {
+            BrowserItem it;
+            it.path = f;
+            it.label = label(f);
+            it.tooltip = toUtf8(f);
+            labels_[toUtf8(f)] = it.label;
+            it.lower = lower(it.label + "\n" + it.tooltip);
+            tu.items.push_back(std::move(it));
+        }
+        std::sort(tu.items.begin(), tu.items.end(), [](auto& a, auto& b) { return a.label < b.label; });
+        if (!tu.items.empty()) groups_.push_back(std::move(tu));
+    }
     if (catalog_) addCatalogGroups();
 }
 
@@ -304,13 +310,14 @@ void App::buildCatalog() {
     if (root_.empty() || !fs::exists(root_)) return;
     fs::path root = root_;
     fs::path cache = settingsPath_.empty() ? fs::path() : settingsPath_.parent_path() / "catalog.json";
+    fs::path update = updateRoot();
     indexing_ = true;
-    runReadOnlyTask("Indexing textures and models", false, [this, root, cache](Task& t) -> std::function<void()> {
+    runReadOnlyTask("Indexing textures and models", false, [this, root, cache, update](Task& t) -> std::function<void()> {
         ops::Progress pr;
         pr.log = [this](const std::string& s) { log(s); };
         pr.step = [&t](double f, const std::string& s) { t.report(f, s); };
         pr.cancel = &t.cancel;
-        std::shared_ptr<const Catalog> cat = Catalog::build(root, cache, pr);
+        std::shared_ptr<const Catalog> cat = Catalog::build(root, cache, pr, update);
         return [this, cat, root] {
             indexing_ = false;
             if (!cat || root != root_) return;
@@ -319,15 +326,18 @@ void App::buildCatalog() {
             for (auto& k : std::exchange(pendingOpen_, {})) openWhenIndexed(k);
             size_t ui = 0;
             for (auto& x : cat->textures) ui += x.ui;
-            status("Indexed " + std::to_string(cat->textures.size()) + " textures (" + std::to_string(ui) + " UI icons) and " +
-                   std::to_string(cat->models.size()) + " models");
+            status("Indexed " + std::to_string(cat->textures.size()) + " textures (" + std::to_string(ui) + " UI icons), " +
+                   std::to_string(cat->models.size()) + " models and " + std::to_string(cat->scripts.size()) + " scripts");
         };
     });
 }
 
 void App::addCatalogGroups() {
     groups_.erase(std::remove_if(groups_.begin(), groups_.end(),
-                                 [](const BrowserGroup& g) { return g.name == "Textures" || g.name == "UI icons" || g.name == "Models" || g.name == "Audio"; }),
+                                 [](const BrowserGroup& g) {
+                                     return g.name == "Textures" || g.name == "UI icons" || g.name == "Models" || g.name == "Audio" || g.name == "Scripts" ||
+                                            g.name == "Vehicle parts";
+                                 }),
                   groups_.end());
     if (!catalog_) return;
     auto strip = [](const std::string& n, std::initializer_list<const char*> prefixes) {
@@ -398,6 +408,49 @@ void App::addCatalogGroups() {
             audio.children.push_back({"Other", std::move(other), {}});
         }
     }
+    // Scripts by kind; searching also matches the assets that use them.
+    BrowserGroup scripts{"Scripts", {}, {}};
+    {
+        const std::pair<gamescript::Kind, const char*> kinds[] = {{gamescript::Kind::Script, "Scene scripts"},
+                                                                  {gamescript::Kind::ActorGoals, "Actor goals"},
+                                                                  {gamescript::Kind::ScriptTable, "Script tables"},
+                                                                  {gamescript::Kind::StateTable, "State tables"}};
+        for (auto& [kind, label] : kinds) {
+            BrowserGroup g{label, {}, {}};
+            for (auto& s : catalog_->scripts) {
+                if (s.kind != kind) continue;
+                BrowserItem it;
+                it.kind = BrowserItem::Script;
+                it.key = s.name;
+                it.label = strip(s.name, {"aid_script_banjox_", "aid_script_banjoxdlc_", "aid_actorgoals_banjox_", "aid_scripttable_banjox_",
+                                          "aid_statetable_banjox_", "aid_script_", "aid_actorgoals_", "aid_scripttable_", "aid_statetable_"});
+                it.tooltip = s.name + "\n" + std::to_string(s.locs.size()) + (s.locs.size() == 1 ? " copy" : " copies") + ", used by " +
+                             std::to_string(s.usedBy.size()) + (s.usedBy.size() == 1 ? " asset" : " assets");
+                it.lower = lower(s.name);
+                for (auto& u : s.usedBy) it.lower += "\n" + lower(u);
+                g.items.push_back(std::move(it));
+            }
+            if (!g.items.empty()) scripts.children.push_back(std::move(g));
+        }
+    }
+    // Vehicle parts by the category in their names (aid_objparams_banjox_vehicleblock_wheels_monster -> wheels).
+    BrowserGroup parts{"Vehicle parts", {}, {}};
+    {
+        std::map<std::string, std::vector<BrowserItem>> byCat;
+        for (auto& p : catalog_->parts) {
+            BrowserItem it;
+            it.kind = BrowserItem::Script;
+            it.key = p.name;
+            std::string rest = strip(p.name, {"aid_objparams_banjox_vehicleblock_", "aid_objparams_banjoxdlc_vehicleblock_", "aid_objparams_"});
+            size_t us = rest.find('_');
+            std::string cat = us == std::string::npos ? std::string("other") : rest.substr(0, us);
+            it.label = us == std::string::npos ? rest : rest.substr(us + 1);
+            it.tooltip = p.name + "\n" + std::to_string(p.locs.size()) + (p.locs.size() == 1 ? " copy" : " copies");
+            it.lower = lower(p.name);
+            byCat[cat].push_back(std::move(it));
+        }
+        for (auto& [c, items] : byCat) parts.children.push_back({c, std::move(items), {}});
+    }
     // Right after Bundles and Stream bundles.
     auto at = groups_.begin() + long(std::min<size_t>(2, groups_.size()));
     std::vector<BrowserGroup> add;
@@ -405,6 +458,8 @@ void App::addCatalogGroups() {
     add.push_back(std::move(ui));
     add.push_back(std::move(models));
     if (!audio.children.empty()) add.push_back(std::move(audio));
+    if (!scripts.children.empty()) add.push_back(std::move(scripts));
+    if (!parts.children.empty()) add.push_back(std::move(parts));
     groups_.insert(at, std::make_move_iterator(add.begin()), std::make_move_iterator(add.end()));
 }
 
@@ -494,21 +549,9 @@ void App::rebuildFonts() {
     cjk.BuildRanges(&cjkRanges);
     hangul.BuildRanges(&hangulRanges);
 
-#ifdef _WIN32
     const char* windir = SDL_getenv("WINDIR");
     fs::path fonts = fromUtf8(windir ? windir : "C:\\Windows") / "Fonts";
     fs::path mainFont = fonts / "segoeui.ttf", cjkFont = fonts / "msyh.ttc", hangulFont = fonts / "malgun.ttf";
-#else
-    fs::path mainFont = findFont({"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-                                  "/usr/share/fonts/google-noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                                  "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"},
-                                 "sans-serif:lang=en");
-    // Noto Sans CJK covers Chinese, Japanese and Hangul.
-    auto cjkFiles = {"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-                "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"};
-    fs::path cjkFont = cjkRanges.Size > 1 ? findFont(cjkFiles, "sans-serif:lang=zh-cn") : fs::path();
-    fs::path hangulFont = hangulRanges.Size > 1 ? findFont(cjkFiles, "sans-serif:lang=ko") : fs::path();
-#endif
     float size = std::round(16.0f * uiScale_);
     ImFontConfig cfg;
     cfg.OversampleH = 2;
@@ -619,6 +662,30 @@ void App::openWhenIndexed(const std::string& key) {
     if (startsWith(key, "tex:")) openTexture(key.substr(4));
     else if (startsWith(key, "model:")) openModel(key.substr(6));
     else if (startsWith(key, "audio:")) openAudio(key.substr(6));
+    else if (startsWith(key, "script:")) openScript(key.substr(7));
+}
+
+void App::openScript(const std::string& name) {
+    const ScriptInfo* s = catalog_ ? catalog_->script(name) : nullptr;
+    if (!s && catalog_) s = catalog_->part(name);
+    if (!s) {
+        error(indexing_ ? "Still indexing, try again in a moment" : "Script not found: " + name);
+        return;
+    }
+    ScriptInfo copy = *s;
+    auto cat = catalog_;
+    fs::path root = root_;
+    openDocument("script:" + name, name, [copy, cat, root] { return makeScriptDocument(copy, cat, root); });
+}
+
+bool App::openAsset(const std::string& name) {
+    if (!catalog_) return false;
+    if (catalog_->script(name) || catalog_->part(name)) openScript(name);
+    else if (catalog_->model(name)) openModel(name);
+    else if (catalog_->texture(ops::fullName(name))) openTexture(ops::fullName(name));
+    else if (catalog_->audioBank(name)) openAudio(name);
+    else return false;
+    return true;
 }
 
 void App::openAudio(const std::string& name, const std::string& filter) {
@@ -828,6 +895,8 @@ void App::frame() {
     drawExtractDialog();
     drawModExport();
     drawRestore();
+    drawBulkImport();
+    drawChangedMips();
     drawScript();
     drawIdTool();
     drawAbout();
@@ -841,6 +910,20 @@ void App::drawMenu() {
             openFolderDialog("Choose the assets folder", [this](const fs::path& p) { setAssetsRoot(p); }, root_);
         if (ImGui::MenuItem("Open file...")) openFileDialog("Open asset file", {}, [this](const fs::path& p) { openPath(p); }, root_);
         if (ImGui::MenuItem("Rescan assets folder", nullptr, false, !root_.empty())) scanAssets();
+        if (ImGui::BeginMenu("Title update folder")) {
+            fs::path cur = updateRoot();
+            ImGui::TextDisabled("%s", cur.empty() ? "none found" : toUtf8(cur).c_str());
+            if (ImGui::MenuItem("Choose..."))
+                openFolderDialog("Choose the title update folder (with its 4f... bundles)", [this](const fs::path& p) {
+                    updateDir_ = p;
+                    setAssetsRoot(root_);
+                }, cur.empty() ? root_ : cur);
+            if (ImGui::MenuItem("Find it beside the assets folder", nullptr, updateDir_.empty())) {
+                updateDir_.clear();
+                setAssetsRoot(root_);
+            }
+            ImGui::EndMenu();
+        }
         ImGui::Separator();
         Document* cur = nullptr;
         for (auto& d : docs_) if (d->uid == currentTabUid_) cur = d.get();
@@ -857,6 +940,20 @@ void App::drawMenu() {
     if (ImGui::BeginMenu("Tools")) {
         if (ImGui::MenuItem("Extract everything...", nullptr, false, !root_.empty())) showExtract_ = true;
         if (ImGui::MenuItem("Export mod package (.nbpatch)...", nullptr, false, !root_.empty())) showModExport_ = true;
+        if (ImGui::MenuItem("Bulk import textures...", nullptr, false, !root_.empty())) showBulkImport_ = true;
+        if (ImGui::MenuItem("Remove mipmaps from changed textures...", nullptr, false, !root_.empty())) showChangedMips_ = true;
+        if (ImGui::MenuItem("Fit menus to resized textures", nullptr, false, catalog_ && !busy())) {
+            auto cat = catalog_;
+            docs_.clear(); // a bundle tab may show a menu that is about to change
+            runTask("Fitting menus to resized textures", true, [this, cat](Task& t) -> std::function<void()> {
+                int n = fixMenus(*this, *cat, &t);
+                return [this, n] {
+                    status(n ? "Fitted " + std::to_string(n) + " menu element(s) to their textures' new sizes (see the log)"
+                             : "No menu element needed fitting");
+                    if (n) buildCatalog();
+                };
+            });
+        }
         if (ImGui::MenuItem("Restore original files (revert all)...", nullptr, false, !root_.empty())) {
             showRestore_ = true;
             restoreScanned_ = false;
@@ -909,7 +1006,7 @@ void App::drawBrowser(float) {
     }
     ImGui::TextDisabled("%s", toUtf8(root_).c_str());
     ImGui::SetNextItemWidth(-FLT_MIN);
-    inputText("##filter", browserFilter_);
+    browserFilterChanged_ = inputText("##filter", browserFilter_);
     if (browserFilter_.empty() && !ImGui::IsItemActive()) {
         ImVec2 pos = ImGui::GetItemRectMin();
         ImGui::GetWindowDrawList()->AddText(ImVec2(pos.x + ImGui::GetStyle().FramePadding.x, pos.y + ImGui::GetStyle().FramePadding.y),
@@ -933,9 +1030,13 @@ void App::drawBrowserGroup(const BrowserGroup& g, bool topLevel) {
     };
     size_t n = count(g);
     if (n == 0 && !needle.empty()) return;
-    if (!needle.empty()) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+    // Searching opens the groups with matches each time the search text changes; they can be
+    // collapsed in between. Search results keep their own open state (another id), so clearing
+    // the search brings the tree back as it was.
+    bool searching = !needle.empty();
+    if (searching) ImGui::SetNextItemOpen(true, browserFilterChanged_ ? ImGuiCond_Always : ImGuiCond_Once);
     char head[256];
-    std::snprintf(head, sizeof head, "%s (%zu)###%s%p", g.name.c_str(), n, g.name.c_str(), static_cast<const void*>(&g));
+    std::snprintf(head, sizeof head, "%s (%zu)###%s%s%p", g.name.c_str(), n, searching ? "search:" : "", g.name.c_str(), static_cast<const void*>(&g));
     if (!ImGui::TreeNodeEx(head, topLevel ? ImGuiTreeNodeFlags_Framed | ImGuiTreeNodeFlags_SpanAvailWidth : ImGuiTreeNodeFlags_SpanAvailWidth)) return;
     for (auto& c : g.children) drawBrowserGroup(c, false);
     std::vector<const BrowserItem*> shown;
@@ -948,7 +1049,8 @@ void App::drawBrowserGroup(const BrowserGroup& g, bool topLevel) {
             std::string key = it.kind == BrowserItem::Texture ? "tex:" + it.key
                               : it.kind == BrowserItem::Model ? "model:" + it.key
                               : it.kind == BrowserItem::Audio ? "audio:" + it.key
-                                                              : toUtf8(it.path);
+                              : it.kind == BrowserItem::Script ? "script:" + it.key
+                                                               : toUtf8(it.path);
             bool open = false;
             for (auto& d : docs_) if (d->key == key) open = true;
             ImGui::PushID(&it);
@@ -956,6 +1058,7 @@ void App::drawBrowserGroup(const BrowserGroup& g, bool topLevel) {
                 if (it.kind == BrowserItem::Texture) openTexture(it.key);
                 else if (it.kind == BrowserItem::Model) openModel(it.key);
                 else if (it.kind == BrowserItem::Audio) openAudio(it.key, needle.empty() || lower(it.key).find(needle) != std::string::npos ? std::string() : needle);
+                else if (it.kind == BrowserItem::Script) openScript(it.key);
                 else openPath(it.path);
             }
             if (ImGui::BeginItemTooltip()) {
@@ -1013,7 +1116,8 @@ void App::drawWelcome() {
         ImGui::BulletText("Pick an asset on the left to open it. Use the search box to filter by name.");
         ImGui::BulletText("Bundles: browse every asset inside, preview and replace textures, export or replace raw data.");
         ImGui::BulletText("Text: edit strings for any language side by side with English.");
-        ImGui::BulletText("Fonts: view glyphs, edit metrics, export/import glyph pages.");
+        ImGui::BulletText("Fonts: view glyphs, edit metrics, export/import glyph pages, export as TTF / BMFont.");
+        ImGui::BulletText("Scripts: read and edit scene scripts, actor goals and script tables as text, and see what uses each one.");
         ImGui::BulletText("Tools > Extract everything... unpacks the whole game into a folder.");
         ImGui::Spacing();
         ImGui::TextDisabled("Saving writes plain (uncompressed) files and keeps a .bak of the original.");
@@ -1086,18 +1190,35 @@ void App::drawExtractDialog() {
     inputText("Output folder", extractOut_);
     ImGui::SameLine();
     if (ImGui::Button("Browse...")) openFolderDialog("Output folder", [this](const fs::path& p) { extractOut_ = toUtf8(p); });
+    ImGui::Checkbox("Textures only", &extractTexturesOnly_);
+    ImGui::SameLine();
+    helpMarker("Just the textures, from every bundle and stream bundle, as PNG in one \"textures\" folder (one copy of each; "
+               "split textures merged). These are the names Bulk import textures reads back.");
     static const char* cats[] = {"bundles", "streams", "text", "video", "fonts", "ini", "misc"};
     static const char* catLabels[] = {"Bundles", "Stream bundles (incl. audio)", "Text", "Videos", "Fonts", "Font metadata", "Other files"};
-    for (int i = 0; i < 7; ++i) {
-        ImGui::Checkbox(catLabels[i], &extractCats_[i]);
-        if (i % 3 != 2 && i != 6) ImGui::SameLine();
+    if (extractTexturesOnly_) {
+        ImGui::Checkbox("Also write DDS", &extractDds_);
+    } else {
+        for (int i = 0; i < 7; ++i) {
+            ImGui::Checkbox(catLabels[i], &extractCats_[i]);
+            if (i % 3 != 2 && i != 6) ImGui::SameLine();
+        }
+        ImGui::Checkbox("Also write PNG copies of textures", &extractPng_);
     }
-    ImGui::Checkbox("Also write PNG copies of textures", &extractPng_);
-    ImGui::TextDisabled("A full extraction writes about 8 GB and takes a few minutes.");
+    ImGui::SetNextItemWidth(260 * uiScale_);
+    inputText("Only names containing", extractFilter_);
+    ImGui::SameLine();
+    helpMarker("Leave empty for everything. With text such as ui_, only what is named with it is written: textures, the "
+               "symbols of bundles and entries of stream bundles, wave banks, text tables, videos and fonts. A filtered bundle "
+               "is written as loose files, without the caff.json needed to pack it back.");
+    if (!extractTexturesOnly_ && extractFilter_.empty()) ImGui::TextDisabled("A full extraction writes about 8 GB and takes a few minutes.");
     ImGui::BeginDisabled(extractOut_.empty());
     if (ImGui::Button("Start")) {
         ops::ExtractOptions opt;
         opt.png = extractPng_;
+        opt.texturesOnly = extractTexturesOnly_;
+        opt.texturesDds = extractDds_;
+        opt.filter = trim(extractFilter_);
         for (int i = 0; i < 7; ++i) if (extractCats_[i]) opt.only.insert(cats[i]);
         fs::path root = root_, out = fromUtf8(extractOut_);
         saveSettings();
@@ -1169,13 +1290,16 @@ void App::drawModExport() {
     ImGui::BeginDisabled(busy() || (modSource_ == 1 && modOriginal_.empty()));
     if (ImGui::Button("Find changed files")) {
         fs::path root = root_, orig = modSource_ == 1 ? fromUtf8(modOriginal_) : fs::path();
+        fs::path update = updateRoot(), origUpdate = orig.empty() ? fs::path() : ops::updateFolder(orig);
         saveSettings();
-        runReadOnlyTask("Looking for changed files", true, [this, root, orig](Task& t) -> std::function<void()> {
+        runReadOnlyTask("Looking for changed files", true, [this, root, orig, update, origUpdate](Task& t) -> std::function<void()> {
             ops::Progress pr;
             pr.log = [this](const std::string& s) { log(s); };
             pr.step = [&t](double f, const std::string& s) { t.report(f, s); };
             pr.cancel = &t.cancel;
             auto found = std::make_shared<std::vector<nbpatch::Change>>(nbpatch::findChanges(root, orig, pr));
+            // The title update's edits go in as update/<file>, which reNut serves as UPDATE: files.
+            nbpatch::addUpdateChanges(*found, root, update, origUpdate, pr);
             return [this, found] {
                 modChanges_ = std::move(*found);
                 modPick_.assign(modChanges_.size(), 1);
@@ -1260,13 +1384,14 @@ void App::drawRestore() {
     ImGui::BeginDisabled(busy());
     // Look as soon as the window opens, and again on request.
     if (ImGui::Button("Look again") || (!restoreScanned_ && !busy())) {
-        fs::path root = root_;
-        runReadOnlyTask("Looking for edited files", true, [this, root](Task& t) -> std::function<void()> {
+        fs::path root = root_, update = updateRoot();
+        runReadOnlyTask("Looking for edited files", true, [this, root, update](Task& t) -> std::function<void()> {
             ops::Progress pr;
             pr.log = [this](const std::string& s) { log(s); };
             pr.step = [&t](double f, const std::string& s) { t.report(f, s); };
             pr.cancel = &t.cancel;
             auto found = std::make_shared<std::vector<nbpatch::Change>>(nbpatch::findChanges(root, {}, pr));
+            nbpatch::addUpdateChanges(*found, root, update, {}, pr);
             return [this, found] {
                 restoreChanges_ = std::move(*found);
                 restorePick_.assign(restoreChanges_.size(), 1);
@@ -1328,6 +1453,100 @@ void App::drawRestore() {
         if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
+    ImGui::End();
+}
+
+// Imports a folder of images into the textures they are named after.
+void App::drawBulkImport() {
+    if (!showBulkImport_) return;
+    ImGui::SetNextWindowSize(ImVec2(em(600), 0), ImGuiCond_Appearing);
+    if (!ImGui::Begin("Bulk import textures", &showBulkImport_)) {
+        ImGui::End();
+        return;
+    }
+    ImGui::TextWrapped("Imports every image in a folder into the texture it is named after, as Export PNG and Extract everything "
+                       "name them (aid_texture_banjox_particles_spanglewhite.png). Each image goes into every copy of its texture, as "
+                       "Import image in a texture tab does: an image of another size resizes the texture, and a DDS must use the "
+                       "texture's format. Images that match their texture exactly are skipped, so a folder of exports with a few "
+                       "edited ones changes only those. Changed files are saved with a .bak backup. Open tabs are closed first.");
+    ImGui::SetNextItemWidth(em(460));
+    inputText("##bulkfolder", bulkFolder_);
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...##bulk"))
+        openFolderDialog("Folder of texture images", [this](const fs::path& p) { bulkFolder_ = toUtf8(p); }, fromUtf8(bulkFolder_));
+    bool anyDirty = false;
+    for (auto& d : docs_) anyDirty |= d->dirty();
+    if (anyDirty) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Unsaved changes in open tabs are discarded.");
+    auto cat = catalog_;
+    if (!cat) ImGui::TextDisabled("Waiting for the asset index...");
+    ImGui::BeginDisabled(busy() || !cat || bulkFolder_.empty());
+    if (ImGui::Button("Import")) {
+        fs::path folder = fromUtf8(bulkFolder_);
+        saveSettings();
+        docs_.clear(); // tabs may show what is about to change
+        runTask("Importing textures", true, [this, cat, folder](Task& t) -> std::function<void()> {
+            BulkImportResult r = bulkImport(*this, *cat, folder, t);
+            return [this, r] {
+                std::string s = "Imported " + std::to_string(r.imported) + " texture(s) into " + std::to_string(r.files) + " file(s); " +
+                                std::to_string(r.unchanged) + " unchanged, " + std::to_string(r.unmatched) + " not named after a texture";
+                if (r.menuElements) s += "; fitted " + std::to_string(r.menuElements) + " menu element(s)";
+                if (r.failed) {
+                    error(s + ", " + std::to_string(r.failed) + " not imported (see the log)");
+                    showLog_ = true;
+                } else {
+                    status(s);
+                }
+                if (r.files) buildCatalog();
+            };
+        });
+    }
+    ImGui::EndDisabled();
+    ImGui::End();
+}
+
+// Removes the mipmaps of every texture that differs from its file's .bak backup.
+void App::drawChangedMips() {
+    if (!showChangedMips_) return;
+    ImGui::SetNextWindowSize(ImVec2(em(560), 0), ImGuiCond_Appearing);
+    if (!ImGui::Begin("Remove mipmaps from changed textures", &showChangedMips_)) {
+        ImGui::End();
+        return;
+    }
+    ImGui::TextWrapped("Removes the mipmaps of every texture you changed: the textures that differ from their file's .bak backup "
+                       "(imported, resized...). The other textures in those files are left alone. As with Remove mipmaps in a "
+                       "texture tab, the full-size picture is kept as it is and a split texture keeps level 1. Open tabs are closed first.");
+    bool anyDirty = false;
+    for (auto& d : docs_) anyDirty |= d->dirty();
+    if (anyDirty) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Unsaved changes in open tabs are discarded.");
+    ImGui::BeginDisabled(busy());
+    if (ImGui::Button("Remove mipmaps")) {
+        fs::path root = root_, update = updateRoot();
+        docs_.clear();
+        runTask("Removing mipmaps from changed textures", true, [this, root, update](Task& t) -> std::function<void()> {
+            ops::Progress pr;
+            pr.log = [this](const std::string& s) { log(s); };
+            pr.step = [&t](double f, const std::string& s) { t.report(f, s); };
+            pr.cancel = &t.cancel;
+            auto changes = nbpatch::findChanges(root, {}, pr);
+            for (auto& c : nbpatch::findChanges(update, {}, pr)) changes.push_back(c);
+            int textures = 0, files = 0;
+            for (size_t i = 0; i < changes.size() && !t.cancel; ++i) {
+                t.report(double(i) / double(changes.size()), changes[i].path);
+                try {
+                    int n = ops::removeChangedMipmaps(changes[i].modified, changes[i].original, pr);
+                    textures += n;
+                    files += n ? 1 : 0;
+                } catch (std::exception& e) {
+                    log("warning: " + changes[i].path + ": " + e.what());
+                }
+            }
+            return [this, textures, files] {
+                status("Removed the mipmaps of " + std::to_string(textures) + " changed texture(s) in " + std::to_string(files) + " file(s)");
+                if (files) buildCatalog();
+            };
+        });
+    }
+    ImGui::EndDisabled();
     ImGui::End();
 }
 

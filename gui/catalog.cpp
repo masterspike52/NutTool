@@ -6,6 +6,7 @@
 #include "json.hpp"
 #include "media.hpp"
 #include "model.hpp"
+#include "objparams.hpp"
 #include "streambundle.hpp"
 #include "texture.hpp"
 #include "xctd.hpp"
@@ -18,7 +19,7 @@
 namespace nut::gui {
 namespace {
 
-constexpr int kCacheVersion = 4;
+constexpr int kCacheVersion = 7;
 
 struct Found {
     struct Tex {
@@ -32,7 +33,27 @@ struct Found {
     std::vector<std::pair<std::string, AssetLoc>> anims;
     std::vector<uint32_t> uiIds;
     std::vector<AudioBankInfo> audio;
+    bool menus = false;
+    std::vector<std::pair<std::string, AssetLoc>> scripts;    // game script .data symbols
+    std::vector<std::pair<std::string, AssetLoc>> parts;      // vehicle part objparams
+    std::vector<std::pair<uint32_t, std::string>> scriptRefs; // {word that may be a script id, asset holding it}
+    std::vector<std::string> names;                           // every asset name in the file
 };
+
+// Words carrying a game script type byte: "used by" candidates, kept once every script is known.
+void scanScriptRefs(const Bytes& d, const std::string& user, Found& out) {
+    static const std::vector<bool> scriptType = [] {
+        std::vector<bool> t(256, false);
+        for (const char* n : {"script", "actorgoals", "scripttable", "statetable"})
+            if (auto x = assetdb::typeIndex(n)) t[*x] = true;
+        return t;
+    }();
+    std::set<uint32_t> seen;
+    for (size_t k = 0; k + 4 <= d.size(); k += 4) {
+        uint32_t v = be32(&d[k]);
+        if (scriptType[v >> 24] && seen.insert(v).second) out.scriptRefs.emplace_back(v, user);
+    }
+}
 
 // A wave bank's tables (`d` may stop after them: the wave data is not needed).
 void scanWaveBank(const Bytes& d, const fs::path& file, int entry, uint32_t id, Found& out) {
@@ -57,6 +78,20 @@ void scanCaff(caff::Caff& c, const fs::path& file, int entry, Found& out) {
         if (model::isModelSymbol(c, i)) out.models.emplace_back(assetdb::baseAssetName(c.symbolName(i)), AssetLoc{file, entry, uint32_t(i)});
         else if (model::isAnimationSymbol(c, i)) out.anims.emplace_back(assetdb::baseAssetName(c.symbolName(i)), AssetLoc{file, entry, uint32_t(i)});
         std::string n = c.symbolName(i);
+        std::string base = assetdb::baseAssetName(n);
+        if (startsWith(base, "aid_")) {
+            out.names.push_back(base);
+            if (ops::validSection(c, c.symbols[i]) && c.sections[c.symbols[i].section - 1].name == ".data") {
+                try {
+                    Bytes d = c.symbolData(i);
+                    if (gamescript::kindOf(base)) out.scripts.emplace_back(base, AssetLoc{file, entry, uint32_t(i)});
+                    else if (startsWith(base, "aid_objparams_") && objparams::isVehiclePart(d)) out.parts.emplace_back(base, AssetLoc{file, entry, uint32_t(i)});
+                    scanScriptRefs(d, base, out);
+                } catch (...) {
+                }
+            }
+        }
+        if (entry < 0 && startsWith(n, "aid_xuipackage_")) out.menus = true;
         if (startsWith(n, "aid_xuicachefile_")) {
             // Dependency list of {u32 1, u32 12, u32 asset id} records.
             try {
@@ -219,7 +254,22 @@ const ModelInfo* Catalog::anim(const std::string& name) const {
     return it == animIndex.end() ? nullptr : &anims[it->second];
 }
 
-std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& cacheFile, const ops::Progress& progress) {
+const ScriptInfo* Catalog::script(const std::string& name) const {
+    auto it = scriptIndex.find(name);
+    return it == scriptIndex.end() ? nullptr : &scripts[it->second];
+}
+
+const ScriptInfo* Catalog::part(const std::string& name) const {
+    auto it = partIndex.find(name);
+    return it == partIndex.end() ? nullptr : &parts[it->second];
+}
+
+std::string Catalog::nameOf(uint32_t id) const {
+    auto it = names.find(id);
+    return it == names.end() ? std::string() : it->second;
+}
+
+std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& cacheFile, const ops::Progress& progress, const fs::path& updateDir) {
     std::vector<fs::path> files;
     for (const char* sub : {"4f", "50"}) {
         fs::path d = root / "Bundle" / sub;
@@ -228,6 +278,7 @@ std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& ca
             if (e.is_regular_file() && e.path().extension() != ".bak") files.push_back(e.path());
     }
     std::sort(files.begin(), files.end());
+    for (auto& f : ops::updateBundles(updateDir)) files.push_back(f);
     // Signature of the scanned files, to validate the cache.
     std::string signature;
     for (auto& f : files) {
@@ -246,6 +297,10 @@ std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& ca
         for (size_t i = 0; i < cat->anims.size(); ++i) cat->animIndex[cat->anims[i].name] = i;
         std::sort(cat->audio.begin(), cat->audio.end(), [](auto& a, auto& b) { return a.name < b.name; });
         for (size_t i = 0; i < cat->audio.size(); ++i) cat->audioIndex[cat->audio[i].name] = i;
+        std::sort(cat->scripts.begin(), cat->scripts.end(), [](auto& a, auto& b) { return a.name < b.name; });
+        for (size_t i = 0; i < cat->scripts.size(); ++i) cat->scriptIndex[cat->scripts[i].name] = i;
+        std::sort(cat->parts.begin(), cat->parts.end(), [](auto& a, auto& b) { return a.name < b.name; });
+        for (size_t i = 0; i < cat->parts.size(); ++i) cat->partIndex[cat->parts[i].name] = i;
         return cat;
     };
     auto readLoc = [&](const Json& j) { return AssetLoc{root / fromUtf8Generic(j[size_t(0)].asString()), int(j[size_t(1)].asNumber()), j[size_t(2)].asU32()}; };
@@ -284,6 +339,26 @@ std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& ca
                                            w[size_t(4)].asU32(), w[size_t(5)].asBool()});
                     cat->audio.push_back(std::move(b));
                 }
+                for (auto& m : j["menus"].items()) cat->menuBundles.push_back(root / fromUtf8Generic(m.asString()));
+                for (auto& s : j["scripts"].items()) {
+                    ScriptInfo si;
+                    si.name = s["n"].asString();
+                    auto kind = gamescript::kindOf(si.name);
+                    if (!kind) continue;
+                    si.kind = *kind;
+                    for (auto& l : s["l"].items()) si.locs.push_back(readLoc(l));
+                    for (auto& u : s["u"].items()) si.usedBy.push_back(u.asString());
+                    cat->scripts.push_back(std::move(si));
+                }
+                for (auto& n : j["names"].items())
+                    if (auto id = assetdb::idFromName(n.asString())) cat->names.emplace(*id, n.asString());
+                for (auto& p : j["parts"].items()) {
+                    ScriptInfo si;
+                    si.name = p["n"].asString();
+                    si.objParams = true;
+                    for (auto& l : p["l"].items()) si.locs.push_back(readLoc(l));
+                    cat->parts.push_back(std::move(si));
+                }
                 progress.at(1.0, "loaded from cache");
                 return finish();
             }
@@ -318,6 +393,8 @@ std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& ca
     std::map<std::string, TextureInfo> texMap;
     std::map<std::string, ModelInfo> modelMap, animMap;
     std::map<std::string, AudioBankInfo> audioMap;
+    for (size_t i = 0; i < results.size(); ++i)
+        if (results[i].menus) cat->menuBundles.push_back(files[i]);
     for (auto& r : results) {
         for (auto& t : r.textures) {
             bool top = endsWith(t.name, "top") && ops::fullName(t.name) != t.name;
@@ -355,6 +432,46 @@ std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& ca
     for (auto& [n, m] : modelMap) cat->models.push_back(std::move(m));
     for (auto& [n, a] : animMap) cat->anims.push_back(std::move(a));
     for (auto& [n, a] : audioMap) cat->audio.push_back(std::move(a));
+
+    // Game scripts, and which assets point at them.
+    std::map<std::string, ScriptInfo> scriptMap;
+    std::map<uint32_t, std::set<std::string>> refs;
+    for (auto& r : results) {
+        for (auto& [n, loc] : r.scripts) {
+            ScriptInfo& s = scriptMap[n];
+            s.name = n;
+            s.kind = *gamescript::kindOf(n);
+            s.locs.push_back(loc);
+        }
+        for (auto& [id, user] : r.scriptRefs) refs[id].insert(user);
+        for (auto& n : r.names)
+            if (auto id = assetdb::idFromName(n)) cat->names.emplace(*id, n);
+    }
+    for (const fs::path& idx : {root / "Debug" / "db_index.txt", updateDir.empty() ? fs::path() : updateDir / "db_index.txt"}) {
+        try {
+            if (!idx.empty() && fs::exists(idx))
+                for (auto& e : assetdb::readDbIndex(idx))
+                    if (auto id = assetdb::idFromName(e.name)) cat->names.emplace(*id, assetdb::baseAssetName(e.name));
+        } catch (...) {
+        }
+    }
+    std::map<std::string, ScriptInfo> partMap;
+    for (auto& r : results)
+        for (auto& [n, loc] : r.parts) {
+            ScriptInfo& p = partMap[n];
+            p.name = n;
+            p.objParams = true;
+            p.locs.push_back(loc);
+        }
+    for (auto& [n, p] : partMap) cat->parts.push_back(std::move(p));
+    for (auto& [n, s] : scriptMap) {
+        auto id = assetdb::idFromName(n);
+        auto it = id ? refs.find(*id) : refs.end();
+        if (it != refs.end())
+            for (auto& u : it->second)
+                if (u != n) s.usedBy.push_back(u);
+        cat->scripts.push_back(std::move(s));
+    }
 
     // Save the cache.
     try {
@@ -413,6 +530,34 @@ std::shared_ptr<Catalog> Catalog::build(const fs::path& root, const fs::path& ca
             audio.push(o);
         }
         j["audio"] = audio;
+        Json menus = Json::array();
+        for (auto& f : cat->menuBundles) menus.push(toUtf8Generic(fs::relative(f, root)));
+        j["menus"] = menus;
+        Json scripts = Json::array();
+        for (auto& s : cat->scripts) {
+            Json o = Json::object();
+            o["n"] = s.name;
+            Json l = Json::array(), u = Json::array();
+            for (auto& x : s.locs) l.push(locJson(x, root));
+            for (auto& x : s.usedBy) u.push(x);
+            o["l"] = l;
+            o["u"] = u;
+            scripts.push(o);
+        }
+        j["scripts"] = scripts;
+        Json parts = Json::array();
+        for (auto& p : cat->parts) {
+            Json o = Json::object();
+            o["n"] = p.name;
+            Json l = Json::array();
+            for (auto& x : p.locs) l.push(locJson(x, root));
+            o["l"] = l;
+            parts.push(o);
+        }
+        j["parts"] = parts;
+        Json names = Json::array();
+        for (auto& [id, n] : cat->names) names.push(n);
+        j["names"] = names;
         if (!cacheFile.empty()) writeText(cacheFile, j.dump(0));
     } catch (std::exception& e) {
         progress.info(std::string("could not save the index cache: ") + e.what());

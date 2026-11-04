@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 namespace nut::texture {
 namespace {
@@ -190,6 +191,51 @@ void writeHeaderDims(Bytes& d, uint32_t w, uint32_t h, uint32_t mips) {
     putBe16(&d[0x24], uint16_t(w));
     putBe16(&d[0x26], uint16_t(h));
     d[0x30] = uint8_t(mips);
+}
+
+namespace {
+
+struct ArrayTable {
+    uint32_t offsets, widths, heights, mips;
+};
+
+std::optional<ArrayTable> arrayTable(const Bytes& d, uint32_t slices) {
+    if (d.size() < 0x54 || slices == 0 || be32(&d[0x38]) != slices) return std::nullopt;
+    ArrayTable t{be32(&d[0x3C]), be32(&d[0x44]), be32(&d[0x48]), be32(&d[0x4C])};
+    for (uint32_t p : {t.offsets, t.widths, t.heights, t.mips})
+        if (p < 0x54 || p % 4 || size_t(p) + 4 * size_t(slices) > d.size()) return std::nullopt;
+    for (uint32_t i = 0; i < slices; ++i)
+        if (be32(&d[t.widths + 4 * i]) != be16(&d[0x24]) || be32(&d[t.heights + 4 * i]) != be16(&d[0x26])) return std::nullopt;
+    return t;
+}
+
+} // namespace
+
+bool hasArrayTable(const Bytes& header, uint32_t slices) { return arrayTable(header, slices).has_value(); }
+
+void writeArrayTable(Bytes& d, const Header& h, uint32_t slices, uint32_t sliceBytes) {
+    auto t = arrayTable(d, slices);
+    if (!t) fail("this array texture's slice table is not the expected shape");
+    for (uint32_t i = 0; i < slices; ++i) {
+        putBe32(&d[t->widths + 4 * i], h.width);
+        putBe32(&d[t->heights + 4 * i], h.height);
+        putBe32(&d[t->mips + 4 * i], h.mipLevels);
+        putBe32(&d[t->offsets + 4 * i], i * sliceBytes);
+    }
+}
+
+Header resized(const Header& h, uint32_t w, uint32_t hh) {
+    if (w == 0 || hh == 0 || w > 8192 || hh > 8192)
+        fail("textures can be 1x1 to 8192x8192, not " + std::to_string(w) + "x" + std::to_string(hh));
+    Header r = h;
+    r.width = w;
+    r.height = hh;
+    if (h.mipLevels > 1) {
+        int grow = int(log2Ceil(std::min(w, hh))) - int(log2Ceil(std::min(h.width, h.height)));
+        int most = std::max(2, int(log2Ceil(std::max(w, hh))) + 1);
+        r.mipLevels = uint32_t(std::clamp(int(h.mipLevels) + grow, 2, most));
+    }
+    return r;
 }
 
 Contents describeContents(const Header& h, size_t gpuBytes) {

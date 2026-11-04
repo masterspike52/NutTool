@@ -45,6 +45,14 @@ struct Header {
 bool isTextureHeader(const Bytes& data);
 Header parseHeader(const Bytes& data);
 void writeHeaderDims(Bytes& data, uint32_t width, uint32_t height, uint32_t mipLevels);
+// Array textures end their header with a table of each slice's width, height, mip count and data
+// offset (pointers at 0x3C/0x44/0x48/0x4C, relative to the header). True when it matches the header.
+bool hasArrayTable(const Bytes& header, uint32_t slices);
+// Rewrites that table for a texture now shaped like `h`, with `sliceBytes` of GPU data per slice.
+void writeArrayTable(Bytes& header, const Header& h, uint32_t slices, uint32_t sliceBytes);
+// The same texture at another size (2D, up to 8192x8192). A mip chain keeps the same number of
+// levels below the smaller side's size, so it ends where the original did.
+Header resized(const Header& h, uint32_t width, uint32_t height);
 
 // Which levels the GPU blob holds.
 struct Contents {

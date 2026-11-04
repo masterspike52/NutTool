@@ -6,6 +6,7 @@
 #include "audio.hpp"
 #include "fbx.hpp"
 #include "font.hpp"
+#include "gamescript.hpp"
 #include "texture.hpp"
 #include "json.hpp"
 #include "loctext.hpp"
@@ -13,6 +14,7 @@
 #include "model.hpp"
 #include "modelimport.hpp"
 #include "nbpatch.hpp"
+#include "objparams.hpp"
 #include "streambundle.hpp"
 #include "ops.hpp"
 #include "xctd.hpp"
@@ -613,20 +615,27 @@ int modelSwap(const Args& a) {
     return 0;
 }
 
-int texImport(const Args& a) {
-    fs::path p = a.at(0, "file");
-    std::string name = lower(a.at(1, "texture name"));
-    fs::path img = a.at(2, "image");
-    Loaded l = loadAsset(p);
-    auto& c = requireCaff(l, p);
+// The one texture whose name is, or contains, `name`.
+ops::TexRef textureNamed(caff::Caff& c, const std::string& wanted) {
+    std::string name = lower(wanted);
     std::vector<ops::TexRef> matches;
     for (auto& t : ops::findTextures(c)) {
         std::string n = lower(t.name);
-        if (n == name || lower(ops::fullName(t.name)) == name) { matches = {t}; break; }
+        if (n == name || lower(ops::fullName(t.name)) == name) return t;
         if (n.find(name) != std::string::npos) matches.push_back(t);
     }
     if (matches.size() != 1)
         fail(matches.empty() ? "no texture matches '" + name + "'" : "'" + name + "' matches " + std::to_string(matches.size()) + " textures; be more specific");
+    return matches[0];
+}
+
+int texImport(const Args& a) {
+    fs::path p = a.at(0, "file");
+    std::string name = a.at(1, "texture name");
+    fs::path img = a.at(2, "image");
+    Loaded l = loadAsset(p);
+    auto& c = requireCaff(l, p);
+    std::vector<ops::TexRef> matches = {textureNamed(c, name)};
     std::optional<Loaded> stream;
     if (!a.opt("--stream").empty()) {
         stream = loadAsset(a.opt("--stream"));
@@ -642,6 +651,23 @@ int texImport(const Args& a) {
         writeFile(sout, stream->sb->serialize());
         print("wrote %s\n", sout.string().c_str());
     }
+    return 0;
+}
+
+int texRemoveMips(const Args& a) {
+    fs::path p = a.at(0, "file");
+    Loaded l = loadAsset(p);
+    auto& c = requireCaff(l, p);
+    ops::TexRef t = textureNamed(c, a.at(1, "texture name"));
+    bool changed = false;
+    std::string summary = ops::removeMipmaps(c, t, &changed);
+    if (!changed) {
+        print("%s: %s; nothing written\n", t.name.c_str(), summary.c_str());
+        return 0;
+    }
+    fs::path out = prepareOutput(p, a.opt("-o"));
+    saveCaff(out, c, a.flag("--xctd"));
+    print("%s: %s; wrote %s\n", t.name.c_str(), summary.c_str(), out.string().c_str());
     return 0;
 }
 
@@ -669,6 +695,155 @@ int textImport(const Args& a) {
     fs::path out = prepareOutput(p, a.opt("-o"));
     saveCaff(out, c);
     print("imported %zu strings (%zu before) into %s\n", t.entries.size(), before, out.string().c_str());
+    return 0;
+}
+
+namespace {
+
+// Names for asset ids: the bundle's own symbols plus db_index (from --assets, or the bundle's assets folder).
+assetdb::Names scriptNames(const caff::Caff& c, const fs::path& bundle, const std::string& assets) {
+    assetdb::Names names;
+    for (size_t i = 0; i < c.symbols.size(); ++i) names.add(assetdb::baseAssetName(c.symbolName(i)));
+    fs::path root = !assets.empty() ? fs::path(assets) : fs::absolute(bundle).parent_path().parent_path().parent_path();
+    fs::path idx = root / "Debug" / "db_index.txt";
+    if (fs::exists(idx))
+        for (auto& e : assetdb::readDbIndex(idx)) names.add(e.name);
+    return names;
+}
+
+bool isScriptSymbol(const caff::Caff& c, size_t i) {
+    return gamescript::kindOf(assetdb::baseAssetName(c.symbolName(i))) && validSection(c, c.symbols[i]) &&
+           c.sections[c.symbols[i].section - 1].name == ".data";
+}
+
+} // namespace
+
+int gamescriptExport(const Args& a) {
+    fs::path p = a.at(0, "bundle"), dir = a.at(1, "output dir");
+    std::string filter = lower(a.opt("--name"));
+    Loaded l = loadAsset(p);
+    auto& c = requireCaff(l, p);
+    assetdb::Names names = scriptNames(c, p, a.opt("--assets"));
+    auto lookup = [&names](uint32_t id) { return names.lookup(id); };
+    fs::create_directories(longPath(dir));
+    std::set<std::string> done;
+    for (size_t i = 0; i < c.symbols.size(); ++i) {
+        std::string name = assetdb::baseAssetName(c.symbolName(i));
+        if (!isScriptSymbol(c, i) || (!filter.empty() && lower(name).find(filter) == std::string::npos) || !done.insert(name).second) continue;
+        writeText(dir / (safeName(name) + ".txt"), "# " + name + "\n" + gamescript::toText(*gamescript::kindOf(name), c.symbolData(i), lookup));
+    }
+    print("exported %zu script%s to %s\n", done.size(), done.size() == 1 ? "" : "s", dir.string().c_str());
+    return 0;
+}
+
+int gamescriptImport(const Args& a) {
+    fs::path p = a.at(0, "bundle"), in = a.at(1, "script .txt or folder");
+    std::vector<fs::path> files;
+    if (fs::is_directory(in)) {
+        for (auto& e : fs::directory_iterator(in))
+            if (e.is_regular_file() && lower(e.path().extension().string()) == ".txt") files.push_back(e.path());
+        std::sort(files.begin(), files.end());
+    } else {
+        files.push_back(in);
+    }
+    Loaded l = loadAsset(p);
+    auto& c = requireCaff(l, p);
+    size_t changed = 0;
+    for (auto& f : files) {
+        std::string name = f.stem().string();
+        auto kind = gamescript::kindOf(name);
+        if (!kind) fail(f.filename().string() + ": the file must be named after its asset (aid_script_..., aid_actorgoals_..., aid_scripttable_..., aid_statetable_...)");
+        Bytes data;
+        try {
+            data = gamescript::fromText(*kind, readText(f));
+        } catch (std::exception& e) {
+            fail(f.filename().string() + ": " + e.what());
+        }
+        bool found = false;
+        for (size_t i = 0; i < c.symbols.size(); ++i) {
+            if (!isScriptSymbol(c, i) || assetdb::baseAssetName(c.symbolName(i)) != name) continue;
+            found = true;
+            if (c.symbolData(i) != data) {
+                c.replaceSymbolData(i, data);
+                ++changed;
+            }
+        }
+        if (!found) fail(name + " is not in " + p.filename().string());
+    }
+    if (!changed) {
+        print("nothing changed: the %zu file(s) match %s\n", files.size(), p.string().c_str());
+        return 0;
+    }
+    fs::path out = prepareOutput(p, a.opt("-o"));
+    saveCaff(out, c, a.flag("--xctd"));
+    print("applied %zu file(s), %zu symbol(s) changed; wrote %s\n", files.size(), changed, out.string().c_str());
+    return 0;
+}
+
+int objparamsExport(const Args& a) {
+    fs::path p = a.at(0, "bundle"), dir = a.at(1, "output dir");
+    std::string filter = lower(a.opt("--name"));
+    bool partsOnly = a.flag("--parts");
+    Loaded l = loadAsset(p);
+    auto& c = requireCaff(l, p);
+    assetdb::Names names = scriptNames(c, p, a.opt("--assets"));
+    auto lookup = [&names](uint32_t id) { return names.lookup(id); };
+    fs::create_directories(longPath(dir));
+    std::set<std::string> done;
+    for (size_t i = 0; i < c.symbols.size(); ++i) {
+        std::string name = assetdb::baseAssetName(c.symbolName(i));
+        if (!startsWith(name, "aid_objparams_") || !validSection(c, c.symbols[i]) || c.sections[c.symbols[i].section - 1].name != ".data") continue;
+        if ((!filter.empty() && lower(name).find(filter) == std::string::npos) || done.count(name)) continue;
+        Bytes d = c.symbolData(i);
+        if (!objparams::isObjParams(d) || (partsOnly && !objparams::isVehiclePart(d))) continue;
+        done.insert(name);
+        writeText(dir / (safeName(name) + ".txt"), "# " + name + "\n" + objparams::toText(d, lookup));
+    }
+    print("exported %zu objparams to %s\n", done.size(), dir.string().c_str());
+    return 0;
+}
+
+int objparamsImport(const Args& a) {
+    fs::path p = a.at(0, "bundle"), in = a.at(1, "objparams .txt or folder");
+    std::vector<fs::path> files;
+    if (fs::is_directory(in)) {
+        for (auto& e : fs::directory_iterator(in))
+            if (e.is_regular_file() && lower(e.path().extension().string()) == ".txt") files.push_back(e.path());
+        std::sort(files.begin(), files.end());
+    } else {
+        files.push_back(in);
+    }
+    Loaded l = loadAsset(p);
+    auto& c = requireCaff(l, p);
+    size_t changed = 0;
+    for (auto& f : files) {
+        std::string name = f.stem().string();
+        if (!startsWith(name, "aid_objparams_")) fail(f.filename().string() + ": the file must be named after its asset (aid_objparams_...)");
+        std::string text = readText(f);
+        bool found = false;
+        for (size_t i = 0; i < c.symbols.size(); ++i) {
+            if (assetdb::baseAssetName(c.symbolName(i)) != name || !validSection(c, c.symbols[i]) || c.sections[c.symbols[i].section - 1].name != ".data") continue;
+            found = true;
+            Bytes old = c.symbolData(i), data;
+            try {
+                data = objparams::fromText(old, text);
+            } catch (std::exception& e) {
+                fail(f.filename().string() + ": " + e.what());
+            }
+            if (data != old) {
+                c.replaceSymbolData(i, data);
+                ++changed;
+            }
+        }
+        if (!found) fail(name + " is not in " + p.filename().string());
+    }
+    if (!changed) {
+        print("nothing changed: the %zu file(s) match %s\n", files.size(), p.string().c_str());
+        return 0;
+    }
+    fs::path out = prepareOutput(p, a.opt("-o"));
+    saveCaff(out, c, a.flag("--xctd"));
+    print("applied %zu file(s), %zu symbol(s) changed; wrote %s\n", files.size(), changed, out.string().c_str());
     return 0;
 }
 
@@ -750,6 +925,9 @@ int extractAll(const Args& a) {
     ops::ExtractOptions opt;
     opt.png = a.flag("--png");
     if (!a.opt("--only").empty()) for (auto& s : split(a.opt("--only"), ',')) opt.only.insert(trim(s));
+    opt.texturesOnly = a.flag("--textures-only");
+    opt.texturesDds = a.flag("--dds");
+    opt.filter = a.opt("--filter");
     int failures = ops::extractAll(root, out, opt, consoleProgress());
     print("extract-all finished with %d error(s); output in %s\n", failures, out.string().c_str());
     return failures ? 1 : 0;
@@ -781,6 +959,12 @@ int makeNbpatch(const Args& a) {
     ops::Progress pr;
     pr.log = [](const std::string& s) { print("%s\n", s.c_str()); };
     auto changes = nbpatch::findChanges(root, a.opt("--original"), pr);
+    // The title update's edits go in as update/<file>, which reNut serves as UPDATE: files.
+    fs::path update = ops::updateFolder(root, a.opt("--update"));
+    fs::path originalUpdate = a.opt("--original").empty() ? fs::path() : ops::updateFolder(a.opt("--original"));
+    size_t before = changes.size();
+    nbpatch::addUpdateChanges(changes, root, update, originalUpdate, pr);
+    if (changes.size() > before) print("title update (%s): %zu changed file(s)\n", update.string().c_str(), changes.size() - before);
     if (changes.empty()) {
         print("no changed files found (%s)\n", a.opt("--original").empty() ? "no <file>.bak backups differ from their files" : "the folders match");
         return 1;
@@ -788,6 +972,42 @@ int makeNbpatch(const Args& a) {
     print("%zu changed file(s):\n", changes.size());
     if (!nbpatch::write(out, info, changes, pr)) return 1;
     print("wrote %s\n", out.string().c_str());
+    return 0;
+}
+
+int texRemoveMipsChanged(const Args& a) {
+    fs::path root = a.at(0, "game dir");
+    ops::Progress pr;
+    pr.log = [](const std::string& s) { print("%s\n", s.c_str()); };
+    auto changes = nbpatch::findChanges(root, a.opt("--original"), pr);
+    // The title update's files have their own backups beside them.
+    if (a.opt("--original").empty())
+        for (auto& c : nbpatch::findChanges(ops::updateFolder(root, a.opt("--update")), {}, pr)) changes.push_back(c);
+    int textures = 0, files = 0;
+    for (auto& c : changes) {
+        int n = ops::removeChangedMipmaps(c.modified, c.original, pr);
+        textures += n;
+        files += n ? 1 : 0;
+    }
+    print("removed the mipmaps of %d changed texture(s) in %d file(s) (%zu changed file(s) looked at)\n", textures, files, changes.size());
+    return 0;
+}
+
+int menuFix(const Args& a) {
+    fs::path root = a.at(0, "game dir");
+    ops::Progress pr;
+    pr.log = [](const std::string& s) { print("%s\n", s.c_str()); };
+    fs::path update = ops::updateFolder(root, a.opt("--update"));
+    if (!a.opt("--update").empty() && update.empty()) fail("no folder " + a.opt("--update"));
+    if (!update.empty()) print("title update: %s\n", update.string().c_str());
+    auto resized = ops::resizedTextures(root, pr, update);
+    print("%zu texture(s) differ in size from their backups\n", resized.size());
+    std::vector<fs::path> bundles;
+    for (size_t i = 1; i < a.pos.size(); ++i) bundles.push_back(a.pos[i]);
+    if (bundles.empty()) bundles = ops::menuBundles(root, pr, update);
+    int elements = 0;
+    for (auto& b : bundles) elements += ops::adaptMenus(b, resized, pr);
+    print("adjusted %d menu element(s) in %zu bundle(s) with menus\n", elements, bundles.size());
     return 0;
 }
 
@@ -800,8 +1020,9 @@ const std::vector<Command>& commands() {
         {"hash", "<asset name>...", "Compute asset ids (and on-disk paths) for aid_ names", hash},
         {"index", "<assets dir> [--json]", "List every asset in Debug\\db_index.txt with its id and file", index},
         {"verify", "<assets dir>", "Round-trip every container to prove lossless parsing", verify},
-        {"extract-all", "<assets dir> <out dir> [--png] [--only bundles,streams,text,video,fonts,ini,misc]",
-         "Unpack everything into editable files", extractAll},
+        {"extract-all", "<assets dir> <out dir> [--png] [--only bundles,streams,text,video,fonts,ini,misc] [--textures-only [--dds]] [--filter text]",
+         "Unpack everything into editable files. --textures-only writes just the textures, as PNG in one folder; --filter keeps only "
+         "what is named with the text (ui_, say)", extractAll},
 
         {"decompress", "<in> <out>", "Remove XCTD compression from a bundle file", decompress},
         {"compress", "<in> <out>", "Wrap a file in an (uncompressed) XCTD container", compress},
@@ -813,8 +1034,17 @@ const std::vector<Command>& commands() {
         {"replace", "<file> <#index|name> <data> [-o out] [--section .gpu] [--xctd]", "Replace one symbol or stream bundle entry", replace},
 
         {"tex-export", "<file> <dir> [--stream <stream bundle>] [--png|--png-only]", "Export textures as DDS (and PNG)", texExport},
-        {"tex-import", "<file> <texture name> <image.dds|png> [-o out] [--stream <sb> [--stream-out out]]",
-         "Replace a texture (same size/format); --stream also replaces the streamed top mip", texImport},
+        {"tex-import", "<file> <texture name> <image.png|jpg|bmp|tga|dds> [-o out] [--stream <sb> [--stream-out out]]",
+         "Replace a texture; an image of another size resizes it. --stream also replaces the streamed top level", texImport},
+        {"tex-remove-mips", "<file> <texture name> [-o out]",
+         "Remove a texture's mipmaps (a split texture keeps level 1 beside its streamed level 0)", texRemoveMips},
+        {"tex-remove-mips-changed", "<game dir> [--original <clean game dir>] [--update <title update dir>]",
+         "Remove the mipmaps of every changed texture: those that differ from the file's .bak backup (the title update's too), or from --original",
+         texRemoveMipsChanged},
+        {"menu-fix", "<game dir> [bundle...] [--update <title update dir>]",
+         "Keep menu images the same size on screen when their textures were resized (compared with the .bak backups); "
+         "without bundles, every bundle with menus is found and fixed, the title update's too (<game dir>\\..\\update, or --update)",
+         menuFix},
         {"model-export", "<file> <dir> [--all-groups] [--png]",
          "Export models as OBJ + MTL with a bone list; --all-groups includes every LOD and alternative part, --png writes the file's textures",
          modelExport},
@@ -830,12 +1060,25 @@ const std::vector<Command>& commands() {
          "Export a model as FBX: meshes skinned to its skeleton, materials with embedded PNG textures, and its animations as takes "
          "(those named after it, from the same bundle or --anims; --all-anims for every animation there)",
          modelFbx},
-        {"make-nbpatch", "<game dir> <out.nbpatch> --name <name> [--original <clean game dir>] [--version v] [--author a] [--category c] [--description d] [--id id]",
-         "Package edited files as a mod for reNut / NB Studio: files with a .bak backup, or every file that differs from --original",
+        {"make-nbpatch",
+         "<game dir> <out.nbpatch> --name <name> [--original <clean game dir>] [--update <title update dir>] [--version v] [--author a] "
+         "[--category c] [--description d] [--id id]",
+         "Package edited files as a mod for reNut / NB Studio: files with a .bak backup, or every file that differs from --original. "
+         "The title update's edited files (<game dir>\\..\\update, or --update) go in as update/<file>, which reNut serves as UPDATE: files",
          makeNbpatch},
         {"text-export", "<loctext file> <out.json>", "Export a string table to UTF-8 JSON", textExport},
         {"text-import", "<loctext file> <in.json> [-o out] [--prune]", "Apply edited/added strings from JSON", textImport},
-        {"font-export", "<font.sbp> <dir>", "Export a glyph cache to PNG pages + font.json", fontExport},
+        {"gamescript-export", "<bundle> <dir> [--name text] [--assets dir]",
+         "Write the bundle's game scripts (scene scripts, actor goals, script and state tables) as editable text, one <asset>.txt each",
+         gamescriptExport},
+        {"gamescript-import", "<bundle> <file.txt|dir> [-o out] [--xctd]",
+         "Apply edited game script text (files named <asset>.txt, as gamescript-export writes them)", gamescriptImport},
+        {"objparams-export", "<bundle> <dir> [--parts] [--name text] [--assets dir]",
+         "Write the bundle's object parameters as editable text, one <asset>.txt each; --parts keeps the vehicle parts (named fields: mass, health, ratings...)",
+         objparamsExport},
+        {"objparams-import", "<bundle> <file.txt|dir> [-o out] [--xctd]",
+         "Apply edited objparams text (files named <asset>.txt); fields not listed keep their values", objparamsImport},
+        {"font-export", "<font.sbp> <dir>", "Export a glyph cache to PNG pages + font.json, and as a font: <dir name>.ttf and font.fnt (BMFont)", fontExport},
         {"font-import", "<dir> <out.sbp> [--base original.sbp]", "Rebuild a glyph cache from exported pages", fontImport},
         {"xmv-info", "<file> [copy.wmv]", "Show movie streams (XMV files are plain WMV/ASF)", xmvInfo},
         {"wave-export", "<stream bundle|xwb> <dir> [--wav] [--name text]",
@@ -853,7 +1096,8 @@ namespace {
 
 Args parseArgs(const std::vector<std::string>& argv) {
     static const std::set<std::string> valued = {"-o", "--out", "--stream", "--stream-out", "--base", "--section", "--only",
-                                                "--name", "--id", "--version", "--author", "--category", "--description", "--original", "--anims"};
+                                                "--name", "--id", "--version", "--author", "--category", "--description", "--original", "--anims", "--filter",
+                                                "--assets", "--update"};
     Args a;
     for (size_t i = 1; i < argv.size(); ++i) {
         std::string s = argv[i];

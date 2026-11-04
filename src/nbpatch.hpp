@@ -60,6 +60,12 @@ struct Change {
 // `originalRoot` differs or is missing.
 std::vector<Change> findChanges(const fs::path& gameRoot, const fs::path& originalRoot, const ops::Progress& pr = {});
 
+// Adds the title update's changed files (findChanges over `updateDir`, against `originalUpdateDir`
+// or the .bak backups) with paths under "update/", which reNut serves as UPDATE: files. Adds nothing
+// when `updateDir` is empty or inside `gameRoot`, whose findChanges already lists it.
+void addUpdateChanges(std::vector<Change>& out, const fs::path& gameRoot, const fs::path& updateDir, const fs::path& originalUpdateDir,
+                      const ops::Progress& pr = {});
+
 // Writes the package and checks every entry by rebuilding it from the original. Returns false (with
 // the reason logged) when a file could not be packaged.
 bool write(const fs::path& out, const Info& info, const std::vector<Change>& changes, const ops::Progress& pr = {});

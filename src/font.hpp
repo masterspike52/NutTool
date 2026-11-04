@@ -30,8 +30,16 @@ struct Font {
 
 bool looksLikeFont(const Bytes& data);
 
-// Export to <dir>/font.json + <dir>/page_NNN.png (32x32 cells per page).
+// Export to <dir>/font.json + <dir>/page_NNN.png (32x32 cells per page), plus the font itself:
+// <dir>/font.fnt (BMFont over the pages) and <dir>/<dir name>.ttf.
 void exportTo(const Font& f, const fs::path& dir);
+
+// Baseline as a row from the cell top; the cache stores none, so it is read off flat-bottomed letters.
+uint32_t baselineRow(const Font& f);
+// TrueType font with one square per pixel of coverage >= 8/15; 1 em = the cache's line height.
+Bytes toTtf(const Font& f, const std::string& family);
+// BMFont text descriptor for the pages written by exportTo.
+std::string toBmfont(const Font& f, const std::string& face);
 // Rebuild from an exported directory. When `base` is given, glyphs whose pixels are unchanged
 // keep their original compressed data so the output stays close to the original size.
 Font importFrom(const fs::path& dir, const Font* base = nullptr);

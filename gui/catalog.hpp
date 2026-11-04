@@ -4,6 +4,7 @@
 
 #include "caff.hpp"
 #include "common.hpp"
+#include "gamescript.hpp"
 #include "ops.hpp"
 #include "streambundle.hpp"
 
@@ -50,6 +51,15 @@ struct AudioBankInfo {
     double seconds() const;
 };
 
+// A scene script, actor goal list, script table or state table, and the assets that point at it.
+struct ScriptInfo {
+    std::string name;
+    gamescript::Kind kind = gamescript::Kind::Script;
+    bool objParams = false;          // a vehicle part's objparams instead of a script
+    std::vector<AssetLoc> locs;      // its .data symbol in each copy
+    std::vector<std::string> usedBy; // assets whose data holds its id, sorted
+};
+
 struct Catalog {
     std::vector<TextureInfo> textures; // sorted by name
     std::vector<ModelInfo> models;
@@ -59,13 +69,23 @@ struct Catalog {
     std::map<std::string, size_t> animIndex;
     std::vector<AudioBankInfo> audio; // wave banks, sorted by name
     std::map<std::string, size_t> audioIndex;
+    std::vector<fs::path> menuBundles; // bundles holding menu packages (aid_xuipackage_*)
+    std::vector<ScriptInfo> scripts;   // sorted by name
+    std::map<std::string, size_t> scriptIndex;
+    std::vector<ScriptInfo> parts;     // vehicle part objparams, sorted by name
+    std::map<std::string, size_t> partIndex;
+    std::map<uint32_t, std::string> names; // every asset name seen in the bundles and db_index, by id
 
     const TextureInfo* texture(const std::string& name) const;
     const ModelInfo* model(const std::string& name) const;
     const ModelInfo* anim(const std::string& name) const;
     const AudioBankInfo* audioBank(const std::string& name) const;
+    const ScriptInfo* script(const std::string& name) const;
+    const ScriptInfo* part(const std::string& name) const;
+    std::string nameOf(uint32_t id) const; // "" when unknown
 
-    static std::shared_ptr<Catalog> build(const fs::path& root, const fs::path& cacheFile, const ops::Progress& progress);
+    // Scans the bundles of `root`, and those of the title update when `updateDir` is given.
+    static std::shared_ptr<Catalog> build(const fs::path& root, const fs::path& cacheFile, const ops::Progress& progress, const fs::path& updateDir = {});
 };
 
 // Loads CAFFs from bundles / stream bundle entries, keeping recently used files decompressed.

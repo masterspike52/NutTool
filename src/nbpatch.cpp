@@ -52,11 +52,7 @@ public:
         if (!f_) fail("cannot write " + p.string());
         std::time_t now = std::time(nullptr);
         std::tm tm{};
-#ifdef _WIN32
         localtime_s(&tm, &now);
-#else
-        localtime_r(&now, &tm);
-#endif
         time_ = uint16_t(tm.tm_hour << 11 | tm.tm_min << 5 | tm.tm_sec / 2);
         date_ = uint16_t(std::max(0, tm.tm_year - 80) << 9 | (tm.tm_mon + 1) << 5 | tm.tm_mday);
     }
@@ -389,6 +385,18 @@ std::vector<Change> findChanges(const fs::path& gameRoot, const fs::path& origin
         }
     }
     return out;
+}
+
+void addUpdateChanges(std::vector<Change>& out, const fs::path& gameRoot, const fs::path& updateDir, const fs::path& originalUpdateDir,
+                      const ops::Progress& pr) {
+    std::error_code ec;
+    if (updateDir.empty() || !fs::is_directory(updateDir, ec)) return;
+    fs::path rel = fs::relative(fs::absolute(updateDir, ec), fs::absolute(gameRoot, ec), ec);
+    if (!ec && !rel.empty() && *rel.begin() != "..") return; // inside the game folder: already listed
+    for (Change c : findChanges(updateDir, originalUpdateDir, pr)) {
+        c.path = "update/" + c.path;
+        out.push_back(std::move(c));
+    }
 }
 
 bool write(const fs::path& out, const Info& info, const std::vector<Change>& changes, const ops::Progress& pr) {

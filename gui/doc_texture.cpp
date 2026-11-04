@@ -2,6 +2,7 @@
 #include "docs.hpp"
 
 #include "ops.hpp"
+#include "texture_edit.hpp"
 
 #include <algorithm>
 #include <set>
@@ -48,23 +49,48 @@ public:
             }, fromUtf8(ops::safeName(tex_.name, 150) + ".dds"));
         }
         ImGui::SameLine();
-        bool canImport = tex_.header.kind == texture::Kind::Tex2D;
+        bool canImport = tex_.header.kind == texture::Kind::Tex2D || tex_.header.kind == texture::Kind::Array;
         ImGui::BeginDisabled(!canImport);
         if (ImGui::Button("Import image...")) {
-            app.openFileDialog("Import texture image", {{"Images", "png;dds"}}, [this, &app](const fs::path& img) {
+            app.openFileDialog("Import texture image", {{"Images", ops::textureImagePattern()}}, [this, &app](const fs::path& img) {
                 app.runTask("Importing " + shortName(t_.name), true, [this, img, &app](Task&) -> std::function<void()> {
-                    int written = importAll(app, img);
-                    return [this, &app, written] {
+                    int menus = 0;
+                    int written = importAll(app, ops::readTextureImage(img), &menus);
+                    return [this, &app, written, menus] {
                         reload();
                         preview_.dirty = true;
-                        app.status("Imported into " + std::to_string(written) + " file(s) (originals kept as .bak)");
+                        app.status("Imported into " + std::to_string(written) + " file(s) (originals kept as .bak)" +
+                                   (menus ? "; fitted " + std::to_string(menus) + " menu element(s) to the new size" : ""));
                     };
                 });
             });
         }
         ImGui::EndDisabled();
         helpMarker("Writes the image into every copy of this texture (each bundle, and the streamed top level of split textures). "
-                   "PNG must match the size shown; DDS must use the same format. Changed files are saved immediately with a .bak backup.");
+                   "PNG/JPG/BMP/TGA are compressed to the texture's format with a new mip chain. An image of another size "
+                   "(a higher resolution, say) resizes the texture, and the menus that show it are fitted so it keeps its size "
+                   "on screen. DDS must use the same format. An array texture (several slices, such as the animated action "
+                   "buttons) gets the image in every slice; Bulk import takes one image per slice. Changed files are saved "
+                   "immediately with a .bak backup.");
+        ImGui::SameLine();
+        bool split = !t_.tops.empty();
+        ImGui::BeginDisabled(tex_.levels.size() <= (split ? 2u : 1u));
+        if (ImGui::Button("Remove mipmaps")) {
+            app.runTask("Removing mipmaps from " + shortName(t_.name), true, [this, &app](Task&) -> std::function<void()> {
+                int written = removeMipsAll(app);
+                return [this, &app, written] {
+                    reload();
+                    preview_.level = 0;
+                    preview_.dirty = true;
+                    app.status("Removed the mipmaps in " + std::to_string(written) + " file(s) (originals kept as .bak)");
+                };
+            });
+        }
+        ImGui::EndDisabled();
+        helpMarker("Drops the mip chain (the smaller copies the game shows at a distance) from every copy of this texture, "
+                   "keeping the full-size picture as it is. A split texture keeps level 1 too: the game streams the full-size "
+                   "level into it, and a split texture needs two levels. Without mipmaps, distant surfaces can shimmer and "
+                   "the texture is read at full size everywhere. Changed files are saved immediately with a .bak backup.");
         if (ImGui::CollapsingHeader("Where it lives")) {
             auto row = [&](const AssetLoc& l, const char* what) {
                 std::string s = toUtf8(fs::relative(l.file, root_));
@@ -94,46 +120,32 @@ private:
         try {
             CaffCache cache;
             tex_ = decodeCatalogTexture(t_, cache);
+            // An import may have resized it.
+            t_.width = tex_.header.width;
+            t_.height = tex_.header.height;
+            t_.mips = uint32_t(tex_.levels.size());
         } catch (std::exception& e) {
             error_ = e.what();
         }
     }
 
     // Writes the image into every copy. Runs on a worker thread (the UI is blocked by a modal task).
-    int importAll(App& app, const fs::path& img) {
-        int written = 0;
-        for (auto& loc : t_.full) {
-            Loaded l = loadAsset(loc.file);
-            if (loc.entry < 0) {
-                if (!l.caff) continue;
-                auto ref = ops::textureForSymbol(*l.caff, loc.symbol);
-                if (!ref) continue;
-                const AssetLoc* top = nullptr;
-                for (auto& tp : t_.tops) if (tp.file.filename() == loc.file.filename()) top = &tp;
-                std::optional<Loaded> sl;
-                if (top) sl = loadAsset(top->file);
-                bool streamChanged = false;
-                ops::importTexture(*l.caff, *ref, img, sl && sl->sb ? &*sl->sb : nullptr, &streamChanged);
-                app.backupBeforeWrite(loc.file);
-                saveCaff(loc.file, *l.caff);
-                ++written;
-                if (streamChanged) {
-                    app.backupBeforeWrite(top->file);
-                    writeFile(top->file, sl->sb->serialize());
-                    ++written;
-                }
-            } else if (l.sb && size_t(loc.entry) < l.sb->entries.size()) {
-                caff::Caff c = caff::Caff::parse(l.sb->entries[size_t(loc.entry)].data);
-                auto ref = ops::textureForSymbol(c, loc.symbol);
-                if (!ref) continue;
-                ops::importTexture(c, *ref, img, nullptr, nullptr);
-                l.sb->entries[size_t(loc.entry)].data = c.serialize();
-                app.backupBeforeWrite(loc.file);
-                writeFile(loc.file, l.sb->serialize());
-                ++written;
-            }
-        }
+    // A copy that cannot take the image (one that would need resizing without its stream bundle,
+    // say) leaves all the files untouched.
+    int importAll(App& app, const ops::TextureImage& img, int* menuElements) {
+        TextureEdits edits;
+        edits.import(t_, img);
+        int written = edits.write(app);
+        auto cat = app.catalog();
+        if (edits.resizedAny() && cat) *menuElements = fixMenus(app, *cat, nullptr);
         return written;
+    }
+
+    // Removes the mipmaps from every copy (worker thread); streamed top levels are not touched.
+    int removeMipsAll(App& app) {
+        TextureEdits edits;
+        edits.removeMips(t_);
+        return edits.write(app);
     }
 
     TextureInfo t_;

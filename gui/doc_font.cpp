@@ -33,11 +33,11 @@ public:
         ImGui::SameLine();
         if (ImGui::Button("Find") || go) find(app);
         ImGui::SameLine();
-        if (ImGui::Button("Export pages...")) {
-            app.openFolderDialog("Export glyph pages to", [this, &app](const fs::path& dir) {
-                app.runTask("Exporting glyph pages", true, [this, dir, &app](Task&) -> std::function<void()> {
+        if (ImGui::Button("Export...")) {
+            app.openFolderDialog("Export glyph pages and font to", [this, &app](const fs::path& dir) {
+                app.runTask("Exporting font", true, [this, dir, &app](Task&) -> std::function<void()> {
                     font::exportTo(font_, dir);
-                    return [&app, dir] { app.status("Exported glyph pages + font.json to " + toUtf8(dir)); };
+                    return [&app, dir] { app.status("Exported glyph pages, font.json, font.fnt and the .ttf to " + toUtf8(dir)); };
                 });
             });
         }
@@ -56,7 +56,8 @@ public:
             });
         }
         helpMarker("Export writes PNG pages (32x32 glyphs each, white with alpha = coverage) plus font.json with codes and metrics. "
-                   "Edit them and import the folder back.");
+                   "Edit them and import the folder back. It also writes the font itself: <folder name>.ttf (TrueType, one square per "
+                   "pixel; set it to the line height in pixels for an exact match) and font.fnt (BMFont over the pages, keeps the anti-aliasing).");
 
         float h = ImGui::GetContentRegionAvail().y, w = ImGui::GetContentRegionAvail().x;
         float gw = gridFrac_ * w;
@@ -178,7 +179,8 @@ private:
             for (int k = 0; k < 4; ++k) g.metrics[k] = int8_t(std::clamp(m[k], -128, 127));
             dirty_ = true;
         }
-        helpMarker("Four signed bytes per glyph from the game's font cache. The second and third behave like left bearing and advance width.");
+        helpMarker("Four signed bytes per glyph from the game's font cache: unused, A, B, C. The game draws the cell A pixels right of the pen "
+                   "and advances the pen by A + B + C.");
         ImGui::SeparatorText("Bitmap");
         if (ImGui::Button("Export PNG...")) {
             image::Rgba img = glyphImage(g);

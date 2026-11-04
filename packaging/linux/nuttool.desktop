@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=NutTool
-Comment=Banjo-Kazooie: Nuts & Bolts asset editor
-Exec=nuttool-gui %F
-Icon=nuttool
-Terminal=false
-Categories=Development;

@@ -35,7 +35,7 @@ this over hundreds of files.
 - **New** puts the example script back. **Open...**, **Save** and **Save as...** work
   on `.lua` files.
 - The editor text is kept between sessions in `script.lua` next to NutTool's settings
-  (`%APPDATA%\NutTool\NutTool` on Windows, `~/.local/share/NutTool/NutTool` on Linux).
+  (`%APPDATA%\NutTool\NutTool`).
 
 Scripts in the GUI see the assets folder that is open (`nut.assets`). To open the
 window and run a file at startup, pass `--script <file.lua>` on the command line.
@@ -358,7 +358,11 @@ The commands scripts use most:
 |---|---|
 | `info <file>`, `list <file>` | describe a file, list its symbols or entries |
 | `tex-export <file> <dir> [--png\|--png-only]` | textures as DDS/PNG |
-| `tex-import <file> <texture> <image> [--stream <sb>]` | replace a texture (same size and format) |
+| `tex-import <file> <texture> <image> [--stream <sb>]` | replace a texture from a PNG, JPG, BMP, TGA or DDS; another size resizes it |
+| `tex-remove-mips <file> <texture>` | remove a texture's mipmaps (a split texture keeps level 1) |
+| `tex-remove-mips-changed <game dir> [--original <dir>]` | remove the mipmaps of every texture that differs from its `.bak` (or `--original`) |
+| `menu-fix <game dir> [bundle...]` | fit the menus to textures whose size differs from their `.bak` |
+| `extract-all <game dir> <out> [--textures-only [--dds]] [--filter text]` | unpack everything, just the textures, or only what is named with some text |
 | `model-export <file> <dir> [--png]` | models as OBJ + MTL |
 | `model-import <file> <model> <in.obj>` | apply an OBJ (same as `f:import_obj`) |
 | `model-swap <file> <model> <source file> <source model>` | put another model in a model's place |
