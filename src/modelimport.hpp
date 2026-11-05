@@ -37,8 +37,14 @@ ImportReport importObj(caff::Caff& c, size_t symbol, const std::string& objText)
 // like the model's (exactly, or ignoring case and underscores) replace the weights copied from the
 // nearest original vertex; the fur shells FBX export adds are ignored.
 ImportReport importFbx(caff::Caff& c, size_t symbol, const Bytes& fbxFile);
-// OBJ or FBX, told apart by the file's content.
-ImportReport importMeshFile(caff::Caff& c, size_t symbol, const Bytes& file);
+
+// Rig override: moves the model's joints (its bind pose, which the game skins and animates from) to the FBX bones named
+// like them. Orientations, hierarchy and bone count stay for the game's animations; unnamed bones follow their parent.
+ImportReport importRig(caff::Caff& c, size_t symbol, const Bytes& fbxFile);
+
+// OBJ or FBX, told apart by the file's content. With `rig` (FBX only), importRig first, then the meshes when the
+// file has any named like the model's.
+ImportReport importMeshFile(caff::Caff& c, size_t symbol, const Bytes& file, bool rig = false);
 
 // Where copyModel gets a texture the destination lacks: the CAFF holding it (a whole texture, or
 // the "mip" half of a split one) and, for a split texture, its streamed top level: a stream

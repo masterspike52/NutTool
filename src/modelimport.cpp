@@ -655,9 +655,22 @@ ImportReport importFbx(caff::Caff& c, size_t symbol, const Bytes& file) {
     return rep;
 }
 
-ImportReport importMeshFile(caff::Caff& c, size_t symbol, const Bytes& file) {
-    if (fbx::isFbx(file)) return importFbx(c, symbol, file);
-    return importObj(c, symbol, std::string(file.begin(), file.end()));
+ImportReport importMeshFile(caff::Caff& c, size_t symbol, const Bytes& file, bool rig) {
+    if (!fbx::isFbx(file)) {
+        if (rig) fail("only an FBX file carries a rig (OBJ has no skeleton)");
+        return importObj(c, symbol, std::string(file.begin(), file.end()));
+    }
+    if (!rig) return importFbx(c, symbol, file);
+    ImportReport rep = importRig(c, symbol, file);
+    // Meshes too, when the file has any named like the model's.
+    bool meshes = false;
+    for (auto& md : fbx::readMeshes(file)) meshes |= !isFurShell(md.name) && meshOfName(md.name) >= 0;
+    if (meshes) {
+        ImportReport r = importFbx(c, symbol, file);
+        rep.edited = r.edited, rep.rebuilt = r.rebuilt, rep.hidden = r.hidden;
+        rep.notes.insert(rep.notes.end(), r.notes.begin(), r.notes.end());
+    }
+    return rep;
 }
 
 // ---- copying a model -----------------------------------------------------------------------------
@@ -1243,6 +1256,141 @@ CopyResult copyModel(caff::Caff& dst, size_t symbol, const caff::Caff& srcIn, si
                         ")");
     }
     return result;
+}
+
+// ---- rig override ------------------------------------------------------------------------------
+
+ImportReport importRig(caff::Caff& c, size_t symbol, const Bytes& fbxFile) {
+    std::vector<fbx::BoneData> fb = fbx::readBones(fbxFile);
+    const Model m = parse(c, symbol);
+    const size_t n = m.bones.size();
+    if (!n) fail("the model has no skeleton");
+    if (fb.empty()) fail("the file has no skeleton (no LimbNode bones)");
+
+    // Model bone -> file bone: the same name, else the same name ignoring case and underscores.
+    std::map<std::string, size_t> exact, loose;
+    for (size_t k = 0; k < fb.size(); ++k) {
+        exact.emplace(fb[k].name, k);
+        loose.emplace(boneKey(fb[k].name), k);
+    }
+    std::vector<int> from(n, -1);
+    std::set<size_t> used;
+    for (size_t i = 0; i < n; ++i) {
+        auto e = exact.find(m.bones[i].name);
+        auto l = loose.find(boneKey(m.bones[i].name));
+        if (e != exact.end()) from[i] = int(e->second);
+        else if (l != loose.end()) from[i] = int(l->second);
+        if (from[i] >= 0) used.insert(size_t(from[i]));
+    }
+    if (used.empty()) fail("none of the file's bones are named like the model's");
+
+    // The bind pose as the game chains it, then the new joints: a matched bone at its file position, the others
+    // where their unchanged offset from the (moved) parent puts them. Orientations stay.
+    using D3 = std::array<double, 3>;
+    using DQ = std::array<double, 4>;
+    auto qmul = [](const DQ& a, const DQ& b) {
+        return DQ{a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1], a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+                  a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3], a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
+    };
+    auto qrot = [&](const DQ& q, const D3& v) {
+        DQ r = qmul(qmul(q, DQ{v[0], v[1], v[2], 0}), DQ{-q[0], -q[1], -q[2], q[3]});
+        return D3{r[0], r[1], r[2]};
+    };
+    std::vector<DQ> rot(n);
+    std::vector<D3> pos(n);
+    std::vector<int> state(n, 0); // 0 to do, 1 in progress, 2 done
+    std::function<void(size_t)> solve = [&](size_t i) {
+        if (state[i] == 2) return;
+        if (state[i] == 1) fail("the model's skeleton has a loop");
+        state[i] = 1;
+        const Bone& b = m.bones[i];
+        DQ q{b.rotation[0], b.rotation[1], b.rotation[2], b.rotation[3]};
+        double len = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+        if (len > 0) for (double& x : q) x /= len;
+        D3 local{b.local[0], b.local[1], b.local[2]};
+        if (b.parent >= 0) {
+            size_t p = size_t(b.parent);
+            solve(p);
+            rot[i] = qmul(rot[p], q);
+            D3 off = qrot(rot[p], local);
+            pos[i] = {pos[p][0] + off[0], pos[p][1] + off[1], pos[p][2] + off[2]};
+        } else {
+            rot[i] = q;
+            pos[i] = local;
+        }
+        if (from[i] >= 0) {
+            const auto& t = fb[size_t(from[i])].position;
+            pos[i] = {t[0], t[1], t[2]};
+        }
+        state[i] = 2;
+    };
+    for (size_t i = 0; i < n; ++i) solve(i);
+
+    // The pose records: in the .data part, or in a kept skeleton symbol (a model replaced before).
+    SymView v(c, symbol);
+    auto rg = rendergraphIn(v.data);
+    if (!rg) fail("cannot find the model's rendergraph");
+    auto poseSym = v.targetOf(*rg + 0x104);
+    if (!poseSym) fail("cannot find the model's skeleton");
+    Bytes d = c.symbolData(*poseSym);
+    uint32_t pose = be32(&v.data[*rg + 0x104]);
+    if (pose + 0x30 > d.size() || std::memcmp(&d[pose], "pose", 4) != 0 || be32(&d[pose + 0x18]) != n) fail("unexpected skeleton layout");
+    if (pose + 0x30 + n * 52 > d.size()) fail("the skeleton runs past its symbol");
+
+    auto putF = [&](size_t at, double x) {
+        float f = float(x);
+        uint32_t bits;
+        std::memcpy(&bits, &f, 4);
+        putBe32(&d[at], bits);
+    };
+    int moved = 0, unmatched = 0, reparented = 0;
+    bool noBind = false;
+    for (size_t i = 0; i < n; ++i) {
+        const Bone& b = m.bones[i];
+        D3 local = pos[i];
+        if (b.parent >= 0) {
+            size_t p = size_t(b.parent);
+            const DQ& r = rot[p];
+            local = qrot(DQ{-r[0], -r[1], -r[2], r[3]}, D3{pos[i][0] - pos[p][0], pos[i][1] - pos[p][1], pos[i][2] - pos[p][2]});
+        }
+        if (from[i] < 0) ++unmatched;
+        else {
+            const auto& f = fb[size_t(from[i])];
+            noBind |= !f.fromBind;
+            std::string modelParent = b.parent >= 0 ? boneKey(m.bones[size_t(b.parent)].name) : std::string();
+            if (boneKey(f.parent) != modelParent) ++reparented;
+        }
+        // Bones that did not move keep their exact bytes.
+        bool changed = false;
+        for (int k = 0; k < 3; ++k) changed |= std::fabs(local[size_t(k)] - b.local[k]) > 1e-5 || std::fabs(pos[i][size_t(k)] - b.world[k]) > 1e-4;
+        if (!changed) continue;
+        ++moved;
+        size_t r = pose + 0x30 + i * 52;
+        for (int k = 0; k < 3; ++k) {
+            putF(r + 4 * size_t(k), local[size_t(k)]);
+            putF(r + 12 + 4 * size_t(k), pos[i][size_t(k)]);
+        }
+    }
+    if (moved) c.replaceSymbolData(*poseSym, d);
+
+    ImportReport rep;
+    rep.notes.push_back("rig: " + std::to_string(moved) + " joint(s) moved, " + std::to_string(used.size()) + " bone(s) matched by name; bone "
+                        "orientations and the hierarchy stay the model's, as its animations need them");
+    if (unmatched)
+        rep.notes.push_back("rig: " + std::to_string(unmatched) + " model bone(s) are not in the file and kept their offset from their parent");
+    if (reparented)
+        rep.notes.push_back("rig: " + std::to_string(reparented) + " bone(s) have another parent in the file; the model's hierarchy is kept");
+    if (noBind) rep.notes.push_back("rig: the file has no bind pose for some bones, so they were placed where they stand in it");
+    std::string extra;
+    size_t extras = 0;
+    for (size_t k = 0; k < fb.size(); ++k) {
+        const std::string& nm = fb[k].name;
+        bool endBone = nm.size() > 4 && lower(nm.substr(nm.size() - 4)) == "_end";
+        if (used.count(k) || endBone) continue;
+        if (extras++ < 8) extra += (extra.empty() ? "" : ", ") + nm;
+    }
+    if (extras) rep.notes.push_back("rig: bones the model lacks were ignored (the game's skeleton cannot grow): " + extra + (extras > 8 ? ", ..." : ""));
+    return rep;
 }
 
 } // namespace nut::model

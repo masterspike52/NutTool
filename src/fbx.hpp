@@ -2,7 +2,7 @@
 // materials with their colour maps (PNG, embedded), and animations as takes (animation stacks).
 //
 // Bones become LimbNode models under a Null named after the model, with their bind-pose local
-// transforms; each mesh is a Mesh model under the same Null with a Skin deformer whose clusters
+// transforms (in the game's bone frames, or reoriented along the bones); each mesh is a Mesh model under the same Null with a Skin deformer whose clusters
 // carry the bind matrices. Animations are sampled at `fps` the way the viewer plays them: a matched
 // bone takes the animation's rotation and scale and adds its translation to the bind offset.
 // Rotations are written as XYZ Euler angles in degrees, kept continuous from frame to frame.
@@ -31,6 +31,14 @@ struct Options {
     // Bake each material's colour gain and offset into its texture (texture * c:textureGain + c:textureOffset),
     // as the game's shaders draw it; one tinted copy per texture and tint.
     bool tint = true;
+    // Turn each bone so `boneAxis` (0-2 +X/+Y/+Z, 3-5 -X/-Y/-Z) runs along it, towards its main child; the skin,
+    // bind pose and animations are written to match, so the mesh and motion look the same. +Y is Blender's bone axis.
+    bool reorient = false;
+    int boneAxis = 1;
+    // A "<bone>_end" child for each bone without children, boneEndSize (a fraction of the skeleton's size) down its
+    // bone axis: Blender sizes bones by their children, so these draw as short stubs (Ignore Leaf Bones drops them).
+    bool boneEnds = false;
+    float boneEndSize = 0.015f;
     float fps = 30;
     float unitScale = 100; // centimetres per model unit (FBX UnitScaleFactor); the game works in metres
     // Fur shells, as the model viewer draws them: each written mesh that binds a fur volume gets one more
@@ -52,6 +60,14 @@ struct Report {
 
 Bytes write(const model::Model& m, const Options& opt, Report* report = nullptr);
 
+// The same export as Wavefront OBJ: meshes, materials (<base>.mtl) with their tinted textures and fur shells as in
+// the FBX. `files` are the PNGs and side files to write next to <base>.obj, by file name.
+struct ObjFiles {
+    std::string obj, mtl;
+    std::vector<std::pair<std::string, Bytes>> files;
+};
+ObjFiles writeObj(const model::Model& m, const Options& opt, const std::string& base, Report* report = nullptr);
+
 // ---- reading ----------------------------------------------------------------------------------
 
 bool isFbx(const Bytes& file);
@@ -69,5 +85,14 @@ struct MeshData {
     std::vector<std::vector<std::pair<std::string, float>>> skin;
 };
 std::vector<MeshData> readMeshes(const Bytes& file);
+
+// A skeleton bone (LimbNode) of a binary FBX file, its joint in the game's space as for MeshData. The position is
+// its bind pose (skin cluster or BindPose) when the file has one, else where the node stands.
+struct BoneData {
+    std::string name, parent; // parent: empty for a top bone
+    std::array<float, 3> position{};
+    bool fromBind = false;
+};
+std::vector<BoneData> readBones(const Bytes& file);
 
 } // namespace nut::fbx

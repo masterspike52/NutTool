@@ -165,6 +165,7 @@ struct Animation {
     uint32_t bones = 0;
     std::vector<std::string> boneNames;
     std::vector<int> parents;
+    std::vector<Bone> pose; // the skeleton it was made for, in its bind pose
     std::vector<Key> keys; // frames * bones
     std::vector<std::string> warnings;
 };

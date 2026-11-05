@@ -10,6 +10,7 @@
 
 #include <glad/glad.h>
 #include <imgui_impl_opengl3.h>
+#include <imgui_internal.h>
 
 #include <algorithm>
 #include <cmath>
@@ -59,6 +60,22 @@ int inputTextResize(ImGuiInputTextCallbackData* data) {
 
 bool inputText(const char* label, std::string& s, ImGuiInputTextFlags flags) {
     return ImGui::InputText(label, s.data(), s.capacity() + 1, flags | ImGuiInputTextFlags_CallbackResize, inputTextResize, &s);
+}
+
+namespace {
+bool g_collapsing = false;
+}
+
+bool collapsingAll() { return g_collapsing; }
+
+void collapseWindowTree() {
+    ImGuiWindow* root = ImGui::GetCurrentWindow();
+    for (ImGuiWindow* w : GImGui->Windows)
+        if (w == root || ImGui::IsWindowChildOf(w, root, false, false)) w->StateStorage.SetAllInt(0);
+}
+
+bool inputTextWithHint(const char* label, const char* hint, std::string& s, ImGuiInputTextFlags flags) {
+    return ImGui::InputTextWithHint(label, hint, s.data(), s.capacity() + 1, flags | ImGuiInputTextFlags_CallbackResize, inputTextResize, &s);
 }
 
 bool inputTextMultiline(const char* label, std::string& s, const ImVec2& size, ImGuiInputTextFlags flags) {
@@ -945,6 +962,12 @@ void App::drawMenu() {
         if (ImGui::MenuItem("Save as...", "Ctrl+Shift+S", false, cur && cur->canSave())) saveDocument(*cur, true);
         if (ImGui::MenuItem("Save all", nullptr, false, !docs_.empty()))
             for (auto& d : docs_) if (d->dirty()) saveDocument(*d, false);
+        if (ImGui::MenuItem("Close tab", nullptr, false, cur != nullptr)) closeDocuments({cur->uid});
+        if (ImGui::MenuItem("Close all tabs", nullptr, false, !docs_.empty())) {
+            std::vector<std::string> uids;
+            for (auto& d : docs_) uids.push_back(d->uid);
+            closeDocuments(uids);
+        }
         ImGui::Separator();
         ImGui::MenuItem("Make .bak backups when saving", nullptr, &backups_);
         ImGui::Separator();
@@ -992,6 +1015,8 @@ void App::drawMenu() {
     }
     if (ImGui::BeginMenu("View")) {
         ImGui::MenuItem("Log", nullptr, &showLog_);
+        if (ImGui::MenuItem("Collapse all in this tab", nullptr, false, !docs_.empty())) collapseDoc_ = true;
+        if (ImGui::MenuItem("Collapse the asset tree", nullptr, false, !root_.empty())) collapseBrowser_ = true;
         static float zoomPct = 100;
         if (ImGui::IsWindowAppearing()) zoomPct = userZoom_ * 100;
         ImGui::SetNextItemWidth(em(160));
@@ -1026,9 +1051,15 @@ void App::drawBrowser(float) {
         ImGui::GetWindowDrawList()->AddText(ImVec2(pos.x + ImGui::GetStyle().FramePadding.x, pos.y + ImGui::GetStyle().FramePadding.y),
                                             ImGui::GetColorU32(ImGuiCol_TextDisabled), "Search assets...");
     }
-    if (indexing_) ImGui::TextDisabled("Indexing textures, models and audio...");
+    if (ImGui::SmallButton("Collapse all")) collapseBrowser_ = true;
+    if (indexing_) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Indexing textures, models and audio...");
+    }
     ImGui::Separator();
     ImGui::BeginChild("##tree");
+    if (collapseBrowser_) collapseWindowTree();
+    collapseBrowser_ = false;
     for (auto& g : groups_) drawBrowserGroup(g, true);
     ImGui::EndChild();
 }
@@ -1087,34 +1118,58 @@ void App::drawBrowserGroup(const BrowserGroup& g, bool topLevel) {
 
 void App::drawDocuments() {
     if (docs_.empty()) {
+        collapseDoc_ = false;
         drawWelcome();
         return;
     }
     if (!ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_FittingPolicyScroll | ImGuiTabBarFlags_AutoSelectNewTabs)) return;
+    std::vector<std::string> toClose; // closed after the tab bar
+    auto allUids = [&] {
+        std::vector<std::string> u;
+        for (auto& d : docs_) u.push_back(d->uid);
+        return u;
+    };
+    if (ImGui::TabItemButton("Close all", ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip)) toClose = allUids();
+    ImGui::SetItemTooltip("Close every tab (asks about unsaved changes)");
+    if (ImGui::TabItemButton("Collapse all", ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip)) collapseDoc_ = true;
+    ImGui::SetItemTooltip("Collapse every section of this tab");
     for (size_t i = 0; i < docs_.size(); ++i) {
         Document& d = *docs_[i];
         bool open = true;
         ImGuiTabItemFlags flags = d.dirty() ? ImGuiTabItemFlags_UnsavedDocument : 0;
         if (selectTab_ == d.uid && ImGui::GetFrameCount() > 1) flags |= ImGuiTabItemFlags_SetSelected;
         std::string label = d.title() + "###" + d.uid;
-        if (ImGui::BeginTabItem(label.c_str(), &open, flags)) {
+        bool shown = ImGui::BeginTabItem(label.c_str(), &open, flags);
+        if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem("Close")) toClose = {d.uid};
+            if (ImGui::MenuItem("Close other tabs", nullptr, false, docs_.size() > 1))
+                for (auto& o : docs_)
+                    if (o->uid != d.uid) toClose.push_back(o->uid);
+            if (ImGui::MenuItem("Close tabs to the right", nullptr, false, i + 1 < docs_.size()))
+                for (size_t k = i + 1; k < docs_.size(); ++k) toClose.push_back(docs_[k]->uid);
+            if (ImGui::MenuItem("Close all tabs")) toClose = allUids();
+            ImGui::EndPopup();
+        }
+        if (shown) {
             if (selectTab_ == d.uid) selectTab_.clear();
             currentTabUid_ = d.uid;
             ImGui::BeginChild("##doc");
+            if (collapseDoc_) collapseWindowTree();
+            g_collapsing = collapseDoc_;
             try {
                 d.draw(*this);
             } catch (std::exception& e) {
                 error(d.title() + ": " + e.what());
             }
+            g_collapsing = false;
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
-        if (!open) {
-            if (d.dirty()) closeConfirm_ = int(i);
-            else { closeDocument(i); break; }
-        }
+        if (!open) toClose = {d.uid};
     }
+    collapseDoc_ = false;
     ImGui::EndTabBar();
+    if (!toClose.empty()) closeDocuments(toClose);
 }
 
 void App::drawWelcome() {
@@ -1616,8 +1671,20 @@ void App::saveDocument(Document& d, bool saveAs) {
     if (d.save(*this, nullptr)) status("Saved " + toUtf8(d.path));
 }
 
-void App::closeDocument(size_t i) {
-    if (i < docs_.size()) docs_.erase(docs_.begin() + long(i));
+void App::closeDocuments(const std::vector<std::string>& uids) {
+    for (auto& d : docs_)
+        if (d->dirty() && std::find(uids.begin(), uids.end(), d->uid) != uids.end()) {
+            closeUids_ = uids;
+            return;
+        }
+    removeDocuments(uids);
+}
+
+void App::removeDocuments(const std::vector<std::string>& uids) {
+    docs_.erase(std::remove_if(docs_.begin(), docs_.end(), [&](const std::unique_ptr<Document>& d) {
+                    return std::find(uids.begin(), uids.end(), d->uid) != uids.end();
+                }),
+                docs_.end());
 }
 
 void App::requestQuit() {
@@ -1628,22 +1695,23 @@ void App::requestQuit() {
 }
 
 void App::drawCloseConfirm() {
-    bool want = closeConfirm_ >= 0 || quitPending_;
+    bool want = !closeUids_.empty() || quitPending_;
     if (want && !ImGui::IsPopupOpen("Unsaved changes")) ImGui::OpenPopup("Unsaved changes");
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopupModal("Unsaved changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
     std::vector<size_t> which;
-    if (quitPending_) { for (size_t i = 0; i < docs_.size(); ++i) if (docs_[i]->dirty()) which.push_back(i); }
-    else if (closeConfirm_ >= 0 && size_t(closeConfirm_) < docs_.size()) which.push_back(size_t(closeConfirm_));
+    for (size_t i = 0; i < docs_.size(); ++i)
+        if (docs_[i]->dirty() && (quitPending_ || std::find(closeUids_.begin(), closeUids_.end(), docs_[i]->uid) != closeUids_.end()))
+            which.push_back(i);
     ImGui::TextUnformatted("These documents have unsaved changes:");
     for (size_t i : which) ImGui::BulletText("%s", docs_[i]->title().c_str());
     auto finish = [&](bool proceed) {
         if (proceed) {
             if (quitPending_) quit_ = true;
-            else if (closeConfirm_ >= 0) closeDocument(size_t(closeConfirm_));
+            else removeDocuments(closeUids_);
         }
         quitPending_ = false;
-        closeConfirm_ = -1;
+        closeUids_.clear();
         ImGui::CloseCurrentPopup();
     };
     if (ImGui::Button("Save")) {

@@ -1,0 +1,2 @@
+// The program icon; Explorer and SDL's windows use an exe's first icon.
+1 ICON "@NUTTOOL_ICO@"

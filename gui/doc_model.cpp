@@ -2,6 +2,8 @@
 #include "docs.hpp"
 #include "fbx.hpp"
 
+#include "animkeys.hpp"
+#include "assetdb.hpp"
 #include "gl_view.hpp"
 #include "model.hpp"
 #include "modelimport.hpp"
@@ -15,6 +17,7 @@
 #include <cstdio>
 #include <future>
 #include <map>
+#include <optional>
 #include <set>
 
 namespace nut::gui {
@@ -24,6 +27,29 @@ std::string shortModelName(const std::string& n) {
     for (const char* p : {"aid_model_banjox_", "aid_model_banjoxdlc_", "aid_model_"})
         if (startsWith(n, p)) return n.substr(std::string(p).size());
     return n;
+}
+
+// The animation `name` in a CAFF: symbol `hint` when it is that animation, else the first one named so.
+std::optional<size_t> findAnimation(const caff::Caff& c, const std::string& name, size_t hint) {
+    std::string want = lower(name);
+    auto is = [&](size_t i) { return i < c.symbols.size() && model::isAnimationSymbol(c, i) && lower(assetdb::baseAssetName(c.symbolName(i))) == want; };
+    if (is(hint)) return hint;
+    for (size_t i = 0; i < c.symbols.size(); ++i)
+        if (is(i)) return i;
+    return std::nullopt;
+}
+
+// The animation a new motion builds on: the copy at `loc`, or with `fromOriginal` the same copy in the file's .bak when there is one.
+model::Animation motionBase(const AssetLoc& loc, const std::string& name, bool fromOriginal, CaffCache& cache) {
+    AssetLoc from = loc;
+    fs::path bak = loc.file;
+    bak += ".bak";
+    std::error_code ec;
+    if (fromOriginal && fs::exists(bak, ec)) from.file = bak;
+    caff::Caff& c = cache.get(from);
+    auto sym = findAnimation(c, name, loc.symbol);
+    if (!sym) fail(name + " is not in " + toUtf8(from.file));
+    return model::parseAnimation(c, *sym);
 }
 
 // Column-major 4x4 matrices for the skeleton.
@@ -105,6 +131,9 @@ public:
         hasFur_ = false;
         colourGroups_.clear();
         colourEdited_.clear();
+        pickedMaterial_.clear();
+        hoveredMaterial_.clear();
+        pickedMesh_ = -1;
         model_ = model::parse(c, symbol);
         // Decode every referenced texture (level 0, scaled down to at most 1024 for the viewport).
         for (auto& name : model_.textures) {
@@ -193,7 +222,16 @@ public:
             if (!fbxOut.empty()) exportFbxTo(app, fbxOut);
         }
         updateAnimation();
+        // The material picked on the model, or the one hovered in the Materials list, stands out.
+        const std::string& lit = hoveredMaterial_.empty() ? pickedMaterial_ : hoveredMaterial_;
+        std::vector<bool> highlight(model_.meshes.size(), false);
+        for (auto& e : materials_)
+            if (!lit.empty() && e.label == lit)
+                for (size_t m : e.meshes) highlight[m] = true;
+        if (pickedMaterial_.empty() && hoveredMaterial_.empty() && pickedMesh_ >= 0 && size_t(pickedMesh_) < highlight.size()) highlight[size_t(pickedMesh_)] = true;
+        view_->setHighlight(highlight);
         view_->draw(ImGui::GetContentRegionAvail(), opt_);
+        if (auto c = view_->takeClick()) pickMesh(app, *c);
         ImGui::EndChild();
     }
 
@@ -341,21 +379,23 @@ private:
         }
         drawLighting();
         if (ImGui::Button("Reset camera")) view_->frame();
-        helpMarker("Left-drag: orbit around the model.\nRight-drag: turn the camera (look around).\nMiddle-drag or Shift+left-drag: pan.\n"
+        helpMarker("Left-click: pick the material under the cursor (Materials section).\nLeft-drag: orbit around the model.\nRight-drag: turn the camera (look around).\nMiddle-drag or Shift+left-drag: pan.\n"
                    "Wheel: zoom.\nW/A/S/D or arrow keys: fly, Q/E: down/up, hold Shift to go faster (while the mouse is over the view).\n"
                    "Double-click: reset.");
         ImGui::SameLine();
-        if (ImGui::Button("Export OBJ...")) exportObj(app);
-        helpMarker("Writes the shown meshes as .obj + .mtl and the textures as PNG into a folder.");
+        if (ImGui::Button("Export OBJ...")) ImGui::OpenPopup("Export OBJ");
+        helpMarker("Writes the shown meshes as .obj + .mtl with the same materials, tinted textures (PNG files next to it) and fur "
+                   "as the FBX export. OBJ holds no skeleton, skin or animation: use Export FBX for those.");
+        drawExport(app, true);
         ImGui::SameLine();
         if (ImGui::Button("Export FBX...")) ImGui::OpenPopup("Export FBX");
         helpMarker("Writes the shown meshes skinned to the skeleton, materials with their textures (embedded) and animations as one .fbx file.");
-        drawFbxExport(app);
+        drawExport(app, false);
         if (!model_.warnings.empty() && ImGui::CollapsingHeader("Warnings"))
             for (auto& w : model_.warnings) ImGui::BulletText("%s", w.c_str());
 
         drawReplace(app);
-        drawAnimation();
+        drawAnimation(app);
         if (model_.groups.size() > 1) drawParts();
         drawColours();
 
@@ -446,17 +486,56 @@ private:
         }
     }
 
-    void loadAnimation(const std::string& name) {
+    // A new motion for an animation (a JSON timeline, animkeys.hpp): previewed here, written on save.
+    struct MotionEdit {
+        std::string json;
+        fs::path source; // the JSON file, for Reload
+        bool fromOriginal = true;
+        std::vector<std::string> notes;
+    };
+    struct AnimLoad {
+        std::shared_ptr<model::Animation> anim;
+        std::vector<std::string> notes; // from applying a motion
+    };
+
+    // Loads an animation, with `motion` (or its unsaved one) applied to it.
+    void loadAnimation(const std::string& name, std::optional<MotionEdit> motion = std::nullopt) {
         const ModelInfo* info = catalog_ ? catalog_->anim(name) : nullptr;
-        if (!info) return;
+        if (!info || info->locs.empty()) return;
+        if (!motion)
+            if (auto it = motions_.find(name); it != motions_.end()) motion = it->second;
         AssetLoc loc = info->locs.front();
         pendingName_ = name;
+        pendingMotion_ = motion;
         animError_.clear();
-        pending_ = std::async(std::launch::async, [loc] {
+        pending_ = std::async(std::launch::async, [loc, name, motion] {
             CaffCache cache;
-            caff::Caff& c = cache.get(loc);
-            return std::make_shared<model::Animation>(model::parseAnimation(c, loc.symbol));
+            if (!motion) {
+                caff::Caff& c = cache.get(loc);
+                return AnimLoad{std::make_shared<model::Animation>(model::parseAnimation(c, loc.symbol)), {}};
+            }
+            auto a = std::make_shared<model::Animation>(motionBase(loc, name, motion->fromOriginal, cache));
+            model::KeysReport r;
+            a->keys = model::keysFromJson(*a, motion->json, &r);
+            std::vector<std::string> notes{std::to_string(r.bones) + " bone(s) keyed from " + std::to_string(r.entries) + " timeline entr" +
+                                           (r.entries == 1 ? "y" : "ies")};
+            notes.insert(notes.end(), r.notes.begin(), r.notes.end());
+            return AnimLoad{a, notes};
         });
+    }
+
+    // Reads a JSON timeline and previews it on the animation `name`.
+    void applyMotionFile(App& app, const std::string& name, const fs::path& p, bool fromOriginal) {
+        MotionEdit e;
+        try {
+            e.json = readText(p);
+        } catch (std::exception& ex) {
+            app.error(ex.what());
+            return;
+        }
+        e.source = p;
+        e.fromOriginal = fromOriginal;
+        loadAnimation(name, e);
     }
 
     // Track of each model bone, matched by name.
@@ -477,16 +556,22 @@ private:
     void updateAnimation() {
         if (pending_.valid() && pending_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
             try {
-                anim_ = pending_.get();
+                AnimLoad r = pending_.get();
+                anim_ = r.anim;
                 animName_ = pendingName_;
+                if (pendingMotion_) {
+                    pendingMotion_->notes = r.notes;
+                    motions_[animName_] = *pendingMotion_;
+                }
                 bindTracks();
                 animTime_ = 0;
                 playing_ = true;
             } catch (std::exception& e) {
-                animError_ = e.what();
-                anim_.reset();
+                animError_ = (pendingMotion_ ? "new motion: " : "") + std::string(e.what());
+                if (!pendingMotion_) anim_.reset(); // a failed motion leaves the animation shown as it was
             }
             pendingName_.clear();
+            pendingMotion_.reset();
         }
         if (!anim_ || !view_) return;
         if (playing_) {
@@ -569,7 +654,48 @@ private:
         if (view_) view_->setPose(nullptr, nullptr);
     }
 
-    void drawAnimation() {
+    // Replacing the shown animation's motion with a JSON timeline.
+    void drawMotion(App& app) {
+        const std::string name = animName_;
+        if (name.empty()) return;
+        bool busy = pending_.valid();
+        ImGui::BeginDisabled(busy);
+        if (ImGui::Button("Replace motion...")) {
+            bool orig = motionFromOriginal_;
+            app.openFileDialog("New motion for " + shortAnimName(name, animPrefix_), {{"Animation timeline", "json"}},
+                               [this, &app, name, orig](const fs::path& p) { applyMotionFile(app, name, p, orig); });
+        }
+        ImGui::EndDisabled();
+        helpMarker("Gives this animation new motion from a JSON timeline of poses (docs/animation-keys.md), played here straight away. "
+                   "Ctrl+S writes it into every bundle holding the animation. It keeps its name and length, so the game plays your "
+                   "motion wherever it played the original.");
+        ImGui::SameLine();
+        ImGui::Checkbox("Build on the original", &motionFromOriginal_);
+        helpMarker("Keys the game's original animation, read from the bundle's .bak (made before NutTool first writes it), so a new try "
+                   "doesn't build on an earlier one. Without a .bak, or with this off, it builds on the animation as the bundle has it now.");
+        auto it = motions_.find(name);
+        if (it == motions_.end()) return;
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "New motion from %s, not saved yet (Ctrl+S)", toUtf8(it->second.source.filename()).c_str());
+        ImGui::BeginDisabled(busy);
+        if (ImGui::SmallButton("Reload")) {
+            fs::path src = it->second.source;
+            applyMotionFile(app, name, src, motionFromOriginal_);
+        }
+        helpMarker("Reads the JSON file again, after you edit it.");
+        ImGui::SameLine();
+        bool discard = ImGui::SmallButton("Discard");
+        ImGui::EndDisabled();
+        if (discard) {
+            motions_.erase(it);
+            loadAnimation(name);
+            return;
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        for (auto& n : it->second.notes) ImGui::TextWrapped("%s", n.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    void drawAnimation(App& app) {
         ImGui::SeparatorText("Animation");
         if (model_.bones.empty()) {
             ImGui::TextDisabled("This model has no skeleton.");
@@ -597,6 +723,7 @@ private:
                 ImGui::SetNextItemWidth(em(120));
                 ImGui::SliderFloat("Speed", &speed_, 0.1f, 2.0f, "%.2fx");
                 for (auto& w : anim_->warnings) ImGui::TextDisabled("note: %s", w.c_str());
+                drawMotion(app);
             }
         }
         // Choice of animation: this model's own, or any by search.
@@ -753,6 +880,7 @@ private:
             bool hasChildren = false;
             for (auto& c : model_.bones) hasChildren |= c.parent == int(i);
             ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_DefaultOpen | (hasChildren ? 0 : ImGuiTreeNodeFlags_Leaf);
+            if (collapsingAll() && hasChildren) ImGui::SetNextItemOpen(false);
             bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(intptr_t(i + 1)), f, "%s", b.name.c_str());
             if (ImGui::BeginItemTooltip()) {
                 ImGui::Text("bone %zu\nposition %.3f %.3f %.3f", i, b.world[0], b.world[1], b.world[2]);
@@ -771,63 +899,78 @@ private:
         return n;
     }
 
-    void exportObj(App& app) {
-        app.openFolderDialog("Export model to", [this, &app](const fs::path& dir) {
-            std::string base = ops::safeName(shortModelName(model_.name));
-            std::vector<bool> include(model_.meshes.size());
-            for (size_t i = 0; i < include.size(); ++i) include[i] = meshShown(i);
-            writeText(dir / (base + ".obj"), model::toObj(model_, base + ".mtl", meshTex_, include));
-            writeText(dir / (base + ".mtl"), model::toMtl(model_));
-            int n = 0;
-            for (auto& t : textures_)
-                if (!t.img.pixels.empty()) { writeFile(dir / (t.name + ".png"), image::encodePng(t.img)); ++n; }
-            app.status("Exported " + base + ".obj with " + std::to_string(n) + " textures to " + toUtf8(dir));
-        });
-    }
+    // ---- FBX / OBJ export ---------------------------------------------------------
 
-    // ---- FBX export ---------------------------------------------------------------
-
-    void drawFbxExport(App& app) {
-        if (!ImGui::BeginPopup("Export FBX")) return;
-        ImGui::TextUnformatted("Animations");
-        std::string own = "Named after this model (" + std::to_string(ownAnims_.size()) + ")";
-        ImGui::BeginDisabled(ownAnims_.empty());
-        ImGui::RadioButton(own.c_str(), &fbxAnims_, 1);
-        ImGui::EndDisabled();
-        std::string cur = anim_ ? "Only the one playing (" + shortAnimName(animName_, animPrefix_) + ")" : std::string("Only the one playing (none)");
-        ImGui::BeginDisabled(!anim_);
-        ImGui::RadioButton(cur.c_str(), &fbxAnims_, 2);
-        ImGui::EndDisabled();
-        ImGui::RadioButton("None", &fbxAnims_, 0);
-        if (fbxAnims_ == 1 && ownAnims_.empty()) fbxAnims_ = 0;
-        if (fbxAnims_ == 2 && !anim_) fbxAnims_ = ownAnims_.empty() ? 0 : 1;
+    void drawExport(App& app, bool obj) {
+        if (!ImGui::BeginPopup(obj ? "Export OBJ" : "Export FBX")) return;
+        if (!obj) {
+            ImGui::TextUnformatted("Animations");
+            std::string own = "Named after this model (" + std::to_string(ownAnims_.size()) + ")";
+            ImGui::BeginDisabled(ownAnims_.empty());
+            ImGui::RadioButton(own.c_str(), &fbxAnims_, 1);
+            ImGui::EndDisabled();
+            std::string cur = anim_ ? "Only the one playing (" + shortAnimName(animName_, animPrefix_) + ")" : std::string("Only the one playing (none)");
+            ImGui::BeginDisabled(!anim_);
+            ImGui::RadioButton(cur.c_str(), &fbxAnims_, 2);
+            ImGui::EndDisabled();
+            ImGui::RadioButton("None", &fbxAnims_, 0);
+            if (fbxAnims_ == 1 && ownAnims_.empty()) fbxAnims_ = 0;
+            if (fbxAnims_ == 2 && !anim_) fbxAnims_ = ownAnims_.empty() ? 0 : 1;
+        }
         if (hasFur_) {
-            ImGui::Separator();
+            if (!obj) ImGui::Separator();
             ImGui::Checkbox("Fur shells", &fbxFur_);
             helpMarker("Adds the fur as the viewer draws it: one shell mesh per layer of the fur volume, pushed out along the "
                        "surface by the Fur length and tiled by the Tiling set in the viewer, skinned like its mesh. Each layer "
                        "gets a baked texture (the fur colour, with alpha = where the layer has fur), so any program shows it "
                        "with an ordinary alpha-tested material.");
         }
+        if (!obj && !model_.bones.empty()) {
+            ImGui::Separator();
+            ImGui::Checkbox("Reorient bones", &fbxReorient_);
+            helpMarker("Turns each bone so its Bone axis runs along it, towards its child (the one with the most bones under it), "
+                       "so the bones point along the limbs in Blender and other programs. The skin, bind pose and animations are "
+                       "written to match: the model and its motion look the same. Off keeps the game's bone frames.");
+            ImGui::BeginDisabled(!fbxReorient_);
+            static const char* axes[] = {"+X", "+Y (Blender)", "+Z", "-X", "-Y", "-Z"};
+            ImGui::SetNextItemWidth(140);
+            ImGui::Combo("Bone axis", &fbxAxis_, axes, IM_ARRAYSIZE(axes));
+            helpMarker("The bone's local axis that points down the bone. Blender's bones run along +Y; for other programs pick the "
+                       "axis their importer expects (often +X), and set the same axis in the importer's bone axis options.");
+            ImGui::EndDisabled();
+            ImGui::Checkbox("Short end bones", &fbxEnds_);
+            helpMarker("Blender makes each bone as long as the average distance to its children, and a bone without children as "
+                       "long as its parent, so wrench and face bones come out huge. This adds a short <bone>_end child to each "
+                       "bone without children, so it draws as a small stub. Tick Ignore Leaf Bones in Blender's importer to hide "
+                       "them; the stubs stay. They have no weights and NutTool's import ignores them.");
+            ImGui::BeginDisabled(!fbxEnds_);
+            ImGui::SetNextItemWidth(140);
+            ImGui::SliderFloat("End length", &fbxEndPct_, 0.2f, 5.0f, "%.1f%%");
+            helpMarker("The stubs' length, in percent of the skeleton's size.");
+            ImGui::EndDisabled();
+        }
         ImGui::Separator();
         if (ImGui::Button("Save as...")) {
             ImGui::CloseCurrentPopup();
-            exportFbx(app);
+            exportFile(app, obj);
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 
-    void exportFbx(App& app) {
-        app.saveFileDialog("Export FBX", {{"FBX model", "fbx"}}, [this, &app](const fs::path& picked) {
+    void exportFile(App& app, bool obj) {
+        std::string ext = obj ? "obj" : "fbx";
+        app.saveFileDialog(obj ? "Export OBJ" : "Export FBX", {{obj ? "OBJ model" : "FBX model", ext}}, [this, &app, obj, ext](const fs::path& picked) {
             fs::path out = picked;
-            if (lower(out.extension().string()) != ".fbx") out += ".fbx";
-            exportFbxTo(app, out);
-        }, exportName(model_.name, "fbx"));
+            if (lower(out.extension().string()) != "." + ext) out += "." + ext;
+            exportTo(app, out, obj);
+        }, exportName(model_.name, ext));
     }
 
-    void exportFbxTo(App& app, const fs::path& out) {
+    void exportFbxTo(App& app, const fs::path& out) { exportTo(app, out, false); }
+
+    void exportTo(App& app, const fs::path& out, bool obj) {
         // Everything the worker needs, copied: the tab may change or close meanwhile.
         auto m = std::make_shared<model::Model>(model_);
         for (size_t i = 0; i < m->meshes.size() && i < meshTex_.size(); ++i) m->meshes[i].texture = meshTex_[i];
@@ -835,21 +978,28 @@ private:
         for (size_t i = 0; i < include.size(); ++i) include[i] = meshShown(i);
         std::vector<std::string> names;
         std::shared_ptr<model::Animation> playing;
-        if (fbxAnims_ == 1) names = ownAnims_;
-        if (fbxAnims_ == 2) playing = anim_;
+        if (!obj && fbxAnims_ == 1) names = ownAnims_;
+        if (!obj && fbxAnims_ == 2) playing = anim_;
         std::string playingName = shortAnimName(animName_, animPrefix_), prefix = animPrefix_;
         auto catalog = catalog_;
         bool fur = hasFur_ && fbxFur_;
         float furLength = opt_.furLength, furTiling = opt_.furTiling;
-        bool tint = opt_.tint;
+        bool tint = opt_.tint, reorient = fbxReorient_, ends = fbxEnds_;
+        int boneAxis = fbxAxis_;
+        float endSize = fbxEndPct_ / 100;
         app.runTask("Exporting " + toUtf8(out.filename()), false,
-                    [&app, m, include, names, playing, playingName, prefix, catalog, out, fur, furLength, furTiling, tint](Task& t) -> std::function<void()> {
+                    [&app, m, include, names, playing, playingName, prefix, catalog, out, fur, furLength, furTiling, tint, reorient, boneAxis, ends,
+                     endSize, obj](Task& t) -> std::function<void()> {
             CaffCache cache;
             std::vector<std::shared_ptr<model::Animation>> anims;
             fbx::Options opt;
             opt.include = include;
             opt.fur = fur;
             opt.tint = tint;
+            opt.reorient = reorient;
+            opt.boneAxis = boneAxis;
+            opt.boneEnds = ends;
+            opt.boneEndSize = endSize;
             opt.furLength = furLength;
             opt.furTiling = furTiling;
             std::vector<std::string> notes;
@@ -895,25 +1045,41 @@ private:
             };
             t.report(0.85, "Writing " + toUtf8(out.filename()));
             fbx::Report r;
-            Bytes data = fbx::write(*m, opt, &r);
-            writeFile(out, data);
+            if (obj) {
+                std::string base = toUtf8(out.stem());
+                fbx::ObjFiles files = fbx::writeObj(*m, opt, base, &r);
+                writeText(out, files.obj);
+                writeText(out.parent_path() / fromUtf8(base + ".mtl"), files.mtl);
+                for (auto& [name, data] : files.files) writeFile(out.parent_path() / fromUtf8(name), data);
+            } else {
+                writeFile(out, fbx::write(*m, opt, &r));
+            }
             for (auto& n : r.notes) notes.push_back(n);
-            return [&app, r, notes, out] {
-                for (auto& n : notes) app.log("FBX export: " + n);
-                app.status("Exported " + toUtf8(out.filename()) + ": " + std::to_string(r.meshes) + " meshes, " + std::to_string(r.bones) + " bones, " +
-                           std::to_string(r.textures) + " textures, " + std::to_string(r.animations) + " animations" +
+            return [&app, r, notes, out, obj] {
+                for (auto& n : notes) app.log((obj ? "OBJ export: " : "FBX export: ") + n);
+                app.status("Exported " + toUtf8(out.filename()) + ": " + std::to_string(r.meshes) + " meshes, " + std::to_string(r.textures) +
+                           " textures" + (r.bones ? ", " + std::to_string(r.bones) + " bones" : std::string()) +
+                           (r.animations ? ", " + std::to_string(r.animations) + " animations" : std::string()) +
                            (r.furShells ? ", " + std::to_string(r.furShells) + " fur shells" : std::string()));
             };
         });
     }
 
-    // ---- material colours -------------------------------------------------------
-    // Colour constants (c:basecolour, c:velvetColour...) that share a material, a name and a value
-    // are edited together: every detail level repeats the material with its own copy of the value.
+    // ---- materials ------------------------------------------------------------------
+    // Material parameters (c:basecolour, c:specularPower...) that share a material, a name and a value are edited
+    // together: every detail level repeats the material with its own copy of the value.
     struct ColourGroup {
         std::string material, name;
         std::vector<std::pair<size_t, size_t>> uses; // mesh, constant
         std::array<float, 4> original;
+        bool colour = false; // edited with a colour picker
+    };
+    // The groups of one material (by name; unnamed materials are listed per mesh), for the editor.
+    struct MaterialEntry {
+        std::string label;
+        std::vector<size_t> groups;
+        std::set<size_t> meshes;
+        std::string search; // lower-case: label, parameter and texture names
     };
 
     void collectColours() {
@@ -921,14 +1087,33 @@ private:
         for (size_t i = 0; i < model_.meshes.size(); ++i) {
             const auto& cs = model_.meshes[i].constants;
             for (size_t k = 0; k < cs.size(); ++k) {
-                if (cs[k].symbol < 0 || lower(cs[k].name).find("colour") == std::string::npos) continue;
-                std::string key = model_.meshes[i].material + '\x1f' + cs[k].name + '\x1f' +
-                                  std::string(reinterpret_cast<const char*>(cs[k].value.data()), 16);
+                if (cs[k].symbol < 0) continue;
+                std::string key = model_.meshes[i].material + '\x1f' + (model_.meshes[i].material.empty() ? std::to_string(i) : "") + '\x1f' +
+                                  cs[k].name + '\x1f' + std::string(reinterpret_cast<const char*>(cs[k].value.data()), 16);
                 auto [it, added] = byKey.emplace(key, colourGroups_.size());
-                if (added) colourGroups_.push_back({model_.meshes[i].material, cs[k].name, {}, cs[k].value});
+                if (added) {
+                    std::string ln = lower(cs[k].name);
+                    bool colour = ln.find("colour") != std::string::npos || ln.find("color") != std::string::npos;
+                    colourGroups_.push_back({model_.meshes[i].material, cs[k].name, {}, cs[k].value, colour});
+                }
                 colourGroups_[it->second].uses.push_back({i, k});
             }
         }
+        materials_.clear();
+        std::map<std::string, size_t> byLabel;
+        for (size_t gi = 0; gi < colourGroups_.size(); ++gi) {
+            const ColourGroup& g = colourGroups_[gi];
+            std::string label = g.material.empty() ? "mesh " + std::to_string(g.uses[0].first) + " (unnamed material)" : g.material;
+            auto [it, added] = byLabel.emplace(label, materials_.size());
+            if (added) materials_.push_back({label, {}, {}, lower(label)});
+            MaterialEntry& e = materials_[it->second];
+            e.groups.push_back(gi);
+            e.search += '\x1f' + lower(g.name);
+            for (auto [mi, ki] : g.uses)
+                if (e.meshes.insert(mi).second)
+                    for (int t : model_.meshes[mi].textures) e.search += '\x1f' + lower(model_.textures[size_t(t)]);
+        }
+        std::sort(materials_.begin(), materials_.end(), [](const MaterialEntry& a, const MaterialEntry& b) { return a.label < b.label; });
     }
 
     const std::array<float, 4>& colourOf(const ColourGroup& g) const {
@@ -942,44 +1127,140 @@ private:
             mesh.constants[ki].value = v;
             if (g.name == "c:basecolour") std::copy(v.begin(), v.end(), mesh.colour);
             if (g.name == "c:specularColour") std::copy(v.begin(), v.begin() + 3, mesh.specular);
+            if (g.name == "c:specularPower") mesh.specularPower = v[0];
+            // The colour map's tint (model::Mesh::textureGain), as the parser picks it.
+            for (size_t t = 0; t < mesh.textures.size() && t < mesh.textureSlots.size(); ++t) {
+                if (mesh.textures[t] != mesh.texture) continue;
+                std::string slot = std::to_string(mesh.textureSlots[t]);
+                if (g.name == "c:textureGain" + slot) std::copy(v.begin(), v.end(), mesh.textureGain);
+                if (g.name == "c:textureOffset" + slot) std::copy(v.begin(), v.end(), mesh.textureOffset);
+            }
         }
         if (v == g.original) colourEdited_.erase(gi);
         else colourEdited_.insert(gi);
         if (view_) applyMeshState();
     }
 
+    // A click on the model: the material of the mesh under the cursor becomes the one listed (-1: clears it).
+    void pickMesh(App& app, int mesh) {
+        pickedMesh_ = mesh;
+        pickedMaterial_.clear();
+        if (mesh < 0) return;
+        for (auto& e : materials_)
+            if (e.meshes.count(size_t(mesh))) pickedMaterial_ = e.label;
+        scrollToPicked_ = true;
+        const auto& m = model_.meshes[size_t(mesh)];
+        app.status("Picked mesh " + std::to_string(mesh) + (m.material.empty() ? "" : " (" + m.material + ")") +
+                   (pickedMaterial_.empty() ? ": no editable material values" : ""));
+    }
+
     void drawColours() {
+        hoveredMaterial_.clear();
         if (colourGroups_.empty()) return;
-        ImGui::SeparatorText("Material colours");
+        ImGui::SeparatorText("Materials");
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::TextWrapped("A change applies to every mesh and detail level using that material colour. Save (Ctrl+S) "
-                           "writes it into the bundle; the viewport shows base colour changes.");
+        ImGui::TextWrapped("A change applies to every mesh and detail level using that material value. Save (Ctrl+S) "
+                           "writes it into the bundle; the viewport shows base colour, texture tint and specular changes.");
         ImGui::PopStyleColor();
-        for (size_t gi = 0; gi < colourGroups_.size(); ++gi) {
-            const ColourGroup& g = colourGroups_[gi];
-            bool shown = false;
-            for (auto [mi, ki] : g.uses) shown |= meshShown(mi);
-            if (!shown && !allColours_) continue;
-            ImGui::PushID(int(gi));
-            std::array<float, 4> v = colourOf(g);
-            if (ImGui::ColorEdit3("##c", v.data(), ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR))
-                setColour(gi, v);
+        // Picking on the model narrows the list to that mesh's material.
+        if (pickedMesh_ >= 0) {
+            if (pickedMaterial_.empty()) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Mesh %d has no editable material values.", pickedMesh_);
+            else ImGui::Text("Picked: %s", pickedMaterial_.c_str());
             ImGui::SameLine();
-            std::string what = (g.material.empty() ? "mesh " + std::to_string(g.uses[0].first) : g.material) + "  " +
-                               (startsWith(g.name, "c:") ? g.name.substr(2) : g.name);
-            ImGui::TextUnformatted(what.c_str());
+            if (ImGui::SmallButton("Show all materials")) {
+                pickedMesh_ = -1;
+                pickedMaterial_.clear();
+            }
+        } else {
+            ImGui::TextDisabled("Click the model to pick the material under the cursor.");
+        }
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        bool searched = inputTextWithHint("##matsearch", "Search materials, parameters or textures", matFilter_);
+        ImGui::Checkbox("Colours only", &matColoursOnly_);
+        ImGui::SameLine();
+        ImGui::Checkbox("Include hidden parts and detail levels", &allColours_);
+        bool picked = !pickedMaterial_.empty();
+        std::string f = picked ? std::string() : lower(matFilter_);
+        int listed = 0;
+        for (size_t mi = 0; mi < materials_.size(); ++mi) {
+            const MaterialEntry& e = materials_[mi];
+            if (picked && e.label != pickedMaterial_) continue;
+            if (!f.empty() && e.search.find(f) == std::string::npos) continue;
+            bool shown = allColours_ || picked;
+            for (size_t m : e.meshes) shown |= meshShown(m);
+            if (!shown) continue;
+            // A search that names parameters of this material (not the material itself) lists only those.
+            bool narrow = !f.empty() && lower(e.label).find(f) == std::string::npos;
+            if (narrow) {
+                bool paramHit = false;
+                for (size_t gi : e.groups) paramHit |= lower(colourGroups_[gi].name).find(f) != std::string::npos;
+                narrow = paramHit;
+            }
+            std::vector<size_t> rows;
+            size_t edited = 0;
+            for (size_t gi : e.groups) {
+                const ColourGroup& g = colourGroups_[gi];
+                edited += colourEdited_.count(gi);
+                if (matColoursOnly_ && !g.colour) continue;
+                if (narrow && lower(g.name).find(f) == std::string::npos) continue;
+                bool used = allColours_ || picked;
+                for (auto [m, k] : g.uses) used |= meshShown(m);
+                if (used) rows.push_back(gi);
+            }
+            if (rows.empty()) continue;
+            ++listed;
+            ImGui::PushID(int(mi));
+            if ((searched && !f.empty()) || (picked && scrollToPicked_)) ImGui::SetNextItemOpen(true);
+            std::string head = e.label + "  (" + std::to_string(e.meshes.size()) + " mesh" + (e.meshes.size() == 1 ? "" : "es") + ")" +
+                               (edited ? "  *" : "") + "###mat";
+            bool open = ImGui::TreeNodeEx(head.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
+            if (ImGui::IsItemHovered()) hoveredMaterial_ = e.label;
+            if (picked && scrollToPicked_) {
+                ImGui::SetScrollHereY(0.2f);
+                scrollToPicked_ = false;
+            }
             if (ImGui::BeginItemTooltip()) {
-                ImGui::Text("%.3f %.3f %.3f (was %.3f %.3f %.3f)\n%zu mesh(es)", v[0], v[1], v[2], g.original[0], g.original[1], g.original[2],
-                            g.uses.size());
+                ImGui::TextUnformatted("Meshes:");
+                for (size_t m : e.meshes) {
+                    const auto& mesh = model_.meshes[m];
+                    ImGui::BulletText("mesh %zu in %s, %zu tris", m, groupLabel(size_t(mesh.group)).c_str(), mesh.indices.size() / 3);
+                }
                 ImGui::EndTooltip();
             }
-            if (colourEdited_.count(gi)) {
+            if (edited) {
                 ImGui::SameLine();
-                if (ImGui::SmallButton("Revert")) setColour(gi, g.original);
+                if (ImGui::SmallButton("Revert all"))
+                    for (size_t gi : e.groups) setColour(gi, colourGroups_[gi].original);
+            }
+            if (open) {
+                for (size_t gi : rows) {
+                    const ColourGroup& g = colourGroups_[gi];
+                    std::string pn = startsWith(g.name, "c:") ? g.name.substr(2) : g.name;
+                    ImGui::PushID(int(gi));
+                    std::array<float, 4> v = colourOf(g);
+                    bool changed;
+                    ImGui::SetNextItemWidth(em(260));
+                    if (g.colour) changed = ImGui::ColorEdit3("##v", v.data(), ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+                    else changed = ImGui::DragFloat4("##v", v.data(), 0.01f, 0, 0, "%.3g");
+                    if (changed) setColour(gi, v);
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(pn.c_str());
+                    if (ImGui::BeginItemTooltip()) {
+                        ImGui::Text("%s\nnow %.4g %.4g %.4g %.4g\nwas %.4g %.4g %.4g %.4g\n%zu mesh(es)", g.name.c_str(), v[0], v[1], v[2], v[3],
+                                    g.original[0], g.original[1], g.original[2], g.original[3], g.uses.size());
+                        ImGui::EndTooltip();
+                    }
+                    if (colourEdited_.count(gi)) {
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Revert")) setColour(gi, g.original);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::TreePop();
             }
             ImGui::PopID();
         }
-        ImGui::Checkbox("Include hidden parts and detail levels", &allColours_);
+        if (!listed) ImGui::TextDisabled(f.empty() ? "No editable material values on the shown parts." : "Nothing matches the search.");
     }
 
     // ---- replacing geometry ---------------------------------------------------------
@@ -1005,25 +1286,32 @@ private:
                     return;
                 }
                 std::string name = toUtf8(p.filename());
-                deferred_ = [this, &app, name, text] {
+                bool rig = importRig_;
+                deferred_ = [this, &app, name, text, rig] {
                     bool ok = preview(app, [&](caff::Caff& c, uint32_t sym) {
-                        model::ImportReport r = model::importMeshFile(c, sym, text);
+                        model::ImportReport r = model::importMeshFile(c, sym, text, rig);
                         std::vector<std::string> notes{name + ": " + std::to_string(r.edited) + " mesh(es) edited, " + std::to_string(r.rebuilt) +
                                                        " rebuilt, " + std::to_string(r.hidden) + " hidden"};
                         notes.insert(notes.end(), r.notes.begin(), r.notes.end());
                         return notes;
                     });
-                    if (ok) pendingObjs_.push_back(text);
+                    if (ok) pendingObjs_.push_back({text, rig});
                 };
             });
         }
+        ImGui::SameLine();
+        ImGui::Checkbox("Override rig", &importRig_);
+        helpMarker("FBX only: also moves this model's joints to the file's bones with the same names, so its animations bend "
+                   "where your rig's joints are. Bone orientations, the hierarchy and the bone count stay the game's (its "
+                   "animations need them); bones the file lacks follow their parent, extra bones are ignored. The file may "
+                   "hold just the skeleton.");
         ImGui::SameLine();
         if (ImGui::Button("Replace with another model...")) {
             swapFilter_.clear();
             ImGui::OpenPopup("##swap");
         }
         ImGui::EndDisabled();
-        if (coloursPending) ImGui::TextDisabled("Save or revert the colour changes first.");
+        if (coloursPending) ImGui::TextDisabled("Save or revert the material changes first.");
         if (ImGui::BeginPopup("##swap")) {
             ImGui::TextUnformatted("Replace this model with:");
             ImGui::SetNextItemWidth(em(320));
@@ -1144,7 +1432,7 @@ private:
     std::vector<streambundle::Entry> applyReplacements(caff::Caff& c, uint32_t symbol, const AssetLoc& at) {
         std::vector<streambundle::Entry> entries;
         if (!pendingSwap_.empty()) entries = copyFrom(c, symbol, at, pendingSwap_).streamEntries;
-        for (auto& obj : pendingObjs_) model::importMeshFile(c, symbol, obj);
+        for (auto& obj : pendingObjs_) model::importMeshFile(c, symbol, obj.file, obj.rig);
         return entries;
     }
 
@@ -1154,6 +1442,7 @@ private:
         pendingObjs_.clear();
         pendingSwap_.clear();
         replaceNotes_.clear();
+        motions_.clear();
         cache_ = CaffCache();
         loadModel(cache_.get(info_.locs.front()), info_.locs.front().symbol);
     }
@@ -1179,8 +1468,54 @@ private:
         for (auto& [s, d] : data) c.replaceSymbolData(size_t(s), d);
     }
 
+    bool modelDirty() const { return !colourEdited_.empty() || !pendingObjs_.empty() || !pendingSwap_.empty(); }
+
+    // Writes the new motions into every copy of their animations; "save as" writes only those in the model's
+    // first file, into the copy. Returns the copies written.
+    int saveMotions(App& app, const fs::path* saveAs, std::vector<std::string>& skipped) {
+        int written = 0;
+        for (auto& [name, edit] : motions_) {
+            const ModelInfo* info = catalog_ ? catalog_->anim(name) : nullptr;
+            if (!info) fail(name + " is not in the animation list");
+            for (const AssetLoc& loc : info->locs) {
+                fs::path target = loc.file;
+                if (saveAs) {
+                    if (loc.file != info_.locs.front().file) {
+                        skipped.push_back(shortAnimName(name, animPrefix_) + " in " + toUtf8(loc.file.filename()));
+                        continue;
+                    }
+                    target = *saveAs;
+                }
+                CaffCache baseCache;
+                std::vector<model::Key> keys = model::keysFromJson(motionBase(loc, name, edit.fromOriginal, baseCache), edit.json);
+                Loaded l = loadAsset(target);
+                auto write = [&](caff::Caff& c) {
+                    auto sym = findAnimation(c, name, loc.symbol);
+                    if (!sym) fail(name + " is not in " + toUtf8(target));
+                    model::writeAnimationKeys(c, *sym, keys);
+                };
+                if (loc.entry < 0) {
+                    if (!l.caff) fail(toUtf8(target) + " is not a bundle");
+                    write(*l.caff);
+                    if (!saveAs) app.backupBeforeWrite(target);
+                    saveCaff(target, *l.caff);
+                } else {
+                    if (!l.sb || size_t(loc.entry) >= l.sb->entries.size()) fail(toUtf8(target) + ": stream bundle entry missing");
+                    auto& e = l.sb->entries[size_t(loc.entry)];
+                    caff::Caff c = caff::Caff::parse(e.data);
+                    write(c);
+                    e.data = c.serialize();
+                    if (!saveAs) app.backupBeforeWrite(target);
+                    writeFile(target, l.sb->serialize());
+                }
+                ++written;
+            }
+        }
+        return written;
+    }
+
 public:
-    bool dirty() const override { return !colourEdited_.empty() || !pendingObjs_.empty() || !pendingSwap_.empty(); }
+    bool dirty() const override { return modelDirty() || !motions_.empty(); }
     bool canSave() const override { return dirty(); }
 
     // Every bundle holding the model gets the change (some models ship in several); "save as"
@@ -1189,6 +1524,8 @@ public:
         try {
             std::vector<AssetLoc> locs = info_.locs;
             if (saveAs) locs.resize(1);
+            // Only new motions: the model's files stay as they are.
+            if (!modelDirty() && !saveAs) locs.clear();
             int streamFiles = 0;
             for (const AssetLoc& loc : locs) {
                 fs::path target = saveAs ? *saveAs : loc.file;
@@ -1222,19 +1559,31 @@ public:
                     writeFile(target, l.sb->serialize());
                 }
             }
+            bool modelSaved = !locs.empty();
+            bool coloured = !colourEdited_.empty();
             for (size_t gi : colourEdited_) colourGroups_[gi].original = colourOf(colourGroups_[gi]);
             colourEdited_.clear();
             bool replaced = !pendingObjs_.empty() || !pendingSwap_.empty();
+            std::vector<std::string> skipped;
+            int motionCopies = motions_.empty() ? 0 : saveMotions(app, saveAs, skipped);
+            size_t motionCount = motions_.size();
             if (!saveAs) {
                 // What is on disk now matches the preview.
                 preview_.reset();
                 pendingObjs_.clear();
                 pendingSwap_.clear();
                 replaceNotes_.clear();
+                motions_.clear();
                 cache_ = CaffCache();
             }
-            app.status(std::string(replaced ? "Saved the model" : "Saved material colours") + " to " + std::to_string(locs.size() + size_t(streamFiles)) +
-                       " file(s)" + (streamFiles ? " (with the textures it needs)" : ""));
+            for (auto& s : skipped) app.log("Save As: the new motion of " + s + " is not in the saved file; Save writes it there");
+            std::string what = replaced ? "the model" : coloured ? "material changes" : modelSaved ? "the model" : "";
+            std::string msg = what.empty() ? "" : "Saved " + what + " to " + std::to_string(locs.size() + size_t(streamFiles)) + " file(s)" +
+                                                      (streamFiles ? " (with the textures it needs)" : "");
+            if (motionCount)
+                msg += (msg.empty() ? "Saved " : "; ") + std::to_string(motionCount) + " new motion(s) into " + std::to_string(motionCopies) +
+                       " animation cop" + (motionCopies == 1 ? "y" : "ies");
+            app.status(msg);
             return true;
         } catch (std::exception& e) {
             app.error(std::string("save failed: ") + e.what());
@@ -1245,11 +1594,21 @@ public:
 private:
     std::vector<ColourGroup> colourGroups_;
     std::set<size_t> colourEdited_;
-    bool allColours_ = false;
+    std::vector<MaterialEntry> materials_;
+    std::string matFilter_;
+    std::string pickedMaterial_, hoveredMaterial_; // MaterialEntry labels: picked on the model, hovered in the list
+    int pickedMesh_ = -1;
+    bool scrollToPicked_ = false;
+    bool allColours_ = false, matColoursOnly_ = false;
     // Replacements not saved yet: a model copied in, then OBJ imports, in order.
     std::unique_ptr<caff::Caff> preview_;
     std::string pendingSwap_;
-    std::vector<Bytes> pendingObjs_; // OBJ or FBX files
+    struct PendingImport {
+        Bytes file; // OBJ or FBX
+        bool rig = false;
+    };
+    std::vector<PendingImport> pendingObjs_;
+    bool importRig_ = false;
     std::vector<std::string> replaceNotes_;
     std::string swapFilter_;
     std::function<void()> deferred_; // runs at the start of the next frame
@@ -1273,8 +1632,15 @@ private:
     std::vector<std::string> ownAnims_;
     int fbxAnims_ = 1; // FBX export: 0 none, 1 named after the model, 2 the one playing
     bool fbxFur_ = true;
+    bool fbxReorient_ = false;
+    int fbxAxis_ = 1; // fbx::Options::boneAxis
+    bool fbxEnds_ = false;
+    float fbxEndPct_ = 1.5f; // end bone length, percent of the skeleton's size
     std::string animFilter_, animName_, pendingName_, animError_;
-    std::future<std::shared_ptr<model::Animation>> pending_;
+    std::future<AnimLoad> pending_;
+    std::optional<MotionEdit> pendingMotion_;   // the motion pending_ applies
+    std::map<std::string, MotionEdit> motions_; // animation -> new motion not saved yet
+    bool motionFromOriginal_ = true;
     std::shared_ptr<model::Animation> anim_;
     std::vector<int> trackOf_;
     int matched_ = 0;

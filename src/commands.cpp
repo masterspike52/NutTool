@@ -429,7 +429,8 @@ size_t findModel(const caff::Caff& c, const std::string& name) {
 // nuttool model-fbx <file> <model> <out.fbx>: the model with its skeleton, textures (from the
 // bundle and its paired stream bundle) and the animations named after it.
 int modelFbx(const Args& a) {
-    fs::path p = a.at(0, "file"), out = a.at(2, "output .fbx");
+    fs::path p = a.at(0, "file"), out = a.at(2, "output .fbx or .obj");
+    bool obj = lower(out.extension().string()) == ".obj";
     std::string name = a.at(1, "model name");
     Loaded l = loadAsset(p);
     if (!l.caff) fail("model-fbx needs a bundle or CAFF");
@@ -441,6 +442,16 @@ int modelFbx(const Args& a) {
     fbx::Options opt;
     if (a.flag("--all-groups")) opt.include.assign(m.meshes.size(), true);
     opt.tint = !a.flag("--no-tint");
+    std::string axis = lower(a.opt("--bone-axis"));
+    opt.reorient = a.flag("--reorient-bones") || !axis.empty();
+    if (!axis.empty()) {
+        static const char* axes[6] = {"x", "y", "z", "-x", "-y", "-z"};
+        auto it = std::find(std::begin(axes), std::end(axes), axis.front() == '+' ? axis.substr(1) : axis);
+        if (it == std::end(axes)) fail("--bone-axis takes X, Y, Z, -X, -Y or -Z");
+        opt.boneAxis = int(it - std::begin(axes));
+    }
+    opt.boneEnds = a.flag("--bone-ends") || !a.opt("--bone-end-size").empty();
+    if (!a.opt("--bone-end-size").empty()) opt.boneEndSize = std::clamp(std::stof(a.opt("--bone-end-size")) / 100, 0.0001f, 1.0f);
 
     // Textures: whole ones and mip halves here, streamed top levels in the paired stream bundle.
     std::vector<caff::Caff> streamCaffs;
@@ -497,7 +508,7 @@ int modelFbx(const Args& a) {
     // Animations: "aid_anim_<model>_*" in --anims <file> (default: the same bundle), or all of them with --all-anims.
     std::vector<model::Animation> anims;
     std::vector<std::string> animNames;
-    if (!a.flag("--no-anims")) {
+    if (!obj && !a.flag("--no-anims")) {
         std::optional<Loaded> other;
         caff::Caff* ac = &c;
         if (!a.opt("--anims").empty()) {
@@ -522,8 +533,20 @@ int modelFbx(const Args& a) {
     for (size_t i = 0; i < anims.size(); ++i) opt.animations.push_back({animNames[i], &anims[i]});
 
     fbx::Report r;
-    Bytes data = fbx::write(m, opt, &r);
     if (out.has_parent_path()) fs::create_directories(longPath(out.parent_path()));
+    if (obj) {
+        std::string base = out.stem().string();
+        fbx::ObjFiles files = fbx::writeObj(m, opt, base, &r);
+        fs::path dir = out.parent_path();
+        writeText(out, files.obj);
+        writeText(dir / (base + ".mtl"), files.mtl);
+        for (auto& [file, bytes] : files.files) writeFile(dir / file, bytes);
+        print("%s: %zu meshes, %zu vertices, %zu triangles, %zu materials, %zu textures, %zu fur shells -> %s (+ %zu files)\n", m.name.c_str(),
+              r.meshes, r.vertices, r.triangles, r.materials, r.textures, r.furShells, out.string().c_str(), files.files.size() + 1);
+        for (auto& n : r.notes) print("  note: %s\n", n.c_str());
+        return 0;
+    }
+    Bytes data = fbx::write(m, opt, &r);
     writeFile(out, data);
     print("%s: %zu meshes, %zu vertices, %zu triangles, %zu bones, %zu materials, %zu textures (%zu embedded), %zu animations, %zu fur shells -> %s (%zu KB)\n",
           m.name.c_str(), r.meshes, r.vertices, r.triangles, r.bones, r.materials, r.textures, r.embedded, r.animations, r.furShells,
@@ -634,8 +657,9 @@ int modelImport(const Args& a) {
     fs::path p = a.at(0, "file");
     std::string name = a.at(1, "model name");
     Bytes mesh = readFile(a.at(2, "OBJ or FBX file"));
+    bool rig = a.flag("--rig");
     editModel(a, p, name, [&](caff::Caff& c, size_t s) {
-        model::ImportReport r = model::importMeshFile(c, s, mesh);
+        model::ImportReport r = model::importMeshFile(c, s, mesh, rig);
         print("%s: %d mesh(es) edited in place, %d rebuilt, %d hidden\n", c.symbolName(s).c_str(), r.edited, r.rebuilt, r.hidden);
         for (auto& n : r.notes) print("  %s\n", n.c_str());
         return std::vector<streambundle::Entry>{};
@@ -1113,10 +1137,11 @@ const std::vector<Command>& commands() {
         {"model-export", "<file> <dir> [--all-groups] [--png]",
          "Export models as OBJ + MTL with a bone list; --all-groups includes every LOD and alternative part, --png writes the file's textures",
          modelExport},
-        {"model-import", "<file> <model name> <in.obj|in.fbx> [-o out] [--xctd]",
+        {"model-import", "<file> <model name> <in.obj|in.fbx> [--rig] [-o out] [--xctd]",
          "Apply an OBJ or binary FBX to a model: objects named like the export (group0_mesh3) edit that mesh in place when vertex and "
          "triangle counts match, otherwise replace its geometry (skinning from the FBX's weights on bones named like the model's, else "
-         "copied from the nearest original vertex); an object without faces hides the mesh",
+         "copied from the nearest original vertex); an object without faces hides the mesh. --rig also moves the model's joints to the "
+         "FBX's bones of the same names (orientations, hierarchy and bone count stay); the file may then hold only the skeleton",
          modelImport},
         {"model-swap", "<file> <model name> <source file> <source model> [-o out] [--stream-out out] [--xctd]",
          "Replace a model with a copy of another one (from the same or another bundle); the name stays, so the game loads it in its place. "
@@ -1124,12 +1149,20 @@ const std::vector<Command>& commands() {
          modelSwap},
         {"model-fbx",
          "<file> <model name> <out.fbx> [--all-groups] [--no-textures] [--no-anims] [--anims <bundle>] [--all-anims] [--no-fur] "
-         "[--fur-length pct] [--fur-tiling n] [--fur-size px] [--no-tint]",
+         "[--fur-length pct] [--fur-tiling n] [--fur-size px] [--no-tint] [--reorient-bones] [--bone-axis X|Y|Z|-X|-Y|-Z] [--bone-ends] [--bone-end-size pct]",
          "Export a model as FBX: meshes skinned to its skeleton, materials with embedded PNG textures (tinted by their material's "
-         "colour gain and offset as the game draws them; --no-tint keeps them as stored), its animations as takes "
+         "colour gain and offset as the game draws them; --no-tint keeps them as stored), bones in the game's frames (--reorient-bones "
+         "turns each so --bone-axis, default Y as Blender uses, runs along it to its child; --bone-ends gives each childless bone a "
+         "short <bone>_end child, percent of the skeleton's size, default 1.5, so Blender draws it as a stub), its animations as takes "
          "(those named after it, from the same bundle or --anims; --all-anims for every animation there), and its fur as skinned "
          "shell meshes with embedded baked alpha textures (--no-fur leaves it out; length in percent of the model's radius, default "
          "1.5; tiling default 6; size default 512)",
+         modelFbx},
+        {"model-obj",
+         "<file> <model name> <out.obj> [--all-groups] [--no-textures] [--no-fur] [--fur-length pct] [--fur-tiling n] [--fur-size px] "
+         "[--no-tint]",
+         "Export a model as OBJ with the same meshes, materials, tinted textures (PNG files) and fur shells as model-fbx; for the "
+         "skeleton, skin and animations use model-fbx",
          modelFbx},
         {"anim-import", "<file> <animation name> <keys.json> [-o out] [--xctd]",
          "Give an animation new motion from a JSON timeline of poses (bone rotations in Euler degrees, offsets in metres); bones "
@@ -1172,7 +1205,7 @@ namespace {
 Args parseArgs(const std::vector<std::string>& argv) {
     static const std::set<std::string> valued = {"-o", "--out", "--stream", "--stream-out", "--base", "--section", "--only",
                                                 "--name", "--id", "--version", "--author", "--category", "--description", "--original", "--anims", "--filter",
-                                                "--assets", "--update", "--fur-length", "--fur-tiling", "--fur-size"};
+                                                "--assets", "--update", "--fur-length", "--fur-tiling", "--fur-size", "--bone-axis", "--bone-end-size"};
     Args a;
     for (size_t i = 1; i < argv.size(); ++i) {
         std::string s = argv[i];

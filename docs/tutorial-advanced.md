@@ -115,16 +115,16 @@ two-legged model replaces a two-legged character best, because its limbs line up
 the skeleton's.
 
 1. **Export everything.** In the target's model tab, tick **Show everything** in
-   **Parts**, then **Export OBJ...**. Or from the command line, which also writes the bone
-   list:
+   **Parts**, then **Export OBJ...** (or **Export FBX...** to get the skeleton and skin
+   weights too, section 4). Or from the command line, which also writes the bone list:
 
    ```
    nuttool model-export <bundle> <folder> --all-groups --png
    ```
 
-   You get one OBJ with an object per mesh (`group1_mesh30`...), an `.mtl` naming each
-   mesh's texture, the textures as PNGs, and `<model>.bones.txt` with every bone's name,
-   parent and world position.
+   You get one OBJ with an object per mesh (`group1_mesh30`...), an `.mtl` with each
+   mesh's material, the textures as PNGs, and (from the command line)
+   `<model>.bones.txt` with every bone's name, parent and world position.
 2. **Learn the skeleton.** Turn on the skeleton (and bone names) in the model tab, and
    read the bones file. Note where the main joints are: hips, knees, ankles, spine, neck,
    shoulders, elbows and wrists, plus any extra bones for attachments (a backpack, a tail,
@@ -239,7 +239,7 @@ Each mesh draws with its own texture. You have four ways to colour your parts:
    models, and repainting it changes them too. Prefer a texture only your target uses:
    the texture tab's **Where it lives** and the model's texture list help you check.
 4. **Untextured meshes** (many outfits and clothes) take their colour from material
-   constants. Change those in **Material colours** and **Save**.
+   constants. Change those in **Materials** and **Save**.
 
 A model that comes with one texture for everything works best with option 3: put it on
 one mesh's texture and give every part UVs into it. Parts in other meshes can't use that
@@ -312,11 +312,21 @@ In the model tab, click **Export FBX...**. The options:
   viewer, or none. Each one becomes a take (an *action* in Blender).
 - **Fur shells** (furry characters only, on by default): adds the fur as the viewer draws it.
   Set **Fur length** and **Tiling** in the viewer first; the export uses the same values.
+- **Reorient bones** (off by default): the game's bones all face the same way, so in
+  Blender they stick straight up instead of following the arms and legs. With this on, each
+  bone is turned to point at its child, which makes the rig much easier to select and pose.
+  **Bone axis** picks which of the bone's axes points down it: **+Y** for Blender, or the
+  axis your program's importer expects (often +X). The model, its skin and its animations
+  look exactly the same either way; only the bones' own frames change.
+- **Short end bones** (off by default): gives every bone that has no children (fingertips,
+  eyes, the wrench's parts) a tiny `_end` child, so Blender draws it as a short stub instead
+  of a huge spike (see 4.2). **End length** sets how short, in percent of the skeleton's size.
 
 From the command line:
 
 ```
 nuttool model-fbx <bundle> <model> out.fbx [--all-groups] [--no-anims] [--no-fur] [--fur-length 1.5] [--fur-tiling 6]
+                  [--reorient-bones] [--bone-axis Y] [--bone-ends] [--bone-end-size 1.5]
 ```
 
 What's in the file:
@@ -332,9 +342,21 @@ Sizes are in metres, with Y up, as the game uses them.
 
 ### 4.2 Open it in Blender
 
-1. **File > Import > FBX (.fbx)**, and pick the file. The default settings are fine.
-   *Automatic Bone Orientation* makes the bones point along the limbs, which is easier to
-   pose; it doesn't change the mesh.
+1. **File > Import > FBX (.fbx)**, and pick the file. The default settings are fine. If
+   you exported with **Reorient bones** and **+Y**, the bones already point along the limbs:
+   leave *Automatic Bone Orientation* off and *Primary Bone Axis* at Y. Without it,
+   *Automatic Bone Orientation* does a rougher version of the same thing.
+   **Some bones look huge** (the wrench's, the face's). Blender makes each bone as long as
+   the average distance to its children, and a bone with no children copies its parent's
+   length. Export with **Short end bones** and those childless bones become small stubs;
+   tick *Ignore Leaf Bones* in Blender's import settings to hide the `_end` helpers
+   themselves (the stubs keep their size). A bone with several children far apart (the neck,
+   whose children include the eyes) still averages them; to tidy those too, open the **Scripting** tab,
+   click **Open**, pick `docs/blender/tidy_bones.py` from NutTool's folder, select the
+   armature, and click **Run Script** (▶). Each bone then reaches its main child, and
+   bones with no children become short stubs. Only their drawn length changes: the mesh, the
+   rest pose and the animations stay exactly the same. Or, just to see them less, select the
+   armature and set *Object Data properties > Viewport Display > Display As* to **Stick**.
 2. **Textures don't show at first.** Blender opens in *Solid* view, which draws everything
    grey. Press **Z** and choose **Material Preview** (or click the third sphere at the top
    right of the 3D view) to see the textures. Renders use them too.
@@ -356,7 +378,7 @@ What looks different from the game:
   comes from its shaders (specular, normal maps, reflections). For renders, give those
   materials *Metallic* about 1 and *Roughness* about 0.3.
 - **Untextured parts** (many clothes) use their material's colour, which is the same colour
-  the model tab's **Material colours** shows.
+  the model tab's **Materials** section shows.
 
 ### 4.3 Bring it back
 
@@ -375,9 +397,21 @@ Click **Import OBJ / FBX...** in the model tab's **Replace** section (or
 - **Fur shells are skipped.** The game draws the fur itself, from the mesh under it.
 - An object with a vertex but no faces still hides its mesh (3.4).
 
-The skeleton itself is not read back: moving, adding or renaming bones in Blender has no
-effect in game. Animations aren't read back from FBX either; the next section shows how to
-make new ones.
+The skeleton is only read back when you ask for it:
+
+- **Override rig** (the checkbox next to **Import OBJ / FBX...**, or `--rig` with
+  `model-import`) moves the target's joints to your FBX's bones with the same names, so
+  the game's animations bend your model where your rig's joints are. Use it when your
+  model's proportions differ from the original's (longer legs, a higher waist).
+- Only joint positions change. Bone orientations, the hierarchy and the bone count stay
+  the game's, because its animations are made for them. Bones your file lacks follow their
+  parent; extra bones are ignored and listed.
+- The positions come from the file's bind pose (the skin, or the BindPose Blender writes),
+  so posing the armature before you export doesn't matter.
+- The file can hold just the armature, or the armature and the meshes together.
+- Moving joints doesn't move the mesh: in the bind pose it looks exactly as you made it.
+
+Animations aren't read back from FBX; the next section shows how to make new ones.
 
 ## 5. Make new animations
 
@@ -388,7 +422,18 @@ plays when the character cheers.
 
 You describe the motion in a JSON text file, a **timeline of poses**: which bones turn or
 move, and when. NutTool eases between your poses and writes the result into the
-animation. This is done from the command line:
+animation.
+
+**From Blender**: the add-on `docs/blender/nuttool_animation_keys.py` writes this file
+from an animated armature (*File > Export > NutTool Animation Keys*). Animate the skeleton
+from NutTool's **Export FBX...** with keyframes, constraints or IK, export, and bring the
+file in as below. [animation-keys.md](animation-keys.md#from-blender) has the steps and
+options. The rest of this section is about writing the file by hand.
+
+**In the GUI** (recommended): open the character's model tab, pick the animation in the
+**Animation** list, click **Replace motion...** and choose your JSON file. The viewport
+plays the new motion at once; **Ctrl+S** writes it into every bundle holding the animation.
+From the command line:
 
 ```
 nuttool anim-import <bundle> <animation> my_motion.json
@@ -484,7 +529,19 @@ key.
 
 ### 5.5 Import, check, repeat
 
-Always start from the original animation, so a second try doesn't build on the first:
+Always start from the original animation, so a second try doesn't build on the first.
+
+**In the GUI**:
+
+- **Build on the original** (on by default) reads the animation from the bundle's `.bak`,
+  which NutTool makes before it first writes the bundle. With no `.bak` yet, it uses the
+  bundle as it is.
+- After editing the JSON, click **Reload** to see the change; **Discard** goes back to the
+  saved motion. Nothing is written until **Ctrl+S**.
+- Under the buttons, the report says how many bones were keyed and how many timeline
+  entries were used. It notes any key past the animation's end.
+
+**From the command line**:
 
 ```
 nuttool anim-import <bundle>.bak <animation> my_motion.json -o <bundle>
@@ -492,8 +549,7 @@ nuttool anim-import <bundle>.bak <animation> my_motion.json -o <bundle>
 
 (The first time, run it without `.bak` and `-o`: NutTool makes the `.bak` itself.)
 
-- The report says how many bones were keyed and how many timeline entries were used. It
-  notes any key past the animation's end.
+- The command prints the same report.
 - **Check it in NutTool**: open the character's model tab (close and reopen it if it was
   already open), pick the animation in the **Animation** list and play it.
 - **Check it in game**: package the mod (section 14) and load it in reNut.
@@ -639,7 +695,8 @@ nuttool tex-export <bundle> tex --png        # textures
 nuttool tex-import <bundle> <texture> <image> [--stream <stream bundle>]
 nuttool model-export <bundle> models [--all-groups] [--png]
 nuttool model-fbx <bundle> <model> out.fbx   # skinned, with animations and fur, for Blender/Maya
-nuttool model-import <bundle> <model> <file.obj|file.fbx>
+nuttool model-obj <bundle> <model> out.obj   # the same meshes, materials and fur as OBJ
+nuttool model-import <bundle> <model> <file.obj|file.fbx> [--rig]   # --rig: your FBX's joint positions too
 nuttool model-swap <bundle> <target> <source bundle> <source>
 nuttool anim-import <bundle> <animation> <motion.json>   # new motion for an animation
 nuttool menu-fix assets [--update <dir>]

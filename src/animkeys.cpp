@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <optional>
+#include <set>
 
 namespace nut::model {
 namespace {
@@ -23,6 +25,11 @@ Quat qnorm(Quat q) {
     if (n < 1e-12) return {0, 0, 0, 1};
     for (double& x : q) x /= n;
     return q;
+}
+Quat qconj(const Quat& q) { return {-q[0], -q[1], -q[2], q[3]}; }
+Vec qrot(const Quat& q, const Vec& v) {
+    Quat r = qmul(qmul(q, {v[0], v[1], v[2], 0}), qconj(q));
+    return {r[0], r[1], r[2]};
 }
 // XYZ Euler degrees, X applied first: q = qz * qy * qx (FBX's default order, as fbx.cpp writes it).
 Quat fromEuler(const Vec& deg) {
@@ -73,12 +80,53 @@ std::vector<Key> keysFromJson(const Animation& a, const std::string& text, KeysR
     const size_t nf = size_t(a.frames);
     if (!nb || !nf || a.keys.size() != nf * nb) fail("animation " + a.name + " has no keys to start from");
 
+    auto option = [&](const char* key, std::initializer_list<const char*> allowed) {
+        std::string v = doc.has(key) ? doc[key].asString() : *allowed.begin();
+        for (const char* x : allowed)
+            if (v == x) return v;
+        std::string list;
+        for (const char* x : allowed) list += std::string(list.empty() ? "" : " or ") + "\"" + x + "\"";
+        fail(std::string("animation keys: ") + key + " must be " + list);
+    };
+    const bool modelSpace = option("space", {"local", "model"}) == "model";
+    const bool linear = option("interpolation", {"smooth", "linear"}) == "linear";
+    const bool skipUnknown = option("unknownBones", {"fail", "skip"}) == "skip";
+
+    // Rest-pose rotation of each bone in model space, for "space": "model" (rot' = rest(parent)^-1 * rot * rest(bone)).
+    std::vector<Quat> restWorld;
+    if (modelSpace) {
+        if (a.pose.size() != nb) fail("animation keys: " + a.name + " has no rest pose for \"space\": \"model\"");
+        restWorld.assign(nb, {0, 0, 0, 1});
+        std::vector<int> state(nb, 0);
+        std::function<void(size_t)> solve = [&](size_t i) {
+            if (state[i]) return;
+            state[i] = 1;
+            const Bone& b = a.pose[i];
+            Quat q = qnorm({b.rotation[0], b.rotation[1], b.rotation[2], b.rotation[3]});
+            if (b.parent >= 0 && size_t(b.parent) < nb && size_t(b.parent) != i) {
+                if (state[size_t(b.parent)] == 1) fail("animation keys: " + a.name + "'s skeleton has a loop");
+                solve(size_t(b.parent));
+                q = qmul(restWorld[size_t(b.parent)], q);
+            }
+            restWorld[i] = q;
+            state[i] = 2;
+        };
+        for (size_t i = 0; i < nb; ++i) solve(i);
+    }
+    auto parentRest = [&](int b) {
+        int p = a.pose[size_t(b)].parent;
+        return p >= 0 && uint32_t(p) < nb ? restWorld[size_t(p)] : Quat{0, 0, 0, 1};
+    };
+
     std::map<std::string, int> byName;
     for (size_t i = 0; i < a.boneNames.size(); ++i) byName.emplace(lower(a.boneNames[i]), int(i));
+    std::set<std::string> skipped;
     auto boneOf = [&](const std::string& n) {
         auto it = byName.find(lower(n));
-        if (it == byName.end()) fail("animation keys: " + a.name + " has no bone named " + n);
-        return it->second;
+        if (it != byName.end()) return it->second;
+        if (!skipUnknown) fail("animation keys: " + a.name + " has no bone named " + n);
+        skipped.insert(n);
+        return -1;
     };
     auto readPose = [&](const Json& j, const std::string& where) {
         if (j.type() != Json::Object) fail("animation keys: " + where + " must be an object of bones");
@@ -86,6 +134,8 @@ std::vector<Key> keysFromJson(const Animation& a, const std::string& text, KeysR
         for (auto& [bone, v] : j.members()) {
             std::string w = where + " " + bone;
             if (v.type() != Json::Object) fail("animation keys: " + w + " must be an object with rot and/or move");
+            int b = boneOf(bone);
+            if (b < 0) continue;
             Value val;
             if (v.has("rot")) {
                 const Json& r = v["rot"];
@@ -93,6 +143,7 @@ std::vector<Key> keysFromJson(const Animation& a, const std::string& text, KeysR
                 if (r.type() == Json::String && r.asString() == "base") p.base = true;
                 else if (r.type() == Json::Array && r.size() == 4) p.rot = qnorm({r[0].asNumber(), r[1].asNumber(), r[2].asNumber(), r[3].asNumber()});
                 else p.rot = fromEuler(vec3(r, w + " rot"));
+                if (modelSpace && !p.base) p.rot = qnorm(qmul(qmul(qconj(parentRest(b)), p.rot), restWorld[size_t(b)]));
                 val.rot = p;
             }
             if (v.has("move")) {
@@ -100,9 +151,10 @@ std::vector<Key> keysFromJson(const Animation& a, const std::string& text, KeysR
                 Point p;
                 if (m.type() == Json::String && m.asString() == "base") p.base = true;
                 else p.move = vec3(m, w + " move");
+                if (modelSpace && !p.base) p.move = qrot(qconj(parentRest(b)), p.move);
                 val.move = p;
             }
-            pose[boneOf(bone)] = val;
+            pose[b] = val;
         }
         return pose;
     };
@@ -111,12 +163,7 @@ std::vector<Key> keysFromJson(const Animation& a, const std::string& text, KeysR
     if (doc.has("poses"))
         for (auto& [name, j] : doc["poses"].members()) poses[name] = readPose(j, "pose " + name);
 
-    bool keep = true;
-    if (doc.has("base")) {
-        std::string b = doc["base"].asString();
-        if (b != "keep" && b != "rest") fail("animation keys: base must be \"keep\" or \"rest\"");
-        keep = b == "keep";
-    }
+    const bool keep = option("base", {"keep", "rest"}) == "keep";
 
     // Keys per bone, in timeline order (a later entry at the same time wins).
     std::map<int, std::vector<Point>> rotKeys, moveKeys;
@@ -192,7 +239,7 @@ std::vector<Key> keysFromJson(const Animation& a, const std::string& text, KeysR
         Point p0 = resolve(k[i - 1], b), p1 = resolve(k[i], b);
         double span = k[i].time - k[i - 1].time;
         double u = span > 1e-9 ? (t - k[i - 1].time) / span : 1;
-        u = u * u * (3 - 2 * u);
+        if (!linear) u = u * u * (3 - 2 * u);
         Point r;
         if (rot) r.rot = qblend(p0.rot, p1.rot, u);
         else
@@ -222,6 +269,13 @@ std::vector<Key> keysFromJson(const Animation& a, const std::string& text, KeysR
     for (auto& [b, k] : rotKeys) keyed[b] = true;
     for (auto& [b, k] : moveKeys) keyed[b] = true;
     rep.bones = keyed.size();
+    if (!skipped.empty()) {
+        std::string list;
+        size_t n = 0;
+        for (auto& s : skipped)
+            if (n++ < 10) list += (list.empty() ? "" : ", ") + s;
+        rep.notes.push_back(std::to_string(skipped.size()) + " bone(s) the skeleton lacks were skipped: " + list + (n > 10 ? ", ..." : ""));
+    }
     if (report) *report = std::move(rep);
     return out;
 }

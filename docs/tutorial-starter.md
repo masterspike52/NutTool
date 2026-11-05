@@ -137,9 +137,10 @@ instead. Banjo's tuxedo is one.
 1. Open **Models** and pick **`aid_model_banjox_actor_banjotuxedo`**.
 2. The 3D view shows the model. Drag with the left mouse button to orbit, use the wheel
    to zoom, and double-click to reset the camera.
-3. Open the **Material colours** section. Each entry is one colour setting of the model's
-   materials, such as `banjoTuxedoModel1_tuxFabric` and its `c:basecolour`.
-4. Click a colour and pick a new one. The view updates as you go.
+3. Click the part of the model you want to recolour. The **Materials** section then shows
+   just that part's material, such as `banjoTuxedoModel1_tuxFabric`, with its settings,
+   such as its `basecolour`. (Or type part of a name in its search box, such as `tux`.)
+4. Click a colour swatch and pick a new one. The view updates as you go.
 5. Click **Save**. NutTool writes the colours into every file that holds the model.
 
 To see your character move, pick an animation in the **Animation** section and press play.
@@ -204,7 +205,7 @@ game.
 | repaint a texture | its tab in **Textures**: Export PNG, edit, Import image |
 | upscale lots of textures | Tools > Extract everything (Textures only), then Tools > Bulk import textures |
 | fix cropped menu icons after resizing | automatic; or Tools > Fit menus to resized textures |
-| recolour an outfit | the model's tab: Material colours, then Save |
+| recolour an outfit | the model's tab: Materials, then Save |
 | change text | **Text** > language > table, then Ctrl+S |
 | save a sound | its bank in **Audio**: Export WAV |
 | make a mod | Tools > Export mod package (.nbpatch) |

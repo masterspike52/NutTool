@@ -30,10 +30,10 @@ endif()
 
 function(nuttool_warnings target)
     if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /EHsc)
+        target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:C,CXX>:/W4;/permissive-;/utf-8;/EHsc>")
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
     else()
-        target_compile_options(${target} PRIVATE -Wall -Wextra)
+        target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra>")
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
     endif()
 endfunction()
@@ -108,7 +108,22 @@ else()
     message(STATUS "FFmpeg not found: XMA audio cannot be decoded")
 endif()
 
-add_executable(nuttool src/main.cpp)
+# The program icon: icon/nuttool.png made into an .ico while building, in both executables' resources.
+add_executable(nuttool-make-icon tools/make_icon.cpp)
+target_link_libraries(nuttool-make-icon PRIVATE nutcore)
+nuttool_warnings(nuttool-make-icon)
+set(NUTTOOL_ICON_PNG ${CMAKE_CURRENT_SOURCE_DIR}/icon/nuttool.png)
+set(NUTTOOL_ICO ${CMAKE_CURRENT_BINARY_DIR}/nuttool.ico)
+add_custom_command(OUTPUT ${NUTTOOL_ICO}
+    COMMAND nuttool-make-icon ${NUTTOOL_ICON_PNG} ${NUTTOOL_ICO}
+    DEPENDS nuttool-make-icon ${NUTTOOL_ICON_PNG}
+    COMMENT "Making nuttool.ico"
+    VERBATIM)
+configure_file(gui/nuttool.rc.in ${CMAKE_CURRENT_BINARY_DIR}/nuttool.rc @ONLY)
+set(NUTTOOL_RC ${CMAKE_CURRENT_BINARY_DIR}/nuttool.rc)
+set_source_files_properties(${NUTTOOL_RC} PROPERTIES OBJECT_DEPENDS ${NUTTOOL_ICO})
+
+add_executable(nuttool src/main.cpp ${NUTTOOL_RC})
 target_link_libraries(nuttool PRIVATE nutcore)
 nuttool_warnings(nuttool)
 
@@ -130,6 +145,7 @@ if(NUTTOOL_HAVE_GUI_DEPS)
         gui/audio_view.cpp
         gui/gl_view.cpp
         gui/video_player.cpp
+        ${NUTTOOL_RC}
     )
     if(TARGET SDL3::SDL3)
         set(NUTTOOL_SDL SDL3::SDL3)

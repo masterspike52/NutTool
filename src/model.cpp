@@ -968,7 +968,8 @@ Animation parseAnimation(const caff::Caff& c, size_t symbol) {
         a.frameTimes.push_back(authored > 1 ? a.duration * float(at) / float(authored - 1) : 0.0f);
     }
     if (v.isLocal(0x48)) {
-        for (auto& b : readPose(v, v.local(0x48))) {
+        a.pose = readPose(v, v.local(0x48));
+        for (auto& b : a.pose) {
             a.boneNames.push_back(b.name);
             a.parents.push_back(b.parent);
         }

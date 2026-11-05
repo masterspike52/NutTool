@@ -7,7 +7,9 @@
 #include <imgui.h>
 
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace nut::gui {
@@ -95,6 +97,10 @@ public:
     void frame();      // reset the camera to fit the model
     // Draws the viewport filling `size` and handles mouse input on it.
     void draw(const ImVec2& size, const Options& opt);
+    // Meshes drawn tinted to stand out (e.g. the material being edited); empty = none.
+    void setHighlight(const std::vector<bool>& meshes) { highlight_ = meshes; }
+    // The last left click without a drag: the visible mesh under the cursor (-1 for none), or nothing.
+    std::optional<int> takeClick() { return std::exchange(click_, std::nullopt); }
 
 private:
     struct GpuMesh {
@@ -109,6 +115,8 @@ private:
         std::vector<float> bind;      // bind-pose vertex data of skinned meshes
         std::vector<uint8_t> boneIds; // 4 per vertex
         std::vector<float> weights;   // 4 per vertex
+        std::vector<float> pos;       // current (posed) positions, 3 per vertex, for picking
+        std::vector<uint32_t> indices;
         int skinnedVersion = 0;
         Fur fur;
     };
@@ -128,8 +136,11 @@ private:
     void ensureTarget(int w, int h);
     void release();
     void viewProj(float* out, int w, int h) const;
+    int pick(float ndcX, float ndcY, float aspect) const;
 
     std::vector<GpuMesh> meshes_;
+    std::vector<bool> highlight_;
+    std::optional<int> click_;
     std::vector<model::Bone> bones_;
     std::vector<float> skin_, boneWorld_;
     int poseVersion_ = 0;

@@ -182,7 +182,9 @@ private:
     void pumpDialogs();
     void pumpTasks();
     void saveDocument(Document& d, bool saveAs);
-    void closeDocument(size_t i);
+    // Closes the tabs `uids`, asking first when any of them has unsaved changes.
+    void closeDocuments(const std::vector<std::string>& uids);
+    void removeDocuments(const std::vector<std::string>& uids);
     void drawRestore();
     void drawBulkImport();
     void drawChangedMips();
@@ -216,7 +218,9 @@ private:
     std::vector<std::unique_ptr<Document>> docs_;
     std::string selectTab_;      // tab to bring to front on the next frame
     std::string currentTabUid_;  // tab shown this frame
-    int closeConfirm_ = -1;
+    std::vector<std::string> closeUids_; // tabs waiting for the unsaved-changes answer
+    bool collapseDoc_ = false;           // collapse every section of the shown tab this frame
+    bool collapseBrowser_ = false;       // and of the asset tree
     int uidCounter_ = 0;
 
     std::string status_;
@@ -292,9 +296,14 @@ inline float em(float v) { return v * ImGui::GetFontSize() / 16.0f; }
 void splitter(const char* id, float& width, float minWidth, float maxWidth, float height);
 void hexView(const char* id, const Bytes& data, float height);
 void helpMarker(const char* text);
+// Closes every tree node and collapsing header of the current window and its child windows.
+void collapseWindowTree();
+// True while a "Collapse all" is drawn: nodes that open by default call SetNextItemOpen(false) then.
+bool collapsingAll();
 // Suggested save name for an asset: its name without "aid_<type>_" and the game prefix, plus `ext`.
 fs::path exportName(const std::string& asset, const std::string& ext);
 bool inputText(const char* label, std::string& s, ImGuiInputTextFlags flags = 0);
+bool inputTextWithHint(const char* label, const char* hint, std::string& s, ImGuiInputTextFlags flags = 0);
 bool inputTextMultiline(const char* label, std::string& s, const ImVec2& size, ImGuiInputTextFlags flags = 0);
 
 } // namespace nut::gui

@@ -273,6 +273,99 @@ void reduceKeys(const std::vector<float>& v, const std::vector<int64_t>& t, floa
     }
 }
 
+// ---- bone orientation ----------------------------------------------------------------------
+
+using Quat = std::array<double, 4>; // x y z w
+using V3 = std::array<double, 3>;
+
+Quat qmul(const Quat& a, const Quat& b) {
+    return {a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1], a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+            a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3], a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
+}
+Quat qconj(const Quat& q) { return {-q[0], -q[1], -q[2], q[3]}; }
+V3 qrot(const Quat& q, const V3& v) {
+    const double zero[3] = {0, 0, 0}, one[3] = {1, 1, 1};
+    Mat4 r = trs(zero, q.data(), one);
+    return {r[0] * v[0] + r[4] * v[1] + r[8] * v[2], r[1] * v[0] + r[5] * v[1] + r[9] * v[2], r[2] * v[0] + r[6] * v[1] + r[10] * v[2]};
+}
+double vlen(const V3& v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
+
+// Per bone, the turn (in its game frame) that points `axis` (0-2 +X/+Y/+Z, 3-5 -X/-Y/-Z) at its main child: the one with
+// the most bones under it, or the average of tied ones. Leaves carry on along the line from their parent.
+std::vector<Quat> boneFixes(const model::Model& m, const std::vector<Mat4>& world, int axis) {
+    size_t nb = m.bones.size();
+    auto parentOf = [&](size_t i) {
+        int p = m.bones[i].parent;
+        return p >= 0 && size_t(p) < nb && size_t(p) != i ? p : -1;
+    };
+    std::vector<std::vector<size_t>> kids(nb);
+    for (size_t i = 0; i < nb; ++i)
+        if (int p = parentOf(i); p >= 0) kids[size_t(p)].push_back(i);
+    std::vector<int> under(nb, -1);
+    std::function<int(size_t, size_t)> count = [&](size_t i, size_t depth) -> int {
+        if (under[i] >= 0 || depth > nb) return std::max(0, under[i]);
+        int n = 0;
+        for (size_t c : kids[i]) n += 1 + count(c, depth + 1);
+        return under[i] = n;
+    };
+    auto pos = [&](size_t i) { return V3{world[i][12], world[i][13], world[i][14]}; };
+    const double eps = 1e-4; // children closer than this (metres) give no direction
+    std::vector<V3> dir(nb);
+    std::vector<char> has(nb, 0), state(nb, 0);
+    std::function<void(size_t)> solve = [&](size_t i) {
+        if (state[i]) return;
+        state[i] = 1;
+        V3 p = pos(i), sum{};
+        int best = -1;
+        for (size_t c : kids[i]) {
+            V3 q = pos(c), d = {q[0] - p[0], q[1] - p[1], q[2] - p[2]};
+            double len = vlen(d);
+            if (len < eps) continue;
+            int n = count(c, 0);
+            if (n > best) best = n, sum = {};
+            if (n == best)
+                for (int k = 0; k < 3; ++k) sum[size_t(k)] += d[size_t(k)] / len;
+        }
+        double len = vlen(sum);
+        if (best >= 0 && len > 1e-9) {
+            dir[i] = {sum[0] / len, sum[1] / len, sum[2] / len};
+            has[i] = 1;
+        } else if (int pi = parentOf(i); pi >= 0) {
+            solve(size_t(pi));
+            V3 q = pos(size_t(pi)), d = {p[0] - q[0], p[1] - q[1], p[2] - q[2]};
+            double l = vlen(d);
+            if (l >= eps) dir[i] = {d[0] / l, d[1] / l, d[2] / l}, has[i] = 1;
+            else if (has[size_t(pi)]) dir[i] = dir[size_t(pi)], has[i] = 1;
+        }
+        state[i] = 2;
+    };
+    V3 a{};
+    a[size_t(axis % 3)] = axis >= 3 ? -1 : 1;
+    std::vector<Quat> fix(nb, Quat{0, 0, 0, 1});
+    for (size_t i = 0; i < nb; ++i) {
+        solve(i);
+        if (!has[i]) continue;
+        // The direction in the bone's own frame: the transpose of its world rotation applied.
+        const Mat4& w = world[i];
+        V3 l;
+        for (int r = 0; r < 3; ++r) l[size_t(r)] = w[size_t(r * 4)] * dir[i][0] + w[size_t(r * 4 + 1)] * dir[i][1] + w[size_t(r * 4 + 2)] * dir[i][2];
+        double ln = vlen(l);
+        if (ln < 1e-9) continue;
+        for (auto& x : l) x /= ln;
+        double dot = a[0] * l[0] + a[1] * l[1] + a[2] * l[2];
+        if (dot > 1 - 1e-9) continue;
+        Quat q;
+        if (dot < -1 + 1e-9) {
+            q = axis % 3 == 0 ? Quat{0, 0, 1, 0} : Quat{1, 0, 0, 0}; // a half turn across the axis
+        } else {
+            q = {a[1] * l[2] - a[2] * l[1], a[2] * l[0] - a[0] * l[2], a[0] * l[1] - a[1] * l[0], 1 + dot}; // the shortest turn
+            normalize(q.data());
+        }
+        fix[i] = q;
+    }
+    return fix;
+}
+
 std::string shortTextureName(const std::string& n) {
     for (const char* p : {"aid_texture_banjox_", "aid_texture_banjoxdlc_", "aid_texture_"})
         if (startsWith(n, p)) return n.substr(std::strlen(p));
@@ -388,6 +481,133 @@ std::vector<image::Rgba> bakeFur(const model::Model& m, const std::vector<size_t
     return out;
 }
 
+// ---- shared by the FBX and OBJ writers ------------------------------------------------------
+
+using Tint = std::array<float, 6>; // colour gain rgb, offset rgb
+const Tint kNoTint = {1, 1, 1, 0, 0, 0};
+
+// A mesh's colour tint; none when tinting is off.
+Tint meshTint(const model::Mesh& me, bool on) {
+    if (!on) return kNoTint;
+    return {me.textureGain[0], me.textureGain[1], me.textureGain[2], me.textureOffset[0], me.textureOffset[1], me.textureOffset[2]};
+}
+
+// The PNG with `t` baked into its pixels (texture * gain + offset), as the game's shaders draw it.
+std::optional<Bytes> tinted(std::optional<Bytes> png, const Tint& t, const std::string& name, std::vector<std::string>& notes) {
+    if (!png || t == kNoTint) return png;
+    try {
+        image::Rgba img = image::decodePng(*png);
+        for (size_t p = 0; p + 3 < img.pixels.size(); p += 4)
+            for (int c = 0; c < 3; ++c) {
+                float v = float(img.pixels[p + size_t(c)]) / 255.0f * t[size_t(c)] + t[size_t(3 + c)];
+                img.pixels[p + size_t(c)] = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+            }
+        return image::encodePng(img);
+    } catch (std::exception& e) {
+        notes.push_back("texture " + name + ": tint not applied (" + e.what() + ")");
+        return png;
+    }
+}
+
+double furRadius(const model::Model& m) {
+    float dx = m.boundsMax[0] - m.boundsMin[0], dy = m.boundsMax[1] - m.boundsMin[1], dz = m.boundsMax[2] - m.boundsMin[2];
+    return std::max(0.01, std::sqrt(double(dx) * dx + double(dy) * dy + double(dz) * dz) / 2);
+}
+
+// A mesh's vertex positions, pushed `push` out along their normals (fur shells).
+std::vector<std::array<double, 3>> pushedPositions(const model::Mesh& me, double push) {
+    std::vector<std::array<double, 3>> pos;
+    pos.reserve(me.vertices.size());
+    for (auto& v : me.vertices) {
+        double n[3] = {v.normal[0], v.normal[1], v.normal[2]};
+        double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        double k = push != 0 && len > 0.1 ? push / len : 0;
+        pos.push_back({double(v.pos[0]) + n[0] * k, double(v.pos[1]) + n[1] * k, double(v.pos[2]) + n[2] * k});
+    }
+    return pos;
+}
+
+struct FurSet {
+    std::vector<size_t> meshes;       // drawn with these layers
+    std::vector<image::Rgba> layers;  // baked, root to tip
+    std::string name;
+};
+
+// Fur draws bind {0 root colour, 1 fur volume, 2 tip colour, 3 thinning}. Meshes with the same textures, UV layout
+// and tint share one set of baked layers.
+std::vector<FurSet> furSets(const model::Model& m, const Options& opt, const std::function<bool(size_t)>& included) {
+    std::map<int, std::optional<std::vector<image::Rgba>>> decoded;
+    auto imagesOf = [&](int tex) -> const std::vector<image::Rgba>* {
+        if (tex < 0 || size_t(tex) >= m.textures.size()) return nullptr;
+        auto it = decoded.find(tex);
+        if (it == decoded.end()) it = decoded.emplace(tex, opt.pixels(m.textures[size_t(tex)])).first;
+        return it->second && !it->second->empty() ? &*it->second : nullptr;
+    };
+    auto slotTexture = [](const model::Mesh& me, int slot) {
+        for (size_t k = 0; k < me.textures.size() && k < me.textureSlots.size(); ++k)
+            if (me.textureSlots[k] == slot) return me.textures[k];
+        return -1;
+    };
+    std::map<std::pair<std::array<int, 5>, Tint>, std::vector<size_t>> sets; // {root, tip, volume, thinning, UV sets}, tint -> meshes
+    for (size_t i = 0; i < m.meshes.size(); ++i) {
+        if (!included(i)) continue;
+        const auto& me = m.meshes[i];
+        int vol = slotTexture(me, 1);
+        const auto* vi = imagesOf(vol);
+        if (!vi || vi->size() < 2) continue; // not a fur volume
+        int root = slotTexture(me, 0), tip = slotTexture(me, 2), thin = slotTexture(me, 3);
+        if (!imagesOf(root)) root = tip;
+        if (!imagesOf(tip)) tip = root;
+        if (!imagesOf(root)) continue;
+        if (!imagesOf(thin)) thin = -1;
+        sets[{{root, tip, vol, thin, int(me.layout.uvSets.size())}, meshTint(me, opt.tint)}].push_back(i);
+    }
+    std::vector<FurSet> out;
+    for (auto& [setKey, meshes] : sets) {
+        const auto& key = setKey.first;
+        const image::Rgba* thin = key[3] >= 0 ? &imagesOf(key[3])->front() : nullptr;
+        FurSet s;
+        s.meshes = meshes;
+        s.layers = bakeFur(m, meshes, *imagesOf(key[2]), imagesOf(key[0])->front(), imagesOf(key[1])->front(), thin, opt.furTiling,
+                           std::max(16u, opt.furSize), setKey.second);
+        s.name = "fur" + std::to_string(out.size()) + "_" + shortTextureName(m.textures[size_t(key[2])]);
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+bool meshIncluded(const model::Model& m, const Options& opt, size_t i) {
+    const auto& me = m.meshes[i];
+    bool use = i < opt.include.size() ? opt.include[i] : size_t(me.group) < m.groups.size() && m.groups[size_t(me.group)].shown;
+    return use && !me.vertices.empty() && me.indices.size() >= 3;
+}
+
+std::string meshObjectName(const model::Model& m, size_t i) { return "group" + std::to_string(m.meshes[i].group) + "_mesh" + std::to_string(i); }
+
+// World bind matrices of the bones; they follow the hierarchy, whatever order the bones are listed in.
+std::vector<Mat4> bindWorlds(const model::Model& m) {
+    size_t nb = m.bones.size();
+    std::vector<Mat4> world(nb, identity());
+    std::vector<int> state(nb, 0); // 0 todo, 1 in progress, 2 done
+    std::function<void(size_t)> solve = [&](size_t i) {
+        if (state[i] == 2) return;
+        state[i] = 1;
+        const auto& b = m.bones[i];
+        double t[3] = {b.local[0], b.local[1], b.local[2]}, q[4] = {b.rotation[0], b.rotation[1], b.rotation[2], b.rotation[3]}, one[3] = {1, 1, 1};
+        Mat4 local = trs(t, q, one);
+        int p = b.parent;
+        if (p >= 0 && size_t(p) < nb && state[size_t(p)] != 1) {
+            solve(size_t(p));
+            world[i] = mul(world[size_t(p)], local);
+        } else {
+            world[i] = local;
+        }
+        state[i] = 2;
+    };
+    for (size_t i = 0; i < nb; ++i) solve(i);
+    return world;
+}
+
 } // namespace
 
 Bytes write(const model::Model& m, const Options& opt, Report* report) {
@@ -428,26 +648,34 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
     // Skeleton. World bind matrices follow the hierarchy, whatever order the bones are listed in.
     size_t nb = m.bones.size();
     std::vector<int64_t> boneId(nb);
-    std::vector<Mat4> bindWorld(nb, identity());
-    {
-        std::vector<int> state(nb, 0); // 0 todo, 1 in progress, 2 done
-        std::function<void(size_t)> solve = [&](size_t i) {
-            if (state[i] == 2) return;
-            state[i] = 1;
-            const auto& b = m.bones[i];
-            double t[3] = {b.local[0], b.local[1], b.local[2]}, q[4] = {b.rotation[0], b.rotation[1], b.rotation[2], b.rotation[3]}, one[3] = {1, 1, 1};
-            Mat4 local = trs(t, q, one);
-            int p = b.parent;
-            if (p >= 0 && size_t(p) < nb && state[size_t(p)] != 1) {
-                solve(size_t(p));
-                bindWorld[i] = mul(bindWorld[size_t(p)], local);
-            } else {
-                bindWorld[i] = local;
-            }
-            state[i] = 2;
-        };
-        for (size_t i = 0; i < nb; ++i) solve(i);
+    std::vector<Mat4> bindWorld = bindWorlds(m);
+    // Reoriented bones: each written frame is the game's turned by fix[i], so locals become fix[p]^-1 * local * fix[i].
+    std::vector<Quat> fix(nb, Quat{0, 0, 0, 1});
+    if (opt.reorient && nb) fix = boneFixes(m, bindWorld, std::clamp(opt.boneAxis, 0, 5));
+    for (size_t i = 0; i < nb; ++i) {
+        const double zero[3] = {0, 0, 0}, one[3] = {1, 1, 1};
+        bindWorld[i] = mul(bindWorld[i], trs(zero, fix[i].data(), one));
     }
+    // Scale axes follow the turn to the nearest game axis (exact for uniform scale).
+    std::vector<std::array<int, 3>> scaleAxis(nb, {0, 1, 2});
+    for (size_t i = 0; i < nb; ++i)
+        for (int k = 0; k < 3; ++k) {
+            V3 e{};
+            e[size_t(k)] = 1;
+            V3 g = qrot(fix[i], e);
+            int best = 0;
+            for (int j = 1; j < 3; ++j)
+                if (std::abs(g[size_t(j)]) > std::abs(g[size_t(best)])) best = j;
+            scaleAxis[i][size_t(k)] = best;
+        }
+    auto written = [&](size_t i, const double* t, const double* q, const double* s, double to[3], double qo[4], double so[3]) {
+        int p = m.bones[i].parent;
+        Quat fp = p >= 0 && size_t(p) < nb && size_t(p) != i ? fix[size_t(p)] : Quat{0, 0, 0, 1};
+        V3 tt = qrot(qconj(fp), V3{t[0], t[1], t[2]});
+        Quat qq = qmul(qmul(qconj(fp), Quat{q[0], q[1], q[2], q[3]}), fix[i]);
+        for (int c = 0; c < 3; ++c) to[c] = tt[size_t(c)], so[c] = s[scaleAxis[i][size_t(c)]];
+        for (int c = 0; c < 4; ++c) qo[c] = qq[size_t(c)];
+    };
     for (size_t i = 0; i < nb; ++i) {
         const auto& b = m.bones[i];
         boneId[i] = newId();
@@ -457,7 +685,9 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
         a.add("TypeFlags").S("Skeleton");
         Node& n = modelNode(boneId[i], name, "LimbNode");
         Node& p70 = n.add("Properties70");
-        double t[3] = {b.local[0], b.local[1], b.local[2]}, q[4] = {b.rotation[0], b.rotation[1], b.rotation[2], b.rotation[3]};
+        double gt[3] = {b.local[0], b.local[1], b.local[2]}, gq[4] = {b.rotation[0], b.rotation[1], b.rotation[2], b.rotation[3]}, one[3] = {1, 1, 1};
+        double t[3], q[4], s[3];
+        written(i, gt, gq, one, t, q, s);
         auto e = euler(q);
         double r[3] = {e[0] * kDeg, e[1] * kDeg, e[2] * kDeg};
         pVec(p70, "Lcl Translation", "Lcl Translation", t);
@@ -471,6 +701,39 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
         oo(boneId[i], p >= 0 && size_t(p) < nb && size_t(p) != i ? boneId[size_t(p)] : rootId);
     }
     rep.bones = nb;
+
+    // End bones: a short child along the bone axis for each bone without one, since Blender sizes a bone by its children.
+    std::vector<std::pair<int64_t, Mat4>> ends;
+    if (opt.boneEnds && nb) {
+        std::vector<char> hasChild(nb, 0);
+        for (size_t i = 0; i < nb; ++i) {
+            int p = m.bones[i].parent;
+            if (p >= 0 && size_t(p) < nb && size_t(p) != i) hasChild[size_t(p)] = 1;
+        }
+        double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300}, extent = 0;
+        for (auto& w : bindWorld)
+            for (int k = 0; k < 3; ++k) lo[k] = std::min(lo[k], w[size_t(12 + k)]), hi[k] = std::max(hi[k], w[size_t(12 + k)]);
+        for (int k = 0; k < 3; ++k) extent = std::max(extent, hi[k] - lo[k]);
+        double len = std::max(1e-4, double(opt.boneEndSize) * (extent > 0 ? extent : 1));
+        int axis = opt.reorient ? std::clamp(opt.boneAxis, 0, 5) : 1;
+        double t[3] = {0, 0, 0}, q0[4] = {0, 0, 0, 1}, one[3] = {1, 1, 1};
+        t[axis % 3] = axis >= 3 ? -len : len;
+        Mat4 local = trs(t, q0, one);
+        for (size_t i = 0; i < nb; ++i) {
+            if (hasChild[i]) continue;
+            int64_t id = newId(), attr = newId();
+            std::string name = (m.bones[i].name.empty() ? "bone" + std::to_string(i) : m.bones[i].name) + "_end";
+            object("NodeAttribute").L(attr).S(objName(name, "NodeAttribute")).S("LimbNode").add("TypeFlags").S("Skeleton");
+            Node& n = modelNode(id, name, "LimbNode");
+            Node& p70 = n.add("Properties70");
+            pVec(p70, "Lcl Translation", "Lcl Translation", t);
+            n.add("Shading").C(true);
+            n.add("Culling").S("CullingOff");
+            oo(attr, id);
+            oo(id, boneId[i]);
+            ends.push_back({id, mul(bindWorld[i], local)});
+        }
+    }
 
     // A texture object with its video (the PNG, embedded when given).
     auto makeTexture = [&](const std::string& name, const std::string& file, const std::optional<Bytes>& png, bool alpha) -> int64_t {
@@ -504,19 +767,8 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
         ++rep.textures;
         return id;
     };
-    // A mesh's colour tint (gain rgb, offset rgb); all ones and zeros when it has none or tinting is off.
-    using Tint = std::array<float, 6>;
-    auto tintOf = [&](const model::Mesh& me) -> Tint {
-        if (!opt.tint) return {1, 1, 1, 0, 0, 0};
-        return {me.textureGain[0], me.textureGain[1], me.textureGain[2], me.textureOffset[0], me.textureOffset[1], me.textureOffset[2]};
-    };
-    const Tint noTint = {1, 1, 1, 0, 0, 0};
-    auto applyTint = [](uint8_t* px, const Tint& t) {
-        for (int c = 0; c < 3; ++c) {
-            float v = float(px[c]) / 255.0f * t[size_t(c)] + t[size_t(3 + c)];
-            px[c] = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
-        }
-    };
+    auto tintOf = [&](const model::Mesh& me) { return meshTint(me, opt.tint); };
+    const Tint noTint = kNoTint;
     // Colour maps, created on first use: one per texture and tint, the tint baked into its pixels.
     std::map<std::pair<int, Tint>, int64_t> textureId;
     std::map<int, int> tintCount;
@@ -531,15 +783,7 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
             int k = ++tintCount[tex];
             name += "_tint" + std::to_string(k);
             file += "_tint" + std::to_string(k);
-            if (png) {
-                try {
-                    image::Rgba img = image::decodePng(*png);
-                    for (size_t p = 0; p + 3 < img.pixels.size(); p += 4) applyTint(&img.pixels[p], tint);
-                    png = image::encodePng(img);
-                } catch (std::exception& e) {
-                    rep.notes.push_back("texture " + full + ": tint not applied (" + e.what() + ")");
-                }
-            }
+            png = tinted(std::move(png), tint, full, rep.notes);
         }
         int64_t id = makeTexture(name, file + ".png", png, false);
         textureId[{tex, tint}] = id;
@@ -586,12 +830,7 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
 
         std::vector<double> pos, normals, uv, uv2;
         pos.reserve(nv * 3);
-        for (auto& v : me.vertices) {
-            double n[3] = {v.normal[0], v.normal[1], v.normal[2]};
-            double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-            double k = push != 0 && len > 0.1 ? push / len : 0;
-            pos.insert(pos.end(), {double(v.pos[0]) + n[0] * k, double(v.pos[1]) + n[1] * k, double(v.pos[2]) + n[2] * k});
-        }
+        for (auto& p : pushedPositions(me, push)) pos.insert(pos.end(), p.begin(), p.end());
         std::vector<int32_t> poly(ni), uvIndex(ni);
         normals.reserve(ni * 3);
         for (size_t k = 0; k < ni; ++k) {
@@ -707,56 +946,21 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
         rep.vertices += nv;
         rep.triangles += ni / 3;
     };
-    auto included = [&](size_t i) {
-        const auto& me = m.meshes[i];
-        bool use = i < opt.include.size() ? opt.include[i] : size_t(me.group) < m.groups.size() && m.groups[size_t(me.group)].shown;
-        return use && !me.vertices.empty() && me.indices.size() >= 3;
-    };
-    auto meshName = [&](size_t i) { return "group" + std::to_string(m.meshes[i].group) + "_mesh" + std::to_string(i); };
+    auto included = [&](size_t i) { return meshIncluded(m, opt, i); };
+    auto meshName = [&](size_t i) { return meshObjectName(m, i); };
     for (size_t i = 0; i < m.meshes.size(); ++i)
         if (included(i)) emitMesh(m.meshes[i], meshName(i), 0, materialFor(m.meshes[i]), m.meshes[i].layout.uvSets.size() >= 2, false);
     if (!rep.meshes) rep.notes.push_back("no meshes written");
 
-    // Fur shells: fur draws bind {0 root colour, 1 fur volume, 2 tip colour, 3 thinning}. Meshes with the
-    // same textures and UV layout share one set of baked layers.
+    // Fur shells: one shell mesh per baked layer, pushed out by its height.
     if (opt.fur && opt.pixels) {
-        float dx = m.boundsMax[0] - m.boundsMin[0], dy = m.boundsMax[1] - m.boundsMin[1], dz = m.boundsMax[2] - m.boundsMin[2];
-        double radius = std::max(0.01, std::sqrt(double(dx) * dx + double(dy) * dy + double(dz) * dz) / 2);
-        std::map<int, std::optional<std::vector<image::Rgba>>> decoded;
-        auto imagesOf = [&](int tex) -> const std::vector<image::Rgba>* {
-            if (tex < 0 || size_t(tex) >= m.textures.size()) return nullptr;
-            auto it = decoded.find(tex);
-            if (it == decoded.end()) it = decoded.emplace(tex, opt.pixels(m.textures[size_t(tex)])).first;
-            return it->second && !it->second->empty() ? &*it->second : nullptr;
-        };
-        auto slotTexture = [](const model::Mesh& me, int slot) {
-            for (size_t k = 0; k < me.textures.size() && k < me.textureSlots.size(); ++k)
-                if (me.textureSlots[k] == slot) return me.textures[k];
-            return -1;
-        };
-        std::map<std::pair<std::array<int, 5>, Tint>, std::vector<size_t>> sets; // {root, tip, volume, thinning, UV sets}, tint -> meshes
-        for (size_t i = 0; i < m.meshes.size(); ++i) {
-            if (!included(i)) continue;
-            const auto& me = m.meshes[i];
-            int vol = slotTexture(me, 1);
-            const auto* vi = imagesOf(vol);
-            if (!vi || vi->size() < 2) continue; // not a fur volume
-            int root = slotTexture(me, 0), tip = slotTexture(me, 2), thin = slotTexture(me, 3);
-            if (!imagesOf(root)) root = tip;
-            if (!imagesOf(tip)) tip = root;
-            if (!imagesOf(root)) continue;
-            if (!imagesOf(thin)) thin = -1;
-            sets[{{root, tip, vol, thin, int(me.layout.uvSets.size())}, tintOf(me)}].push_back(i);
-        }
-        int setNo = 0;
-        for (auto& [setKey, meshes] : sets) {
-            const auto& key = setKey.first;
-            const image::Rgba* thin = key[3] >= 0 ? &imagesOf(key[3])->front() : nullptr;
-            std::vector<image::Rgba> layers = bakeFur(m, meshes, *imagesOf(key[2]), imagesOf(key[0])->front(), imagesOf(key[1])->front(), thin,
-                                                      opt.furTiling, std::max(16u, opt.furSize), setKey.second);
-            std::string base = "fur" + std::to_string(setNo++) + "_" + shortTextureName(m.textures[size_t(key[2])]);
+        double radius = furRadius(m);
+        std::vector<FurSet> sets = furSets(m, opt, included);
+        for (auto& set : sets) {
+            const auto& layers = set.layers;
+            const auto& meshes = set.meshes;
             for (size_t k = 0; k < layers.size(); ++k) {
-                std::string name = base + "_layer" + std::to_string(k + 1);
+                std::string name = set.name + "_layer" + std::to_string(k + 1);
                 int64_t tex = makeTexture(name, name + ".png", image::encodePng(layers[k]), true);
                 int64_t mat = newId();
                 Node& n = object("Material").L(mat).S(objName(name, "Material")).S("");
@@ -783,7 +987,7 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
         Node& p = object("Pose").L(id).S(objName(rootName, "Pose")).S("BindPose");
         p.add("Type").S("BindPose");
         p.add("Version").I(100);
-        p.add("NbPoseNodes").I(int32_t(1 + nb + meshModels.size()));
+        p.add("NbPoseNodes").I(int32_t(1 + nb + ends.size() + meshModels.size()));
         auto poseNode = [&](int64_t node, const Mat4& mat) {
             Node& pn = p.add("PoseNode");
             pn.add("Node").L(node);
@@ -791,6 +995,7 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
         };
         poseNode(rootId, identity());
         for (size_t i = 0; i < nb; ++i) poseNode(boneId[i], bindWorld[i]);
+        for (auto& [eid, ew] : ends) poseNode(eid, ew);
         for (int64_t mm : meshModels) poseNode(mm, identity());
     }
 
@@ -832,8 +1037,9 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
             for (auto& c : ch) c.reserve(size_t(frames));
             std::array<double, 3> prev{};
             for (int f = 0; f < frames; ++f) {
-                double tr[3], q[4], s[3];
-                sampleLocal(m.bones[b], a, it->second, secs[size_t(f)], tr, q, s);
+                double gt[3], gq[4], gs[3], tr[3], q[4], s[3];
+                sampleLocal(m.bones[b], a, it->second, secs[size_t(f)], gt, gq, gs);
+                written(b, gt, gq, gs, tr, q, s);
                 auto e = euler(q);
                 if (f) e = continuous(e, prev);
                 prev = e;
@@ -849,9 +1055,11 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
             // Channels that stay at the bone's rest transform need no curves: importers take those
             // values from the bone (Blender fills every un-keyed channel of an animated bone that way).
             const auto& bone = m.bones[b];
-            double rq[4] = {bone.rotation[0], bone.rotation[1], bone.rotation[2], bone.rotation[3]};
+            double gt[3] = {bone.local[0], bone.local[1], bone.local[2]}, gq[4] = {bone.rotation[0], bone.rotation[1], bone.rotation[2], bone.rotation[3]};
+            double one[3] = {1, 1, 1}, rt[3], rq[4], rs[3];
+            written(b, gt, gq, one, rt, rq, rs);
             auto re = euler(rq);
-            const double rest[9] = {bone.local[0], bone.local[1], bone.local[2], re[0] * kDeg, re[1] * kDeg, re[2] * kDeg, 1, 1, 1};
+            const double rest[9] = {rt[0], rt[1], rt[2], re[0] * kDeg, re[1] * kDeg, re[2] * kDeg, 1, 1, 1};
             for (int kind = 0; kind < 3; ++kind) {
                 float tol = kind == 1 ? 0.01f : 1e-4f;
                 bool atRest = true;
@@ -1003,6 +1211,118 @@ Bytes write(const model::Model& m, const Options& opt, Report* report) {
 
     if (report) *report = std::move(rep);
     return out;
+}
+
+// ---- OBJ ------------------------------------------------------------------------------------
+
+ObjFiles writeObj(const model::Model& m, const Options& opt, const std::string& base, Report* report) {
+    Report rep;
+    ObjFiles f;
+    std::string& o = f.obj;
+    std::string& mt = f.mtl;
+    char t[256];
+    o = "# " + m.name + " (exported by nuttool)\nmtllib " + base + ".mtl\n";
+    mt = "# " + m.name + " (exported by nuttool)\n";
+
+    // Colour maps: one PNG per texture and tint, the tint baked in, written next to the .obj.
+    std::map<std::pair<int, Tint>, std::string> fileOf;
+    std::map<int, int> tintCount;
+    auto textureFile = [&](int tex, const Tint& tint) -> std::string {
+        auto it = fileOf.find({tex, tint});
+        if (it != fileOf.end()) return it->second;
+        const std::string& full = m.textures[size_t(tex)];
+        std::string file = full + (tint != kNoTint ? "_tint" + std::to_string(++tintCount[tex]) : std::string()) + ".png";
+        std::optional<Bytes> png = tinted(opt.texture ? opt.texture(full) : std::nullopt, tint, full, rep.notes);
+        if (png) {
+            f.files.push_back({file, std::move(*png)});
+            ++rep.textures;
+        } else {
+            rep.notes.push_back("texture " + full + " not written (not found)");
+        }
+        return fileOf[{tex, tint}] = file;
+    };
+    std::map<std::string, int> materialNames;
+    auto newMaterial = [&](const std::string& b) {
+        int k = materialNames[b]++;
+        std::string name = k ? b + "_" + std::to_string(k) : b;
+        mt += "\nnewmtl " + name + "\n";
+        ++rep.materials;
+        return name;
+    };
+    // Materials: one per distinct colour map + tint + colour, as in the FBX.
+    std::map<std::tuple<int, Tint, float, float, float, std::string>, std::string> materialOf;
+    auto materialFor = [&](const model::Mesh& me) -> std::string {
+        int tex = me.texture >= 0 && size_t(me.texture) < m.textures.size() ? me.texture : -1;
+        float r = 1, g = 1, b = 1;
+        if (me.hasColour || tex < 0) r = me.colour[0], g = me.colour[1], b = me.colour[2];
+        Tint tint = tex >= 0 ? meshTint(me, opt.tint) : kNoTint;
+        auto key = std::make_tuple(tex, tint, r, g, b, me.material);
+        auto it = materialOf.find(key);
+        if (it != materialOf.end()) return it->second;
+        std::string name = newMaterial(tex >= 0 ? shortTextureName(m.textures[size_t(tex)]) : me.material.empty() ? std::string("material") : me.material);
+        std::snprintf(t, sizeof t, "Kd %g %g %g\nKs %g %g %g\nNs %g\nd 1\nillum 2\n", r, g, b, me.specular[0], me.specular[1], me.specular[2],
+                      std::clamp(double(me.specularPower), 0.0, 1000.0));
+        mt += t;
+        if (tex >= 0) mt += "map_Kd " + textureFile(tex, tint) + "\n";
+        return materialOf[key] = name;
+    };
+
+    size_t next = 1; // OBJ indices count from 1 across the file
+    auto emit = [&](const model::Mesh& me, const std::string& name, double push, const std::string& material, bool shell) {
+        size_t nv = me.vertices.size(), ni = me.indices.size() / 3 * 3;
+        o += "o " + name + "\n";
+        for (auto& p : pushedPositions(me, push)) {
+            std::snprintf(t, sizeof t, "v %.9g %.9g %.9g\n", p[0], p[1], p[2]);
+            o += t;
+        }
+        for (auto& v : me.vertices) {
+            std::snprintf(t, sizeof t, "vt %.9g %.9g\n", v.uv[0], 1.0f - v.uv[1]);
+            o += t;
+        }
+        for (auto& v : me.vertices) {
+            std::snprintf(t, sizeof t, "vn %g %g %g\n", v.normal[0], v.normal[1], v.normal[2]);
+            o += t;
+        }
+        o += "usemtl " + material + "\n";
+        for (size_t k = 0; k < ni; k += 3) {
+            size_t c[3];
+            for (int q = 0; q < 3; ++q) c[q] = next + (me.indices[k + size_t(q)] < nv ? me.indices[k + size_t(q)] : 0);
+            std::snprintf(t, sizeof t, "f %zu/%zu/%zu %zu/%zu/%zu %zu/%zu/%zu\n", c[0], c[0], c[0], c[1], c[1], c[1], c[2], c[2], c[2]);
+            o += t;
+        }
+        next += nv;
+        if (shell) {
+            ++rep.furShells;
+            return;
+        }
+        ++rep.meshes;
+        rep.vertices += nv;
+        rep.triangles += ni / 3;
+    };
+    auto included = [&](size_t i) { return meshIncluded(m, opt, i); };
+    for (size_t i = 0; i < m.meshes.size(); ++i)
+        if (included(i)) emit(m.meshes[i], meshObjectName(m, i), 0, materialFor(m.meshes[i]), false);
+    if (!rep.meshes) rep.notes.push_back("no meshes written");
+
+    // Fur shells, as in the FBX; each layer's alpha (map_d) is where it has strands.
+    if (opt.fur && opt.pixels) {
+        double radius = furRadius(m);
+        std::vector<FurSet> sets = furSets(m, opt, included);
+        for (auto& set : sets)
+            for (size_t k = 0; k < set.layers.size(); ++k) {
+                std::string name = set.name + "_layer" + std::to_string(k + 1), file = name + ".png";
+                f.files.push_back({file, image::encodePng(set.layers[k])});
+                ++rep.textures;
+                std::string mat = newMaterial(name);
+                mt +="Kd 1 1 1\nKs 0 0 0\nd 1\nillum 1\nmap_Kd " + file + "\nmap_d " + file + "\n";
+                double h = double(k + 1) / double(set.layers.size());
+                for (size_t i : set.meshes) emit(m.meshes[i], meshObjectName(m, i) + "_fur" + std::to_string(k + 1), opt.furLength * radius * h, mat, true);
+            }
+        if (sets.empty()) rep.notes.push_back("no fur: none of the written meshes binds a fur volume");
+    }
+
+    if (report) *report = std::move(rep);
+    return f;
 }
 
 // ---- reading --------------------------------------------------------------------------------
@@ -1245,6 +1565,81 @@ const RNode* firstLayer(const RNode* geo, const char* kind) {
     return best;
 }
 
+// A binary FBX file's objects by id, their object-object connections and the transform from its axes and unit
+// to the game's (Y up, +Z front, +X right, metres).
+struct Scene {
+    std::vector<RNode> top;
+    std::map<int64_t, const RNode*> byId;
+    std::multimap<int64_t, int64_t> parents, children;
+    Mat4 axes = identity();
+
+    const RNode* topNode(const char* n) const {
+        for (auto& t : top)
+            if (t.name == n) return &t;
+        return nullptr;
+    }
+    bool isA(int64_t id, const char* cls, const char* kind) const {
+        auto it = byId.find(id);
+        return it != byId.end() && it->second->name == cls && (!kind || it->second->str(2) == kind);
+    }
+    int64_t modelParent(int64_t id) const {
+        auto r = parents.equal_range(id);
+        for (auto it = r.first; it != r.second; ++it)
+            if (isA(it->second, "Model", nullptr)) return it->second;
+        return 0;
+    }
+    // A Model's world transform in the file's space.
+    Mat4 global(int64_t id, int depth = 0) const {
+        if (!isA(id, "Model", nullptr)) return identity();
+        Mat4 l = localOf(byId.at(id));
+        int64_t p = modelParent(id);
+        return p && depth < 256 ? mul(global(p, depth + 1), l) : l;
+    }
+};
+
+void loadScene(Scene& s, const Bytes& file) {
+    if (!isFbx(file)) fail("not an FBX file");
+    if (file.size() < 27 || std::memcmp(file.data(), "Kaydara FBX Binary  ", 20) != 0)
+        fail("this is a text (ASCII) FBX file; export it as binary FBX");
+    uint32_t version = uint32_t(rdLe(&file[23], 4));
+    if (version < 7000) fail("FBX version " + std::to_string(version) + " is too old; export as FBX 7.x (2011 or later)");
+    const bool wide = version >= 7500;
+    for (size_t at = 27, hdr = wide ? 25 : 13; at + hdr <= file.size();) {
+        RNode n;
+        if (!readNode(file, at, wide, n, 0)) break;
+        s.top.push_back(std::move(n));
+    }
+    const RNode* objects = s.topNode("Objects");
+    const RNode* connections = s.topNode("Connections");
+    if (!objects) fail("FBX: the file has no objects");
+    for (auto& o : objects->kids)
+        if (!o.props.empty()) s.byId[o.num(0)] = &o;
+    if (connections)
+        for (auto& c : connections->kids)
+            if (c.name == "C" && c.str(0) == "OO") {
+                s.parents.emplace(c.num(1), c.num(2));
+                s.children.emplace(c.num(2), c.num(1));
+            }
+
+    const RNode* gs = s.topNode("GlobalSettings");
+    auto axis = [&](const char* n, int def) {
+        int a = int(pNum(gs, n, def));
+        return a >= 0 && a < 3 ? a : def;
+    };
+    auto sign = [&](const char* n) { return pNum(gs, n, 1) < 0 ? -1.0 : 1.0; };
+    int up = axis("UpAxis", 1), front = axis("FrontAxis", 2), coord = axis("CoordAxis", 0);
+    double unit = pNum(gs, "UnitScaleFactor", 1) / 100;
+    if (!(unit > 0)) unit = 0.01;
+    if (up != front && up != coord && front != coord) {
+        s.axes = Mat4{};
+        s.axes[size_t(coord * 4 + 0)] = sign("CoordAxisSign");
+        s.axes[size_t(up * 4 + 1)] = sign("UpAxisSign");
+        s.axes[size_t(front * 4 + 2)] = sign("FrontAxisSign");
+        s.axes[15] = 1;
+    }
+    s.axes = mul(scaling({unit, unit, unit}), s.axes);
+}
+
 } // namespace
 
 bool isFbx(const Bytes& f) {
@@ -1254,75 +1649,13 @@ bool isFbx(const Bytes& f) {
 }
 
 std::vector<MeshData> readMeshes(const Bytes& file) {
-    if (!isFbx(file)) fail("not an FBX file");
-    if (file.size() < 27 || std::memcmp(file.data(), "Kaydara FBX Binary  ", 20) != 0)
-        fail("this is a text (ASCII) FBX file; export it as binary FBX");
-    uint32_t version = uint32_t(rdLe(&file[23], 4));
-    if (version < 7000) fail("FBX version " + std::to_string(version) + " is too old; export as FBX 7.x (2011 or later)");
-    const bool wide = version >= 7500;
-    std::vector<RNode> top;
-    for (size_t at = 27, hdr = wide ? 25 : 13; at + hdr <= file.size();) {
-        RNode n;
-        if (!readNode(file, at, wide, n, 0)) break;
-        top.push_back(std::move(n));
-    }
-    auto topNode = [&](const char* n) -> const RNode* {
-        for (auto& t : top)
-            if (t.name == n) return &t;
-        return nullptr;
-    };
-    const RNode* objects = topNode("Objects");
-    const RNode* connections = topNode("Connections");
-    if (!objects) fail("FBX: the file has no objects");
-
-    std::map<int64_t, const RNode*> byId;
-    for (auto& o : objects->kids)
-        if (!o.props.empty()) byId[o.num(0)] = &o;
-    auto isA = [&](int64_t id, const char* cls, const char* kind) {
-        auto it = byId.find(id);
-        return it != byId.end() && it->second->name == cls && (!kind || it->second->str(2) == kind);
-    };
-    std::multimap<int64_t, int64_t> parents, children; // object-object connections
-    if (connections)
-        for (auto& c : connections->kids)
-            if (c.name == "C" && c.str(0) == "OO") {
-                parents.emplace(c.num(1), c.num(2));
-                children.emplace(c.num(2), c.num(1));
-            }
-    auto modelParent = [&](int64_t id) -> int64_t {
-        auto r = parents.equal_range(id);
-        for (auto it = r.first; it != r.second; ++it)
-            if (isA(it->second, "Model", nullptr)) return it->second;
-        return 0;
-    };
-    std::function<Mat4(int64_t, int)> global = [&](int64_t id, int depth) -> Mat4 {
-        if (!isA(id, "Model", nullptr)) return identity();
-        Mat4 l = localOf(byId[id]);
-        int64_t p = modelParent(id);
-        return p && depth < 256 ? mul(global(p, depth + 1), l) : l;
-    };
-
-    // The file's axes and unit to the game's: Y up, +Z front, +X right, metres.
-    Mat4 axes = identity();
-    {
-        const RNode* gs = topNode("GlobalSettings");
-        auto axis = [&](const char* n, int def) {
-            int a = int(pNum(gs, n, def));
-            return a >= 0 && a < 3 ? a : def;
-        };
-        auto sign = [&](const char* n) { return pNum(gs, n, 1) < 0 ? -1.0 : 1.0; };
-        int up = axis("UpAxis", 1), front = axis("FrontAxis", 2), coord = axis("CoordAxis", 0);
-        double unit = pNum(gs, "UnitScaleFactor", 1) / 100;
-        if (!(unit > 0)) unit = 0.01;
-        if (up != front && up != coord && front != coord) {
-            axes = Mat4{};
-            axes[size_t(coord * 4 + 0)] = sign("CoordAxisSign");
-            axes[size_t(up * 4 + 1)] = sign("UpAxisSign");
-            axes[size_t(front * 4 + 2)] = sign("FrontAxisSign");
-            axes[15] = 1;
-        }
-        axes = mul(scaling({unit, unit, unit}), axes);
-    }
+    Scene s;
+    loadScene(s, file);
+    const auto& byId = s.byId;
+    const auto& children = s.children;
+    const auto& parents = s.parents;
+    const Mat4& axes = s.axes;
+    auto isA = [&](int64_t id, const char* cls, const char* kind) { return s.isA(id, cls, kind); };
 
     std::vector<MeshData> out;
     for (auto& [geoId, geo] : byId) {
@@ -1344,8 +1677,8 @@ std::vector<MeshData> readMeshes(const Bytes& file) {
                 std::string bone;
                 auto br = children.equal_range(c->second);
                 for (auto b = br.first; b != br.second; ++b)
-                    if (isA(b->second, "Model", nullptr)) bone = plainName(byId[b->second]->str(1));
-                const RNode* cl = byId[c->second];
+                    if (isA(b->second, "Model", nullptr)) bone = plainName(byId.at(b->second)->str(1));
+                const RNode* cl = byId.at(c->second);
                 const auto* idx = arrayOf(cl, "Indexes");
                 const auto* wts = arrayOf(cl, "Weights");
                 if (bone.empty() || !idx || !wts) continue;
@@ -1360,11 +1693,11 @@ std::vector<MeshData> readMeshes(const Bytes& file) {
         auto mr = parents.equal_range(geoId);
         for (auto mi = mr.first; mi != mr.second; ++mi) {
             if (!isA(mi->second, "Model", nullptr)) continue;
-            const RNode* mdl = byId[mi->second];
+            const RNode* mdl = byId.at(mi->second);
             const std::array<double, 3> zero{0, 0, 0}, one{1, 1, 1};
             Mat4 geom = mul(translate(pVec3(mdl, "GeometricTranslation", zero)),
                             mul(rotation(pVec3(mdl, "GeometricRotation", zero), 0), scaling(pVec3(mdl, "GeometricScaling", one))));
-            Mat4 world = mul(axes, mul(global(mi->second, 0), geom));
+            Mat4 world = mul(axes, mul(s.global(mi->second), geom));
             // Normals by the cofactor of the linear part; a mirroring transform also reverses the winding.
             std::array<double, 3> a{world[0], world[1], world[2]}, b{world[4], world[5], world[6]}, c{world[8], world[9], world[10]};
             auto crossD = [](const std::array<double, 3>& x, const std::array<double, 3>& y) {
@@ -1419,6 +1752,48 @@ std::vector<MeshData> readMeshes(const Bytes& file) {
             if (!haveUv) md.cornerUv.clear();
             out.push_back(std::move(md));
         }
+    }
+    return out;
+}
+
+std::vector<BoneData> readBones(const Bytes& file) {
+    Scene s;
+    loadScene(s, file);
+    // Bind matrices: a skin cluster's TransformLink, else the bind pose's matrix (both world, file space).
+    std::map<int64_t, Mat4> bind;
+    auto matrixOf = [](const std::vector<double>* a, Mat4& m) {
+        if (!a || a->size() != 16) return false;
+        std::copy(a->begin(), a->end(), m.begin());
+        return true;
+    };
+    for (auto& [id, obj] : s.byId) {
+        if (!s.isA(id, "Deformer", "Cluster")) continue;
+        Mat4 m;
+        if (!matrixOf(arrayOf(obj, "TransformLink"), m)) continue;
+        auto br = s.children.equal_range(id);
+        for (auto b = br.first; b != br.second; ++b)
+            if (s.isA(b->second, "Model", nullptr)) bind.emplace(b->second, m);
+    }
+    for (auto& [id, obj] : s.byId) {
+        if (obj->name != "Pose" || obj->str(2) != "BindPose") continue;
+        for (auto& pn : obj->kids) {
+            Mat4 m;
+            const RNode* node = pn.kid("Node");
+            if (pn.name == "PoseNode" && node && !node->props.empty() && matrixOf(arrayOf(&pn, "Matrix"), m)) bind.emplace(node->num(0), m);
+        }
+    }
+
+    std::vector<BoneData> out;
+    for (auto& [id, obj] : s.byId) {
+        if (obj->name != "Model" || obj->str(2) != "LimbNode") continue;
+        BoneData b;
+        b.name = plainName(obj->str(1));
+        auto it = bind.find(id);
+        b.fromBind = it != bind.end();
+        Mat4 w = mul(s.axes, b.fromBind ? it->second : s.global(id));
+        b.position = {float(w[12]), float(w[13]), float(w[14])};
+        if (int64_t p = s.modelParent(id); p && s.isA(p, "Model", "LimbNode")) b.parent = plainName(s.byId.at(p)->str(1));
+        out.push_back(std::move(b));
     }
     return out;
 }

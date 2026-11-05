@@ -48,6 +48,7 @@ uniform vec4 uOffset;
 uniform vec3 uEye;
 uniform vec3 uSpec;
 uniform float uPower;
+uniform int uHighlight;
 out vec4 oColor;
 void main() {
     vec3 n = vNormal;
@@ -67,6 +68,7 @@ void main() {
         c = vec4(clamp(t.rgb * uGain.rgb + uOffset.rgb, 0.0, 1.0), 1.0);
     }
     oColor = vec4(c.rgb * light + spec, 1.0);
+    if (uHighlight != 0) oColor.rgb = mix(oColor.rgb, vec3(1.0, 0.55, 0.1), 0.45);
 }
 )";
 
@@ -337,6 +339,8 @@ void ModelView::setModel(const model::Model& m) {
         glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, 48, reinterpret_cast<void*>(40));
         glBindVertexArray(0);
         g.count = GLsizei(mesh.indices.size());
+        g.indices = mesh.indices;
+        for (auto& x : mesh.vertices) g.pos.insert(g.pos.end(), {x.pos[0], x.pos[1], x.pos[2]});
         g.uvSets = int(mesh.layout.uvSets.size());
         std::copy(mesh.specular, mesh.specular + 3, g.spec);
         g.power = mesh.specularPower;
@@ -369,7 +373,11 @@ void ModelView::skinMeshes() {
     for (auto& g : meshes_) {
         if (!g.visible || g.bind.empty() || g.skinnedVersion == poseVersion_) continue;
         g.skinnedVersion = poseVersion_;
+        auto keepPositions = [&g](const std::vector<float>& v) {
+            for (size_t i = 0; i * 3 < g.pos.size() && i * 12 + 2 < v.size(); ++i) std::copy(&v[i * 12], &v[i * 12] + 3, &g.pos[i * 3]);
+        };
         if (skin_.empty()) {
+            keepPositions(g.bind);
             glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
             glBufferSubData(GL_ARRAY_BUFFER, 0, GLsizeiptr(g.bind.size() * sizeof(float)), g.bind.data());
             continue;
@@ -398,6 +406,7 @@ void ModelView::skinMeshes() {
                 dst[3 + r] = nl > 0 ? n[r] / nl : src[3 + r];
             }
         }
+        keepPositions(out);
         glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
         glBufferSubData(GL_ARRAY_BUFFER, 0, GLsizeiptr(out.size() * sizeof(float)), out.data());
     }
@@ -498,6 +507,58 @@ void ModelView::viewProj(float* out, int w, int h) const {
     mul(proj, view, out);
 }
 
+// The nearest visible mesh hit by the ray through a viewport point (normalised device coordinates).
+int ModelView::pick(float ndcX, float ndcY, float aspect) const {
+    float eye[3] = {target_[0] + distance_ * std::cos(pitch_) * std::sin(yaw_), target_[1] + distance_ * std::sin(pitch_),
+                    target_[2] + distance_ * std::cos(pitch_) * std::cos(yaw_)};
+    // The camera basis as lookAt builds it: forward f, side s, up u.
+    float f[3] = {target_[0] - eye[0], target_[1] - eye[1], target_[2] - eye[2]};
+    float fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+    for (float& x : f) x /= fl;
+    float s[3] = {-f[2], 0, f[0]}; // f x (0, 1, 0)
+    float sl = std::sqrt(s[0] * s[0] + s[2] * s[2]);
+    if (sl < 1e-6f) return -1;
+    for (float& x : s) x /= sl;
+    float u[3] = {s[1] * f[2] - s[2] * f[1], s[2] * f[0] - s[0] * f[2], s[0] * f[1] - s[1] * f[0]};
+    float t = std::tan(0.8f / 2);
+    float d[3];
+    for (int k = 0; k < 3; ++k) d[k] = f[k] + s[k] * ndcX * aspect * t + u[k] * ndcY * t;
+
+    int best = -1;
+    float bestT = 1e30f;
+    for (size_t mi = 0; mi < meshes_.size(); ++mi) {
+        const GpuMesh& m = meshes_[mi];
+        if (!m.visible) continue;
+        for (size_t i = 0; i + 2 < m.indices.size(); i += 3) {
+            const float* p[3] = {};
+            bool ok = true;
+            for (int c = 0; c < 3; ++c) {
+                size_t v = m.indices[i + size_t(c)];
+                ok &= v * 3 + 2 < m.pos.size();
+                if (ok) p[c] = &m.pos[v * 3];
+            }
+            if (!ok) continue;
+            // Moller-Trumbore, both faces.
+            float e1[3], e2[3], o[3];
+            for (int k = 0; k < 3; ++k) e1[k] = p[1][k] - p[0][k], e2[k] = p[2][k] - p[0][k], o[k] = eye[k] - p[0][k];
+            float q[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+            float det = e1[0] * q[0] + e1[1] * q[1] + e1[2] * q[2];
+            if (std::fabs(det) < 1e-12f) continue;
+            float bu = (o[0] * q[0] + o[1] * q[1] + o[2] * q[2]) / det;
+            if (bu < 0 || bu > 1) continue;
+            float r[3] = {o[1] * e1[2] - o[2] * e1[1], o[2] * e1[0] - o[0] * e1[2], o[0] * e1[1] - o[1] * e1[0]};
+            float bv = (d[0] * r[0] + d[1] * r[1] + d[2] * r[2]) / det;
+            if (bv < 0 || bu + bv > 1) continue;
+            float hit = (e2[0] * r[0] + e2[1] * r[1] + e2[2] * r[2]) / det;
+            if (hit > 0 && hit < bestT) {
+                bestT = hit;
+                best = int(mi);
+            }
+        }
+    }
+    return best;
+}
+
 void ModelView::render(int w, int h, const Options& opt) {
     ensureTarget(w, h);
     skinMeshes();
@@ -525,8 +586,10 @@ void ModelView::render(int w, int h, const Options& opt) {
     setLights(prog_, lights);
     glUniform1i(glGetUniformLocation(prog_, "uTex"), 0);
     glPolygonMode(GL_FRONT_AND_BACK, opt.wireframe ? GL_LINE : GL_FILL);
-    for (auto& m : meshes_) {
+    for (size_t mi = 0; mi < meshes_.size(); ++mi) {
+        auto& m = meshes_[mi];
         if (!m.visible || m.count == 0) continue;
+        glUniform1i(glGetUniformLocation(prog_, "uHighlight"), mi < highlight_.size() && highlight_[mi] ? 1 : 0);
         bool tex = opt.textured && m.tex && m.tex->id();
         glUniform1i(glGetUniformLocation(prog_, "uTextured"), tex ? 1 : 0);
         glUniform3fv(glGetUniformLocation(prog_, "uBase"), 1, m.colour);
@@ -659,6 +722,11 @@ void ModelView::draw(const ImVec2& size, const Options& opt) {
     if (hovered) {
         if (io.MouseWheel != 0) distance_ *= std::pow(0.88f, io.MouseWheel);
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) frame();
+        // A left click that did not orbit picks what is under the cursor.
+        else if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] < 16 && !io.KeyShift) {
+            float nx = (io.MousePos.x - origin.x) / float(w) * 2 - 1, ny = 1 - (io.MousePos.y - origin.y) / float(h) * 2;
+            click_ = pick(nx, ny, float(w) / float(h));
+        }
     }
     if (active) {
         ImVec2 dm = io.MouseDelta;

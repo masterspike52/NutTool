@@ -77,8 +77,13 @@ Start `nuttool-gui.exe`. It finds an `assets` folder next to it or in the curren
 folder; otherwise use **File > Open assets folder**. You can also pass a folder or file on
 the command line, or drag one onto the window.
 
+- **Tabs**: everything opens in a tab. **Collapse all** and **Close all** sit at the right
+  end of the tab bar (also in the View and File menus). Right-click a tab for **Close**,
+  **Close other tabs**, **Close tabs to the right** and **Close all tabs**; tabs with unsaved
+  changes ask first.
 - **Browser** (left): every bundle, stream bundle, string table (by language), video,
-  font and metadata file, named from `db_index.txt`, with a search box. When a folder
+  font and metadata file, named from `db_index.txt`, with a search box and **Collapse
+  all**. When a folder
   opens, the tool indexes every texture and model in the background (a few seconds;
   cached in the settings folder) and adds three groups:
   - **Textures**: every texture in the game, once each, wherever it lives.
@@ -92,7 +97,7 @@ the command line, or drag one onto the window.
   size, such as a higher-resolution repaint, resizes the texture in every copy. If any
   copy can't take it, no file is changed. **Remove mipmaps** drops the mip chain from
   every copy (see [Removing mipmaps](#removing-mipmaps)).
-- **Model tabs**: a 3D viewer (OpenGL) with textures, material colours, fur shells,
+- **Model tabs**: a 3D viewer (OpenGL) with textures, material editing, fur shells,
   wireframe, the skeleton with optional bone names, and a grid.
   - **Camera**: left-drag orbits, right-drag turns the camera in place, middle-drag
     (or Shift+left-drag) pans, and the wheel zooms. W/A/S/D or the arrow keys fly
@@ -106,10 +111,21 @@ the command line, or drag one onto the window.
   - **Meshes**: each draw with its material name and texture. The texture defaults to
     the colour map among those the draw binds; a dropdown picks another. Untextured
     materials show their base colour, and the tooltip lists every material constant.
-  - **Material colours**: a colour picker for each colour constant of the shown meshes
-    (`c:basecolour`, `c:velvetColour`, `c:specularColour`...).
+  - **Materials**: every material of the shown meshes, one collapsible entry each, with
+    all of its parameters: a colour picker for colours (`c:basecolour`,
+    `c:velvetColour`, `c:specularColour`...) and four number fields for the rest
+    (`c:specularPower`, `c:textureGain0`...).
+    - The search box finds materials by name, by parameter name (listing just those
+      parameters) or by the textures their meshes use. **Colours only** hides the
+      other parameters.
+    - **Click the model** to pick the material under the cursor: the list shows just that
+      material, opened, until **Show all materials** (or a click on empty space). The
+      picked material, or the one under the mouse in the list, is tinted orange in the
+      view.
+    - A material's tooltip lists its meshes; an edited material is marked `*` and has
+      **Revert all**.
     - A change applies to every mesh and detail level that uses the same material
-      colour.
+      value.
     - **Save** writes the new values into every bundle that holds the model, keeping a
       `.bak` of the original.
     - Many outfits have no colour texture and take their colour from these constants,
@@ -130,16 +146,27 @@ the command line, or drag one onto the window.
     - The mesh is skinned to the animated skeleton, and the skeleton overlay follows it.
     - Bones are matched by name, so other characters' animations apply only to the
       bones the two skeletons share.
+    - **Replace motion...** gives the shown animation new motion from a JSON timeline
+      (the `anim-import` format, [docs/animation-keys.md](docs/animation-keys.md); the
+      Blender add-on `docs/blender/nuttool_animation_keys.py` exports it from an animated
+      armature) and
+      plays it straight away. **Build on the original** keys the animation from the
+      bundle's `.bak`, so a new try doesn't build on an earlier one, and **Reload**
+      re-reads the edited JSON. **Ctrl+S** writes the motion into every bundle holding
+      the animation.
   - **Textures** (thumbnails, each opening its own tab), the **skeleton** tree, and the
     **materials**.
-  - **Export OBJ** writes the shown meshes with an `.mtl` and PNG textures.
+  - **Export OBJ** writes the shown meshes with the FBX export's materials, tinted PNG
+    textures and fur shells (`.obj`, `.mtl` and PNGs side by side). OBJ holds no
+    skeleton, skin or animation; use **Export FBX** for those.
   - **Export FBX** writes one `.fbx`: the shown meshes skinned to the skeleton, the
     materials with their colour maps embedded at full size, and animations as takes. You
     can include every animation named after the model, only the one playing, or none.
     Furry models also get their fur (**Fur shells**, on by default), using the viewer's
     fur length and tiling.
   - **Replace**: **Import OBJ / FBX** applies an edited export or new geometry (see
-    "Models" below), and **Replace with another model** copies any other game model into
+    "Models" below); with **Override rig** it also moves the joints to the FBX's bones of
+    the same names. **Replace with another model** copies any other game model into
     this one's place. Both show in the viewport straight away; **Ctrl+S** writes them into
     every bundle holding the model, and **Discard changes** goes back to what is on disk.
   Bundle views have an **Open in model viewer** / **Open texture tab** button for
@@ -224,8 +251,16 @@ nuttool model-export assets\Bundle\4f\0a04d0 models   # models as OBJ + MTL + bo
 
 `model-export` writes the parts shown by default. `--all-groups` includes every detail
 level and alternative part (OBJ objects are named `group<N>_mesh<M>`), and `--png` also
-writes the file's textures. Most models use textures from shared bundles; the GUI's
-**Export OBJ** collects those.
+writes the file's textures. It is a quick dump of every model in a file; for one model
+with everything the FBX export has, use `model-obj` (below) or the GUI's **Export OBJ**,
+which also find textures in shared bundles.
+
+```
+nuttool model-obj <bundle> <model> out.obj [--all-groups] [--no-fur] [--no-tint]
+```
+
+`model-obj` takes the same mesh, texture and fur options as `model-fbx` and writes the
+same meshes, materials, tinted textures and fur, as `.obj` + `.mtl` + PNGs.
 
 Run `nuttool help` for the full command list.
 
@@ -552,8 +587,21 @@ nuttool model-fbx assets\Bundle\4f\685374 banjox_actor_banjo banjo.fbx   # for B
 The GUI's **Export FBX** finds animations and textures anywhere in the game through its
 index, so it can include more than the command line, which sees only the bundles you
 give it. Units are metres (the file says 1 unit = 100 cm), Y up. The file is laid out
-as Blender's own exporter writes FBX. In Blender, *Automatic Bone Orientation* makes the
-bones point along the limbs.
+as Blender's own exporter writes FBX. Bones keep the game's frames, which all face the same
+way; `--reorient-bones` (**Reorient bones** in the GUI) turns each one so `--bone-axis`
+(default Y, Blender's bone axis; X, Z, -X, -Y or -Z for other programs) points at its main
+child: the one with the most bones under it, or the average of tied ones. Leaf bones carry
+on along the line from their parent, and each turn is the smallest from the game's frame.
+The skin, bind pose and animation curves are rewritten to match, so the model and its
+motion are unchanged. Without it, Blender's *Automatic Bone Orientation* does a rougher
+version. Blender sizes each bone by the average distance to its children (childless ones copy
+their parent's). `--bone-ends` (**Short end bones**) gives each childless bone a
+`<bone>_end` child, `--bone-end-size` percent of the skeleton's size (default 1.5) down its
+bone axis, so it draws as a stub; Blender's *Ignore Leaf Bones* hides the helpers but keeps
+the stub length. They carry no weights, and `model-import` ignores them.
+`docs/blender/tidy_bones.py`, run in Blender with
+the armature selected, sets each bone to reach its main child and childless ones to short
+stubs, without moving anything.
 
 `model-import` takes a Wavefront OBJ or a binary FBX (7.x; text FBX files are refused,
 so export binary). It matches objects to meshes by the `mesh<N>` in their names, as the
@@ -578,6 +626,19 @@ on bones the skeleton lacks are dropped and listed. For each object:
 Meshes not named in the file stay as they are. New parts cannot be added; replace an
 existing mesh instead. Other detail levels draw their own meshes, so either edit those too
 or set the detail level to 0 in game.
+
+`model-import --rig` (**Override rig** in the GUI) also overrides the skeleton's joint
+positions from an FBX. The game skins with the inverse of the model's bind pose (its
+`pose` block, so a skin matrix is the identity in the bind pose) and adds each animation
+translation to the bone's bind offset. Moving a joint therefore moves where animations
+bend the mesh, without moving the mesh itself.
+- Each model bone named like an FBX bone (as for weights) takes that bone's bind position:
+  its skin cluster's `TransformLink`, else the `BindPose`, else where the node stands.
+  Bones the file lacks keep their offset from their parent.
+- Bone orientations, the hierarchy and the bone count stay, because the game's animations
+  replace rotations and are made for its skeleton. Extra bones (other than `_end` helpers)
+  are ignored and listed.
+- The file may hold only the armature; meshes in it are imported as usual.
 
 `model-swap` copies a whole model (its `.data`, `.gpu` and `.stream` parts) over another
 one, from the same bundle or a different one; shared strings and shaders the destination
