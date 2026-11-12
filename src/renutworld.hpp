@@ -82,6 +82,10 @@ struct World {
 
 // A CAFF of its own holding `syms` of `src` (as its symbols 0, 1...) and the pool entries they point into.
 caff::Caff copyAssets(const caff::Caff& src, const std::vector<size_t>& syms);
+// Makes texture assets (a CAFF each) showing an image, at most `maxSide` a side, from the world textures' template in the
+// game's assets folder; `summary` says what each became.
+std::function<Bytes(const std::string& name, const image::Rgba& img, std::string& summary)> textureMaker(const fs::path& assets,
+                                                                                                       uint32_t maxSide = 1024);
 // Renames asset `from` to `to` in `c`: its symbol names and the name that ends a model's .stream part.
 void renameAssetIn(caff::Caff& c, const std::string& from, const std::string& to);
 // Points the model's texture names (in its .data part `sym`) that are keys of `names` at their values; how many it pointed.

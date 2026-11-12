@@ -123,6 +123,23 @@ struct SkinnedMesh {
 };
 std::vector<SkinnedMesh> skinnedMeshes(const Bytes& glb);
 
+// A .glb's skeleton: its first skin's joints, parents (among them) before children, each depth's after the previous
+// depth's, with their rest transforms in world space (column-major), the pose skinnedMeshes' vertices are in.
+struct Joint {
+    std::string name;
+    int parent = -1;
+    std::array<float, 16> bind{};
+};
+std::vector<Joint> skeleton(const Bytes& glb);
+
+// The file's animations sampled `fps` times a second: each frame's world transform of every joint of skeleton().
+struct JointAnimation {
+    std::string name;
+    float seconds = 0;
+    std::vector<std::vector<std::array<float, 16>>> frames;  // [frame][joint]
+};
+std::vector<JointAnimation> jointAnimations(const Bytes& glb, float fps);
+
 // OBJ text for model import: the node's triangles (normals smoothed by angle, texture coordinates
 // projected along each face's main axis, or `flat`) in an object per `into` mesh, and `hide`'s
 // meshes removed.

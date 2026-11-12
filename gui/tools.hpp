@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+namespace nut::actorswap {
+struct Index;
+}
+
 namespace nut::gui {
 
 // What a file holds, for the name pickers: its models, animations and textures.
@@ -107,6 +111,17 @@ struct ToolWindows {
     std::string scBundle, scName, scAssets, scDir, scIn, scOut;
     int scKind = 0;  // 0 game scripts, 1 objparams, 2 vehicle parts only
     bool scXctd = false;
+
+    // Tools > Replace an actor: the game's actors (read once), the two chosen and each target entry's anim.
+    bool showActor = false;
+    std::shared_ptr<const actorswap::Index> actorIndex;
+    std::string asTarget, asSource, asTargetFilter, asSourceFilter, asMatched;  // asMatched: "target|source" asAnims was made for
+    std::map<std::string, std::string> asAnims;
+    int asEvents = 0;  // 0 keep the target's, 1 the source's, 2 none
+    int asMode = 0;    // 0 a game actor, 1 a rigged .glb of your own
+    std::string asGlb, asGlbSeen, asGlbError;  // the .glb (UTF-8), the one its animations were read from, and why not
+    std::vector<std::string> asGlbAnims;
+    float asScale = 1;
 
     // reNut menu
     bool showPartPicker = false, showBlock = false, showWorld = false, showVehicle = false, showGraph = false;

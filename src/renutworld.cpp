@@ -1406,6 +1406,16 @@ void appendScene(gltfobj::SceneMesh& into, const gltfobj::SceneMesh& more) {
 } // namespace
 
 caff::Caff copyAssets(const caff::Caff& src, const std::vector<size_t>& syms) { return standalone(src, syms); }
+
+std::function<Bytes(const std::string&, const image::Rgba&, std::string&)> textureMaker(const fs::path& assets, uint32_t maxSide) {
+    const fs::path bundle = carParkBundle(assets);
+    Loaded l = loadAsset(bundle);
+    if (!l.caff) fail(bundle.string() + " (the car park, which holds the textures' template) is not a bundle");
+    auto tmpl = std::make_shared<const caff::Caff>(textureTemplate(*l.caff, bundle));
+    return [tmpl, maxSide](const std::string& name, const image::Rgba& img, std::string& summary) {
+        return worldTexture(*tmpl, name, img, summary, maxSide);
+    };
+}
 void renameAssetIn(caff::Caff& c, const std::string& from, const std::string& to) { renameAsset(c, from, to); }
 int retextureIn(caff::Caff& c, size_t sym, const std::map<std::string, std::string>& names) { return retexture(c, sym, names); }
 

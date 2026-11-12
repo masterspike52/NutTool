@@ -1,6 +1,7 @@
 #include "commands.hpp"
 #include "script.hpp"
 
+#include "actorswap.hpp"
 #include "animkeys.hpp"
 #include "assetdb.hpp"
 #include "blockmodel.hpp"
@@ -659,6 +660,70 @@ int animImport(const Args& a) {
     if (l.caff) saveCaff(out, *l.caff, a.flag("--xctd"));
     else writeFile(out, l.sb->serialize());
     print("wrote %s (%d cop%s of the animation)\n", out.string().c_str(), copies, copies == 1 ? "y" : "ies");
+    return 0;
+}
+
+namespace {
+
+// The title update folder for actor-list and actor-swap: --update, else <assets>\..\update when it exists.
+fs::path actorUpdateDir(const Args& a, const fs::path& assets) {
+    if (!a.opt("--update").empty()) return a.opt("--update");
+    const fs::path u = assets.parent_path() / "update";
+    std::error_code ec;
+    return fs::exists(u, ec) ? u : fs::path();
+}
+
+actorswap::Index actorIndex(const Args& a, const fs::path& assets) {
+    return actorswap::scan(assets, actorUpdateDir(a, assets), [](const std::string& s) { print("%s\n", s.c_str()); });
+}
+
+} // namespace
+
+int actorList(const Args& a) {
+    const fs::path assets = a.at(0, "assets dir");
+    const actorswap::Index ix = actorIndex(a, assets);
+    const std::string only = a.opt("--actor");
+    for (const actorswap::Actor& act : ix.actors) {
+        if (!only.empty() && act.name != only && act.name != "aid_objparams_banjox_actor_" + only) continue;
+        print("%s: model %s, table %s (%zu entries)\n", act.name.c_str(), ix.nameOf(act.model).c_str(), ix.nameOf(act.table).c_str(),
+              act.entries.size());
+        if (only.empty()) continue;
+        for (const actorswap::Entry& e : act.entries)
+            print("  %-32s %s%s%s\n", e.name.c_str(), ix.nameOf(e.anim).c_str(), e.events ? "  events " : "", ix.nameOf(e.events).c_str());
+        print("animations it can lend:\n");
+        for (const std::string& n : actorswap::sourceAnims(act, ix)) print("  %s\n", n.c_str());
+    }
+    return 0;
+}
+
+int actorSwap(const Args& a) {
+    const fs::path assets = a.at(0, "assets dir");
+    actorswap::Plan plan;
+    plan.target = a.at(1, "target actor");
+    const std::string source = a.at(2, "source actor or .glb");
+    if (endsWith(lower(source), ".glb")) {
+        plan.glb = source;
+        if (!a.opt("--scale").empty()) plan.scale = std::stof(a.opt("--scale"));
+    } else {
+        plan.source = source;
+    }
+    for (std::string* n : {&plan.target, &plan.source})
+        if (!n->empty() && !startsWith(*n, "aid_")) *n = "aid_objparams_banjox_actor_" + *n;
+    if (!a.opt("--plan").empty()) plan.anims = actorswap::planFromJson(readText(a.opt("--plan"))).anims;
+    const std::string events = a.opt("--events", "keep");
+    if (events == "source") plan.events = actorswap::Events::Source;
+    else if (events == "none") plan.events = actorswap::Events::None;
+    else if (events != "keep") fail("--events is keep, source or none");
+    const actorswap::Index ix = actorIndex(a, assets);
+    const actorswap::Actor* target = ix.actor(plan.target);
+    const actorswap::Actor* from = plan.glb.empty() ? ix.actor(plan.source) : nullptr;
+    std::map<std::string, std::string> matched;
+    if (target && from) matched = actorswap::autoMatch(*target, *from, ix);
+    if (target && !plan.glb.empty()) matched = actorswap::autoMatchGlb(*target, actorswap::glbAnimations(plan.glb));
+    for (const auto& [entry, anim] : matched)
+        if (plan.anims.emplace(entry, anim).second) print("  %-32s -> %s\n", entry.c_str(), anim.c_str());
+    const auto written = actorswap::apply(ix, plan, [](const std::string& s) { print("%s\n", s.c_str()); });
+    for (const fs::path& f : written) print("wrote %s\n", f.string().c_str());
     return 0;
 }
 
@@ -1582,6 +1647,20 @@ const std::vector<Command>& commands() {
          "Give an animation new motion from a JSON timeline of poses (bone rotations in Euler degrees, offsets in metres); bones "
          "without keys keep its own motion, and its length and frame count stay (see reNut's docs/nuttool/animations.md)",
          animImport},
+        {"actor-list", "<assets dir> [--actor name] [--update <title update dir>]",
+         "List the game's actors (objparams with a model) with their model and animation table; with --actor, that actor's "
+         "table entries and the animations it can lend another actor",
+         actorList},
+        {"actor-swap",
+         "<assets dir> <target actor> <source actor | rigged.glb> [--scale s] [--plan plan.json] [--events keep|source|none] [--update dir]",
+         "Replace an actor with another (banjotux npc_klungo, say), or with one of your own from a rigged .glb (its skinned meshes "
+         "on its own skeleton, its textures and its animations, --scale times its size): the target, and every actor sharing its "
+         "animation table, draws the new model (with what it needs copied in), and the table plays the new animations, which "
+         "are copied into its bundles. --plan's \"anims\" {entry: animation} picks one per entry (an aid_anim_ name, or the "
+         ".glb's animation name); the others take the one of the same name, else a stand or idle. --events: the entries keep "
+         "the target's animation events (footsteps, hits), take the source's, or have none. Bundles are written in place "
+         "after a one-time .bak",
+         actorSwap},
         {"make-nbpatch",
          "<game dir> <out.nbpatch> --name <name> [--original <clean game dir>] [--update <title update dir>] [--version v] [--author a] "
          "[--category c] [--description d] [--id id]",
@@ -1723,7 +1802,7 @@ Args parseArgs(const std::vector<std::string>& argv) {
                                                 "--type", "--mass", "--health", "--spawn", "--spawn-yaw", "--exit", "--exit-yaw",
                                                 "--door", "--door-yaw", "--door-style", "--smooth", "--scale", "--ground", "--ground-colour",
                                                 "--hologram", "--sky", "--colour-scale", "--npcs", "--max-texture", "--music", "--music-volume", "--stats", "--water", "--shapes",
-                                                "--materials", "--player-model"};
+                                                "--materials", "--player-model", "--plan", "--events", "--actor"};
     Args a;
     for (size_t i = 1; i < argv.size(); ++i) {
         std::string s = argv[i];

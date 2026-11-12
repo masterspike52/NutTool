@@ -2,6 +2,7 @@
 // code (commands.cpp, or renutmake for reNut blocks) on a worker thread, with its output in the log.
 #include "app.hpp"
 
+#include "actorswap.hpp"
 #include "assetdb.hpp"
 #include "commands.hpp"
 #include "container.hpp"
@@ -423,6 +424,7 @@ void App::drawToolWindows() {
     drawImportTools();
     drawScriptTools();
     drawFileJobs();
+    drawActorSwap();
     drawPartPicker();
     drawBlockTool();
     drawWorldTool();
@@ -1079,6 +1081,226 @@ void App::drawFileJobs() {
             if (!base.empty()) a.insert(a.end(), {"--base", cliPath(base)});
             return a;
         }, {out});
+    }
+    ImGui::End();
+}
+
+// ---- Tools > Replace an actor --------------------------------------------------------------------
+
+namespace {
+
+std::string shortActor(const std::string& n) {
+    const std::string p = "aid_objparams_banjox_actor_";
+    return startsWith(n, p) ? n.substr(p.size()) : n;
+}
+
+std::string shortAnim(const std::string& n) {
+    for (const char* p : {"aid_anim_banjox_actor_", "aid_anim_banjox_", "aid_anim_"})
+        if (startsWith(n, p)) return n.substr(std::string(p).size());
+    return n;
+}
+
+// The actors in a combo with a search box; true when `chosen` changed.
+bool actorCombo(const char* label, const actorswap::Index& ix, std::string& chosen, std::string& filter) {
+    bool changed = false;
+    ImGui::SetNextItemWidth(em(320));
+    if (ImGui::BeginCombo(label, chosen.empty() ? "(choose)" : shortActor(chosen).c_str(), ImGuiComboFlags_HeightLarge)) {
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        inputTextWithHint("##filter", "search", filter);
+        const std::string f = lower(filter);
+        for (const actorswap::Actor& a : ix.actors) {
+            if (!f.empty() && lower(a.name).find(f) == std::string::npos) continue;
+            if (ImGui::Selectable(shortActor(a.name).c_str(), a.name == chosen)) {
+                chosen = a.name;
+                changed = true;
+            }
+            if (ImGui::BeginItemTooltip()) {
+                ImGui::Text("%s\nmodel %s\ntable %s, %zu entries", a.name.c_str(), ix.nameOf(a.model).c_str(), ix.nameOf(a.table).c_str(),
+                            a.entries.size());
+                ImGui::EndTooltip();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
+} // namespace
+
+void App::drawActorSwap() {
+    ToolWindows& t = tools_;
+    if (!t.showActor) return;
+    ImGui::SetNextWindowSize(ImVec2(em(760), em(600)), ImGuiCond_Appearing);
+    if (!ImGui::Begin("Replace an actor", &t.showActor)) {
+        ImGui::End();
+        return;
+    }
+    note("Makes one of the game's actors another: it draws the other's model with its own rig, and its animation table plays the "
+         "other's animations, picked entry by entry. Its moves, body and attacks stay its own: Banjo replaced by Klungo looks and "
+         "animates like Klungo but plays as Banjo. The bundles are written straight away with .bak backups; Tools > Restore "
+         "original files undoes it.");
+    if (!t.actorIndex) {
+        if (root_.empty()) ImGui::TextDisabled("Open the game's assets folder first (File > Open assets folder).");
+        if (runButton(*this, "Read the game's actors", !root_.empty())) {
+            fs::path root = root_, update = updateRoot();
+            runReadOnlyTask("Reading the game's actors", true, [this, root, update](Task& task) -> std::function<void()> {
+                auto ix = std::make_shared<actorswap::Index>(actorswap::scan(root, update, [&task](const std::string& s) { task.report(-1, s); }));
+                return [this, ix] {
+                    tools_.actorIndex = ix;
+                    status(std::to_string(ix->actors.size()) + " actors read");
+                };
+            });
+        }
+        helpMarker("Reads every bundle once (a minute or two) for each actor, its model, its animation table and where they are.");
+        ImGui::End();
+        return;
+    }
+    const actorswap::Index& ix = *t.actorIndex;
+    actorCombo("Replace##astarget", ix, t.asTarget, t.asTargetFilter);
+    helpMarker("The actor that changes; the game spawns it as before. banjotux is the player's Banjo.");
+    ImGui::RadioButton("With a game actor##asmode", &t.asMode, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("With a rigged .glb of your own##asmode", &t.asMode, 1);
+    const bool own = t.asMode == 1;
+    if (!own) {
+        actorCombo("With##assource", ix, t.asSource, t.asSourceFilter);
+        helpMarker("The actor whose model, rig and animations it takes. npc_klungo is Klungo.");
+    } else {
+        pathField(*this, "Model##asglb", t.asGlb, PathPick::OpenFile, {{"glTF binary", "glb"}}, "a rigged .glb with its animations");
+        helpMarker("Its skinned meshes on its own skeleton (at most 255 bones), their base colour textures, and every animation "
+                   "it holds for that skeleton (Blender: export glTF Binary with the armature, skinning and animations). Each "
+                   "entry the actor plays gets one of its animations.");
+        ImGui::SetNextItemWidth(em(120));
+        ImGui::DragFloat("Scale##asglb", &t.asScale, 0.01f, 0.01f, 100.0f, "%.3g");
+        helpMarker("Times the file's size; the game's units are metres (Banjo is about 1.2 tall).");
+        if (t.asGlb != t.asGlbSeen) {
+            t.asGlbSeen = t.asGlb;
+            t.asGlbAnims.clear();
+            t.asGlbError.clear();
+            if (!trim(t.asGlb).empty()) {
+                try {
+                    t.asGlbAnims = actorswap::glbAnimations(optPath(t.asGlb));
+                    if (t.asGlbAnims.empty()) t.asGlbError = "it has no animations for its skeleton";
+                } catch (const std::exception& e) {
+                    t.asGlbError = e.what();
+                }
+            }
+        }
+        if (!t.asGlbError.empty()) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "%s", t.asGlbError.c_str());
+    }
+    const actorswap::Actor* target = ix.actor(t.asTarget);
+    const actorswap::Actor* source = own ? nullptr : ix.actor(t.asSource);
+    if (!target || (!own && (!source || target == source)) || (own && t.asGlbAnims.empty())) {
+        ImGui::TextDisabled(target && target == source ? "Pick two different actors."
+                            : own                     ? "Pick the actor and a rigged .glb with animations."
+                                                      : "Pick both actors.");
+        ImGui::End();
+        return;
+    }
+    const std::string pair = t.asTarget + "|" + (own ? t.asGlb : t.asSource);
+    auto match = [&] { return own ? actorswap::autoMatchGlb(*target, t.asGlbAnims) : actorswap::autoMatch(*target, *source, ix); };
+    if (t.asMatched != pair) {
+        t.asAnims = match();
+        t.asMatched = pair;
+    }
+    std::string sharing;
+    for (const actorswap::Actor& a : ix.actors)
+        if (&a != target && a.table == target->table) sharing += (sharing.empty() ? "" : ", ") + shortActor(a.name);
+    if (!sharing.empty())
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "%s",
+                           ("Its animation table is also " + sharing + "'s: they draw the new model too.").c_str());
+    if (own && t.asEvents == 1) t.asEvents = 0;
+    ImGui::RadioButton("Keep its animation events##as", &t.asEvents, 0);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(own);
+    ImGui::RadioButton("Use the other's##as", &t.asEvents, 1);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::RadioButton("None##as", &t.asEvents, 2);
+    helpMarker("Animation events are what happens at moments of an animation: footstep sounds, effects, the frame an attack hits. "
+               "Keeping the actor's own keeps its gameplay timing; the other's fit the new animations; none silences them.");
+
+    ImGui::SeparatorText("Animations");
+    const std::string sourceLabel = own ? toUtf8(optPath(t.asGlb).filename()) : shortActor(source->name);
+    ImGui::TextDisabled("Each entry the game plays by name gets one of %s's animations.", sourceLabel.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Match again")) t.asAnims = match();
+    helpMarker("Each entry takes the animation of the same name (ignoring case and underscores), else a stand or idle. Every "
+               "entry needs one: the game animates a model only with animations made for its skeleton.");
+    const std::vector<std::string> lend = own ? t.asGlbAnims : actorswap::sourceAnims(*source, ix);
+    size_t missing = 0;
+    const float tableH = std::max(em(120), ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.6f);
+    if (ImGui::BeginTable("##asanims", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH, ImVec2(0, tableH))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Entry");
+        ImGui::TableSetupColumn("Played");
+        ImGui::TableSetupColumn("Plays now");
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < target->entries.size(); ++i) {
+            const actorswap::Entry& e = target->entries[i];
+            if (!e.anim) continue;
+            std::string& cur = t.asAnims[e.name];
+            missing += cur.empty();
+            ImGui::PushID(int(i));
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(e.name.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", shortAnim(ix.nameOf(e.anim)).c_str());
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##anim", cur.empty() ? "(choose)" : shortAnim(cur).c_str(), ImGuiComboFlags_HeightLarge)) {
+                for (const std::string& n : lend)
+                    if (ImGui::Selectable(shortAnim(n).c_str(), n == cur)) cur = n;
+                ImGui::EndCombo();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (runButton(*this, "Replace", missing == 0)) {
+        actorswap::Plan plan;
+        plan.target = t.asTarget;
+        if (own) {
+            plan.glb = optPath(t.asGlb);
+            plan.scale = t.asScale;
+        } else {
+            plan.source = t.asSource;
+        }
+        plan.anims = t.asAnims;
+        plan.events = t.asEvents == 1 ? actorswap::Events::Source : t.asEvents == 2 ? actorswap::Events::None : actorswap::Events::Keep;
+        // The bundles it writes: those holding the actors drawing the model, and the table.
+        std::vector<fs::path> writes;
+        std::vector<uint32_t> ids{target->table};
+        for (const actorswap::Actor& a : ix.actors)
+            if (&a == target || a.table == target->table)
+                if (auto id = assetdb::idFromName(a.name)) ids.push_back(*id);
+        for (uint32_t id : ids)
+            if (auto h = ix.holders.find(id); h != ix.holders.end())
+                for (size_t k : h->second) writes.push_back(ix.bundles[k]);
+        if (checkUnsaved(writes)) {
+            auto index = t.actorIndex;
+            runTask("Replacing " + shortActor(plan.target), true, [this, index, plan](Task& task) -> std::function<void()> {
+                std::vector<std::string> said;
+                const std::vector<fs::path> files = actorswap::apply(*index, plan, [&](const std::string& s) {
+                    said.push_back(s);
+                    task.report(-1, s);
+                });
+                return [this, files, said, plan] {
+                    for (const std::string& s : said) log(s);
+                    tools_.actorIndex.reset();  // the bundles changed: read them again before another swap
+                    tools_.asMatched.clear();
+                    reloadWritten(files);
+                    const std::string now = plan.glb.empty() ? shortActor(plan.source) : toUtf8(plan.glb.filename());
+                    status(shortActor(plan.target) + " is now " + now + " (" + std::to_string(files.size()) + " file(s) written)");
+                };
+            });
+        }
+    }
+    if (missing) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%zu entr%s without an animation", missing, missing == 1 ? "y" : "ies");
     }
     ImGui::End();
 }

@@ -213,7 +213,7 @@ public:
             std::string r = app.takeStartupReplacement();
             if (!r.empty())
                 deferred_ = [this, &app, r, a] {
-                    if (preview(app, [&](caff::Caff& c, uint32_t sym) { return copyFrom(c, sym, info_.locs.front(), r).notes; })) pendingSwap_ = r;
+                    addChange(app, {Change::Kind::Swap, r, {}, false, 0});
                     if (!a.empty()) loadAnimation(a);
                 };
             else if (!a.empty())
@@ -236,6 +236,15 @@ public:
     }
 
 private:
+    // A model change not saved yet. Bind's mesh numbers the meshes as the changes before it leave them.
+    struct Change {
+        enum class Kind { Swap, Import, Bind, Restore } kind;
+        std::string name; // Swap: the model copied in; Import: the file's name; Bind: the texture
+        Bytes file;       // Import: the OBJ, FBX or .glb
+        bool rig = false; // Import: the rig override
+        size_t mesh = 0;  // Bind
+    };
+
     struct LoadedTex {
         std::string name;
         image::Rgba img;
@@ -266,6 +275,47 @@ private:
         f.thinning = thin && thin->gl && !thin->glArray ? thin->gl.get() : nullptr;
         if (!f.root) f.root = f.tip;
         return f;
+    }
+
+    // The model texture a mesh binds to sampler `slot`, or -1.
+    static int textureInSlot(const model::Mesh& m, int slot) {
+        for (size_t k = 0; k < m.textures.size() && k < m.textureSlots.size(); ++k)
+            if (m.textureSlots[k] == slot) return m.textures[k];
+        return -1;
+    }
+
+    bool furred(const model::Mesh& m) const {
+        int v = textureInSlot(m, 1);
+        return v >= 0 && size_t(v) < textures_.size() && textures_[size_t(v)].volumeLayers > 0;
+    }
+
+    // The furred meshes shown, each with its mask: the thinning map in sampler slot 3.
+    void drawFur(App& app) {
+        std::vector<size_t> shown;
+        for (size_t i = 0; i < model_.meshes.size(); ++i)
+            if (groupShown_[size_t(model_.meshes[i].group)] && furred(model_.meshes[i])) shown.push_back(i);
+        if (shown.empty()) return;
+        ImGui::SeparatorText("Fur");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("A furred mesh's mask is its thinning map: the viewer grows the fur where the mask is bright, as long as it "
+                           "is bright, and none where it is black. Open a mask to import a black and white image over it; every model "
+                           "using that mask changes with it. A mesh with no mask is furred all over.");
+        ImGui::PopStyleColor();
+        for (size_t i : shown) {
+            const model::Mesh& m = model_.meshes[i];
+            const int mask = textureInSlot(m, 3);
+            ImGui::PushID(int(i) + 30000);
+            ImGui::Text("mesh %zu%s%s", i, m.material.empty() ? "" : ": ", m.material.c_str());
+            ImGui::SameLine();
+            if (mask < 0) {
+                ImGui::TextDisabled("no mask");
+            } else {
+                ImGui::TextDisabled("mask %s", shortTex(model_.textures[size_t(mask)]).c_str());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Open mask")) app.openTexture(model_.textures[size_t(mask)]);
+            }
+            ImGui::PopID();
+        }
     }
 
     void initMeshState() {
@@ -399,8 +449,16 @@ private:
         if (model_.groups.size() > 1) drawParts();
         drawColours();
 
+        drawFur(app);
+
         ImGui::SeparatorText("Meshes");
-        ImGui::TextDisabled("Textured meshes show the colour map among the textures their draw binds; the others use their material's base colour.");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Textured meshes show the colour map among the textures their draw binds; the others use their material's "
+                           "base colour. Picking another of the model's textures for a mesh that draws a colour map makes it draw that "
+                           "one, saved with Ctrl+S (draws sharing its binding change with it). For other meshes, and (none), the "
+                           "choice only changes the view.");
+        ImGui::PopStyleColor();
+        int bindMesh = -1, bindTo = -1;
         for (size_t i = 0; i < model_.meshes.size(); ++i) {
             auto& m = model_.meshes[i];
             if (!groupShown_[size_t(m.group)]) continue;
@@ -413,7 +471,8 @@ private:
                                    ImVec2(ImGui::GetTextLineHeight(), ImGui::GetTextLineHeight()));
                 ImGui::SameLine();
             }
-            ImGui::Text("%s  %zu tris", m.material.empty() ? ("mesh " + std::to_string(i)).c_str() : m.material.c_str(), m.indices.size() / 3);
+            ImGui::Text("%s  %zu tris%s", m.material.empty() ? ("mesh " + std::to_string(i)).c_str() : m.material.c_str(), m.indices.size() / 3,
+                        furred(m) ? "  fur" : "");
             if (ImGui::BeginItemTooltip()) {
                 ImGui::Text("mesh %zu in %s\n%zu vertices, layout %s", i, groupLabel(size_t(m.group)).c_str(), m.vertices.size(), layoutText(m).c_str());
                 if (m.textures.empty()) ImGui::TextUnformatted("No textures bound.");
@@ -425,13 +484,19 @@ private:
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-FLT_MIN);
             std::string cur = meshTex_[i] < 0 ? "(none)" : shortTex(model_.textures[size_t(meshTex_[i])]);
+            const bool bindable = m.texture >= 0 && !m.source.samplers.empty();
             ImGui::BeginDisabled(m.layout.uvSets.empty());
             if (ImGui::BeginCombo("##tex", cur.c_str())) {
-                if (ImGui::Selectable("(none)", meshTex_[i] < 0)) { meshTex_[i] = -1; applyMeshState(); }
-                // Textures bound to this draw first, then the rest of the model's.
+                if (ImGui::Selectable(bindable ? "(none, view only)" : "(none)", meshTex_[i] < 0)) { meshTex_[i] = -1; applyMeshState(); }
+                // Textures bound to this draw first, then the rest of the model's. Fur volumes (3D) can't be a colour map.
                 auto item = [&](size_t t) {
                     ImGui::PushID(int(t));
-                    if (ImGui::Selectable(shortTex(model_.textures[t]).c_str(), meshTex_[i] == int(t))) { meshTex_[i] = int(t); applyMeshState(); }
+                    ImGui::BeginDisabled(bindable && textures_[t].volumeLayers > 0);
+                    if (ImGui::Selectable(shortTex(model_.textures[t]).c_str(), meshTex_[i] == int(t))) {
+                        if (bindable && int(t) != m.texture) bindMesh = int(i), bindTo = int(t);
+                        else { meshTex_[i] = int(t); applyMeshState(); }
+                    }
+                    ImGui::EndDisabled();
                     ImGui::PopID();
                 };
                 for (int t : m.textures) item(size_t(t));
@@ -443,6 +508,7 @@ private:
             ImGui::EndDisabled();
             ImGui::PopID();
         }
+        if (bindMesh >= 0) bindTexture(app, size_t(bindMesh), bindTo);
 
         ImGui::SeparatorText("Textures");
         for (size_t i = 0; i < textures_.size(); ++i) {
@@ -1223,10 +1289,14 @@ private:
             }
             if (rows.empty()) continue;
             ++listed;
+            // Every mesh with it draws a colour map, which takes the place of its base colour.
+            std::set<int> maps;
+            for (size_t m : e.meshes) maps.insert(model_.meshes[m].texture);
+            const bool textured = !maps.empty() && !maps.count(-1);
             ImGui::PushID(int(mi));
             if ((searched && !f.empty()) || (picked && scrollToPicked_)) ImGui::SetNextItemOpen(true);
             std::string head = e.label + "  (" + std::to_string(e.meshes.size()) + " mesh" + (e.meshes.size() == 1 ? "" : "es") + ")" +
-                               (edited ? "  *" : "") + "###mat";
+                               (textured ? "  textured" : "") + (edited ? "  *" : "") + "###mat";
             bool open = ImGui::TreeNodeEx(head.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
             if (ImGui::IsItemHovered()) hoveredMaterial_ = e.label;
             if (picked && scrollToPicked_) {
@@ -1238,6 +1308,11 @@ private:
                 for (size_t m : e.meshes) {
                     const auto& mesh = model_.meshes[m];
                     ImGui::BulletText("mesh %zu in %s, %zu tris", m, groupLabel(size_t(mesh.group)).c_str(), mesh.indices.size() / 3);
+                }
+                if (textured) {
+                    ImGui::TextUnformatted("Textured: its meshes draw");
+                    for (int t : maps) ImGui::BulletText("%s", shortTex(model_.textures[size_t(t)]).c_str());
+                    ImGui::TextUnformatted("so its base colour isn't drawn; textureGain and textureOffset tint the texture.");
                 }
                 ImGui::EndTooltip();
             }
@@ -1263,6 +1338,15 @@ private:
                         ImGui::Text("%s\nnow %.4g %.4g %.4g %.4g\nwas %.4g %.4g %.4g %.4g\n%zu mesh(es)", g.name.c_str(), v[0], v[1], v[2], v[3],
                                     g.original[0], g.original[1], g.original[2], g.original[3], g.uses.size());
                         ImGui::EndTooltip();
+                    }
+                    if (textured && g.name == "c:basecolour") {
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "(not drawn: textured)");
+                        if (ImGui::BeginItemTooltip()) {
+                            ImGui::TextUnformatted("Every mesh with this material draws a texture in place of this colour, so changing "
+                                                   "it shows nothing. Tint the texture with textureGain and textureOffset instead.");
+                            ImGui::EndTooltip();
+                        }
                     }
                     if (colourEdited_.count(gi)) {
                         ImGui::SameLine();
@@ -1301,16 +1385,7 @@ private:
                 }
                 std::string name = toUtf8(p.filename());
                 bool rig = importRig_;
-                deferred_ = [this, &app, name, text, rig] {
-                    bool ok = preview(app, [&](caff::Caff& c, uint32_t sym) {
-                        model::ImportReport r = model::importMeshFile(c, sym, text, rig);
-                        std::vector<std::string> notes{name + ": " + std::to_string(r.edited) + " mesh(es) edited, " + std::to_string(r.rebuilt) +
-                                                       " rebuilt, " + std::to_string(r.hidden) + " hidden"};
-                        notes.insert(notes.end(), r.notes.begin(), r.notes.end());
-                        return notes;
-                    });
-                    if (ok) pendingObjs_.push_back({text, rig});
-                };
+                deferred_ = [this, &app, name, text, rig] { addChange(app, {Change::Kind::Import, name, text, rig}); };
             });
         }
         ImGui::SameLine();
@@ -1343,12 +1418,7 @@ private:
                         }
                         if (ImGui::Selectable(shortModelName(m.name).c_str())) {
                             std::string name = m.name;
-                            deferred_ = [this, &app, name] {
-                                if (preview(app, [&](caff::Caff& c, uint32_t sym) { return copyFrom(c, sym, info_.locs.front(), name).notes; })) {
-                                    pendingSwap_ = name;
-                                    pendingObjs_.clear(); // the new model replaces any imported geometry
-                                }
-                            };
+                            deferred_ = [this, &app, name] { addChange(app, {Change::Kind::Swap, name, {}, false, 0}); };
                             ImGui::CloseCurrentPopup();
                         }
                     }
@@ -1357,8 +1427,33 @@ private:
             ImGui::EndChild();
             ImGui::EndPopup();
         }
-        if (!pendingSwap_.empty()) ImGui::BulletText("Replaced by %s", shortModelName(pendingSwap_).c_str());
-        if (!pendingObjs_.empty()) ImGui::BulletText("%zu mesh import(s)", pendingObjs_.size());
+        bool backup = false;
+        for (auto& l : info_.locs) {
+            fs::path bak = l.file;
+            bak += ".bak";
+            std::error_code ec;
+            backup |= fs::exists(bak, ec);
+        }
+        ImGui::BeginDisabled(coloursPending || !backup);
+        if (ImGui::Button("Restore the original model")) deferred_ = [this, &app] { addChange(app, {Change::Kind::Restore, {}, {}, false, 0}); };
+        ImGui::EndDisabled();
+        helpMarker(backup ? "Brings back the model as the game shipped it, from the .bak NutTool kept of its bundle before first saving "
+                            "over it: its meshes, materials, rig and textures. Only this model: the bundle's other models keep their "
+                            "changes. Ctrl+S writes it."
+                          : "Needs the .bak NutTool keeps of a bundle the first time it saves over it (File > Make .bak backups when "
+                            "saving); this model's bundle has none.");
+        // Each change not saved yet, with its own undo: the rest are applied again without it.
+        for (size_t i = 0; i < changes_.size(); ++i) {
+            ImGui::PushID(int(i) + 20000);
+            ImGui::BulletText("%s", changeLabel(changes_[i]).c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Undo")) {
+                std::vector<Change> rest = changes_;
+                rest.erase(rest.begin() + std::ptrdiff_t(i));
+                deferred_ = [this, &app, rest] { rebuild(app, rest); };
+            }
+            ImGui::PopID();
+        }
         if (!replaceNotes_.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
             for (auto& n : replaceNotes_) ImGui::TextWrapped("%s", n.c_str());
@@ -1371,21 +1466,123 @@ private:
         }
     }
 
-    // Applies `op` to a copy of the previewed CAFF; on success it becomes the preview and is shown.
-    bool preview(App& app, const std::function<std::vector<std::string>(caff::Caff&, uint32_t)>& op) {
+    std::string changeLabel(const Change& ch) const {
+        switch (ch.kind) {
+        case Change::Kind::Swap: return "Replaced by " + shortModelName(ch.name);
+        case Change::Kind::Restore: return "Restored the original model";
+        case Change::Kind::Import: return "Imported " + ch.name + (ch.rig ? " (with its rig)" : "");
+        case Change::Kind::Bind: return "Mesh " + std::to_string(ch.mesh) + " draws " + shortTex(ch.name);
+        }
+        return {};
+    }
+
+    // Applies one change to the model at `symbol` in `c` (a copy of the model at `at`); returns the streamed texture
+    // levels it needs in the destination's stream bundle.
+    std::vector<streambundle::Entry> applyChange(caff::Caff& c, uint32_t symbol, const AssetLoc& at, const Change& ch,
+                                                 std::vector<std::string>* notes) {
+        auto note = [&](const std::vector<std::string>& n) {
+            if (notes) notes->insert(notes->end(), n.begin(), n.end());
+        };
+        switch (ch.kind) {
+        case Change::Kind::Swap:
+        case Change::Kind::Restore: {
+            model::CopyResult r = ch.kind == Change::Kind::Swap ? copyFrom(c, symbol, at, ch.name) : restoreFrom(c, symbol, at);
+            note(r.notes);
+            return r.streamEntries;
+        }
+        case Change::Kind::Import: {
+            model::ImportReport r = model::importMeshFile(c, symbol, ch.file, ch.rig);
+            note({ch.name + ": " + std::to_string(r.edited) + " mesh(es) edited, " + std::to_string(r.rebuilt) + " rebuilt, " +
+                  std::to_string(r.hidden) + " hidden"});
+            note(r.notes);
+            return {};
+        }
+        case Change::Kind::Bind: model::bindColourMap(c, symbol, ch.mesh, ch.name); return {};
+        }
+        return {};
+    }
+
+    // Applies `ch` to the preview and lists it; with `reload` the model is read again from it. A whole model copied in
+    // (Swap, Restore) starts from the disk copy, replacing what the earlier changes did.
+    bool addChange(App& app, Change ch, bool reload = true) {
         const AssetLoc& loc = info_.locs.front();
+        const bool whole = ch.kind == Change::Kind::Swap || ch.kind == Change::Kind::Restore;
         try {
-            caff::Caff trial = preview_ ? *preview_ : cache_.get(loc);
-            std::vector<std::string> notes = op(trial, loc.symbol);
+            caff::Caff trial = preview_ && !whole ? *preview_ : cache_.get(loc);
+            std::vector<std::string> notes;
+            applyChange(trial, loc.symbol, loc, ch, &notes);
             preview_ = std::make_unique<caff::Caff>(std::move(trial));
+            if (whole) changes_.clear(), replaceNotes_.clear();
+            app.status(notes.empty() ? changeLabel(ch) : notes.front());
+            changes_.push_back(std::move(ch));
             replaceNotes_.insert(replaceNotes_.end(), notes.begin(), notes.end());
-            loadModel(*preview_, loc.symbol);
-            app.status(notes.empty() ? "Model replaced" : notes.front());
+            if (reload) loadModel(*preview_, loc.symbol);
             return true;
         } catch (std::exception& e) {
             app.error(std::string("could not apply it: ") + e.what());
             return false;
         }
+    }
+
+    // The preview made again from the disk copy with only `changes` (an undo); nothing changes when one fails.
+    bool rebuild(App& app, const std::vector<Change>& changes) {
+        const AssetLoc& loc = info_.locs.front();
+        try {
+            caff::Caff trial = cache_.get(loc);
+            std::vector<std::string> notes;
+            for (const Change& ch : changes) applyChange(trial, loc.symbol, loc, ch, &notes);
+            preview_ = changes.empty() ? nullptr : std::make_unique<caff::Caff>(std::move(trial));
+            changes_ = changes;
+            replaceNotes_ = notes;
+            loadModel(preview_ ? *preview_ : cache_.get(loc), loc.symbol);
+            app.status("Change undone");
+            return true;
+        } catch (std::exception& e) {
+            app.error(std::string("could not undo it: ") + e.what());
+            return false;
+        }
+    }
+
+    // The model as the game shipped it: the same model in the .bak NutTool kept of its file before first saving over it.
+    model::CopyResult restoreFrom(caff::Caff& c, uint32_t symbol, const AssetLoc& at) {
+        fs::path bak = at.file;
+        bak += ".bak";
+        std::error_code ec;
+        if (!fs::exists(bak, ec)) fail(toUtf8(at.file.filename()) + " has no .bak backup to restore the model from");
+        Loaded l = loadAsset(bak);
+        std::shared_ptr<caff::Caff> original;
+        if (at.entry < 0) {
+            if (!l.caff) fail(toUtf8(bak) + " is not a bundle");
+            original = std::make_shared<caff::Caff>(std::move(*l.caff));
+        } else {
+            if (!l.sb || size_t(at.entry) >= l.sb->entries.size()) fail(toUtf8(bak) + ": stream bundle entry missing");
+            original = std::make_shared<caff::Caff>(caff::Caff::parse(l.sb->entries[size_t(at.entry)].data));
+        }
+        for (size_t s = 0; s < original->symbols.size(); ++s)
+            if (model::isModelSymbol(*original, s) && assetdb::baseAssetName(original->symbolName(s)) == info_.name)
+                return model::copyModel(c, symbol, *original, s,
+                                        model::texturesIn(original, at.entry < 0 ? model::pairedStreamBundle(at.file) : fs::path()));
+        fail(info_.name + " is not in " + toUtf8(bak));
+    }
+
+    // Makes mesh `mesh` draw texture `t` in place of its colour map, in the preview and the view (no reload needed).
+    void bindTexture(App& app, size_t mesh, int t) {
+        const model::Mesh& me = model_.meshes[mesh];
+        uint32_t record = 0;
+        for (size_t k = 0; k < me.textures.size() && k < me.source.samplers.size(); ++k)
+            if (me.textures[k] == me.texture) record = me.source.samplers[k];
+        if (!addChange(app, {Change::Kind::Bind, model_.textures[size_t(t)], {}, false, mesh}, false)) return;
+        // Draws sharing the sampler record change with it.
+        for (size_t j = 0; j < model_.meshes.size(); ++j) {
+            model::Mesh& mj = model_.meshes[j];
+            for (size_t k = 0; k < mj.textures.size() && k < mj.source.samplers.size(); ++k) {
+                if (mj.source.samplers[k] != record) continue;
+                if (mj.textures[k] == mj.texture) mj.texture = t;
+                mj.textures[k] = t;
+                meshTex_[j] = t;
+            }
+        }
+        applyMeshState();
     }
 
     // Copies the model `name` over the one at `symbol` in `c` (a copy of the model at `at`).
@@ -1445,16 +1642,17 @@ private:
     // Returns the stream bundle entries (streamed texture levels) the destination's stream bundle needs.
     std::vector<streambundle::Entry> applyReplacements(caff::Caff& c, uint32_t symbol, const AssetLoc& at) {
         std::vector<streambundle::Entry> entries;
-        if (!pendingSwap_.empty()) entries = copyFrom(c, symbol, at, pendingSwap_).streamEntries;
-        for (auto& obj : pendingObjs_) model::importMeshFile(c, symbol, obj.file, obj.rig);
+        for (const Change& ch : changes_) {
+            auto e = applyChange(c, symbol, at, ch, nullptr);
+            entries.insert(entries.end(), e.begin(), e.end());
+        }
         return entries;
     }
 
     // Back to what is on disk.
     void discard() {
         preview_.reset();
-        pendingObjs_.clear();
-        pendingSwap_.clear();
+        changes_.clear();
         replaceNotes_.clear();
         motions_.clear();
         cache_ = CaffCache();
@@ -1482,7 +1680,7 @@ private:
         for (auto& [s, d] : data) c.replaceSymbolData(size_t(s), d);
     }
 
-    bool modelDirty() const { return !colourEdited_.empty() || !pendingObjs_.empty() || !pendingSwap_.empty(); }
+    bool modelDirty() const { return !colourEdited_.empty() || !changes_.empty(); }
 
     // Writes the new motions into every copy of their animations; "save as" writes only those in the model's
     // first file, into the copy. Returns the copies written.
@@ -1580,15 +1778,14 @@ public:
             bool coloured = !colourEdited_.empty();
             for (size_t gi : colourEdited_) colourGroups_[gi].original = colourOf(colourGroups_[gi]);
             colourEdited_.clear();
-            bool replaced = !pendingObjs_.empty() || !pendingSwap_.empty();
+            bool replaced = !changes_.empty();
             std::vector<std::string> skipped;
             int motionCopies = motions_.empty() ? 0 : saveMotions(app, saveAs, skipped);
             size_t motionCount = motions_.size();
             if (!saveAs) {
                 // What is on disk now matches the preview.
                 preview_.reset();
-                pendingObjs_.clear();
-                pendingSwap_.clear();
+                changes_.clear();
                 replaceNotes_.clear();
                 motions_.clear();
                 cache_ = CaffCache();
@@ -1617,14 +1814,9 @@ private:
     int pickedMesh_ = -1;
     bool scrollToPicked_ = false;
     bool allColours_ = false, matColoursOnly_ = false;
-    // Replacements not saved yet: a model copied in, then OBJ imports, in order.
+    // Changes not saved yet, in order: the preview is the disk copy with them applied, and saving replays them on every copy.
     std::unique_ptr<caff::Caff> preview_;
-    std::string pendingSwap_;
-    struct PendingImport {
-        Bytes file; // OBJ or FBX
-        bool rig = false;
-    };
-    std::vector<PendingImport> pendingObjs_;
+    std::vector<Change> changes_;
     bool importRig_ = false;
     std::vector<std::string> replaceNotes_;
     std::string swapFilter_;

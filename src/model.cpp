@@ -434,7 +434,10 @@ Model parse(const caff::Caff& c, size_t symbol) {
             for (auto& [i, n] : texByIndex) {
                 auto at = std::find(m.textures.begin(), m.textures.end(), n);
                 textureOfFile[i] = int(at - m.textures.begin());
-                if (at == m.textures.end()) m.textures.push_back(n);
+                if (at == m.textures.end()) {
+                    m.textures.push_back(n);
+                    m.textureFiles.push_back(i);
+                }
             }
         }
     }
@@ -612,6 +615,7 @@ Model parse(const caff::Caff& c, size_t symbol) {
                         if (t == textureOfFile.end()) continue;
                         mesh.textures.push_back(t->second);
                         slots.push_back(int(v.u32(b + 8 + 16 * k)));
+                        so.samplers.push_back(b + 8 + 16 * k);
                     }
                 }
                 mesh.texture = colourMap(m.textures, mesh.textures);

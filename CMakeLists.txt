@@ -64,6 +64,7 @@ add_library(nutcore STATIC
     src/renutvehicle.cpp
     src/renutmake.cpp
     src/renutchars.cpp
+    src/actorswap.cpp
     src/renutworld.cpp
     src/renutnpc.cpp
     src/gltfobj.cpp

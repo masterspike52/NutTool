@@ -211,6 +211,7 @@ private:
     void drawImportTools();
     void drawScriptTools();
     void drawFileJobs();
+    void drawActorSwap();  // Tools > Replace an actor
     void drawPartPicker();
     void drawBlockTool();
     void drawWorldTool();

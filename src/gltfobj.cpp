@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <memory>
 #include <tuple>
@@ -1067,6 +1068,180 @@ std::vector<SkinnedMesh> skinnedMeshes(const Bytes& file) {
         if (sm.normals.size() != sm.points.size()) sm.normals.clear();
         if (sm.uvs.size() != sm.points.size()) sm.uvs.clear();
         if (!sm.triangles.empty()) out.push_back(std::move(sm));
+    }
+    return out;
+}
+
+namespace {
+
+Mat trs(const std::array<float, 3>& t, const std::array<float, 4>& q, const std::array<float, 3>& s) {
+    const float x = q[0], y = q[1], z = q[2], w = q[3];
+    return {(1 - 2 * (y * y + z * z)) * s[0], 2 * (x * y + z * w) * s[0], 2 * (x * z - y * w) * s[0], 0,
+            2 * (x * y - z * w) * s[1], (1 - 2 * (x * x + z * z)) * s[1], 2 * (y * z + x * w) * s[1], 0,
+            2 * (x * z + y * w) * s[2], 2 * (y * z - x * w) * s[2], (1 - 2 * (x * x + y * y)) * s[2], 0,
+            t[0], t[1], t[2], 1};
+}
+
+// The skin a skeleton comes from: the first skin's joint nodes in skeleton() order, their parents there, and binds:
+// each joint's rest transform in world space, where skinnedMeshes puts the vertices.
+struct SkinJoints {
+    std::vector<size_t> nodes;
+    std::vector<Joint> joints;
+    std::vector<size_t> parentNode;  // every node's parent, SIZE_MAX for roots
+};
+
+SkinJoints skinJoints(const Glb& g) {
+    SkinJoints sj;
+    if (!g.json.has("skins") || g.json["skins"].size() == 0) fail("the file has no skin (no rigged mesh)");
+    const auto& nodes = g.json["nodes"].items();
+    sj.parentNode.assign(nodes.size(), SIZE_MAX);
+    for (size_t i = 0; i < nodes.size(); ++i)
+        if (nodes[i].has("children"))
+            for (auto& c : nodes[i]["children"].items())
+                if (size_t(c.asNumber()) < nodes.size()) sj.parentNode[size_t(c.asNumber())] = i;
+    const Json& s = g.json["skins"][size_t(0)];
+    std::vector<size_t> jn;
+    std::vector<Mat> bind;
+    for (auto& joint : s["joints"].items()) {
+        const size_t n = size_t(joint.asNumber());
+        if (n >= nodes.size()) fail("a skin joint is not a node");
+        Mat w = identity();
+        for (size_t p = n, guard = 0; p != SIZE_MAX && guard < 1024; p = sj.parentNode[p], ++guard) w = mul(local(nodes[p]), w);
+        jn.push_back(n);
+        bind.push_back(w);
+    }
+    // Each joint's parent: its nearest ancestor that is a joint; its depth, for the order.
+    std::map<size_t, size_t> index;
+    for (size_t k = 0; k < jn.size(); ++k) index[jn[k]] = k;
+    std::vector<int> parent(jn.size(), -1), depth(jn.size(), 0);
+    for (size_t k = 0; k < jn.size(); ++k)
+        for (size_t p = sj.parentNode[jn[k]], guard = 0; p != SIZE_MAX && guard < 1024; p = sj.parentNode[p], ++guard)
+            if (index.count(p)) {
+                parent[k] = int(index[p]);
+                break;
+            }
+    for (size_t k = 0; k < jn.size(); ++k)
+        for (int p = parent[k], guard = 0; p >= 0 && guard < 1024; p = parent[size_t(p)], ++guard) ++depth[k];
+    std::vector<size_t> order(jn.size());
+    for (size_t k = 0; k < order.size(); ++k) order[k] = k;
+    std::stable_sort(order.begin(), order.end(), [&](size_t x, size_t y) { return depth[x] < depth[y]; });
+    std::vector<int> at(jn.size());
+    for (size_t k = 0; k < order.size(); ++k) at[order[k]] = int(k);
+    for (size_t k : order) {
+        Joint j;
+        j.name = nodes[jn[k]].has("name") ? nodes[jn[k]]["name"].asString() : "joint" + std::to_string(k);
+        j.parent = parent[k] < 0 ? -1 : at[size_t(parent[k])];
+        j.bind = bind[k];
+        sj.nodes.push_back(jn[k]);
+        sj.joints.push_back(std::move(j));
+    }
+    return sj;
+}
+
+} // namespace
+
+std::vector<Joint> skeleton(const Bytes& file) { return skinJoints(open(file)).joints; }
+
+std::vector<JointAnimation> jointAnimations(const Bytes& file, float fps) {
+    const Glb g = open(file);
+    const SkinJoints sj = skinJoints(g);
+    std::vector<JointAnimation> out;
+    if (!g.json.has("animations")) return out;
+    const auto& nodes = g.json["nodes"].items();
+    // Every node's rest translation, rotation and scale (a node given as a matrix keeps it, unanimated).
+    struct Trs {
+        std::array<float, 3> t{0, 0, 0}, s{1, 1, 1};
+        std::array<float, 4> r{0, 0, 0, 1};
+    };
+    std::vector<Trs> rest(nodes.size());
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        const Json& n = nodes[i];
+        for (size_t k = 0; k < 3; ++k) rest[i].t[k] = num(n["translation"], k, 0), rest[i].s[k] = num(n["scale"], k, 1);
+        for (size_t k = 0; k < 4; ++k) rest[i].r[k] = num(n["rotation"], k, k == 3 ? 1.0f : 0.0f);
+    }
+    for (size_t ai = 0; ai < g.json["animations"].size(); ++ai) {
+        const Json& a = g.json["animations"][ai];
+        struct Channel {
+            size_t node;
+            int path;  // 0 translation, 1 rotation, 2 scale
+            std::vector<double> times, values;
+            int width;
+            bool step, cubic;
+        };
+        std::vector<Channel> channels;
+        float seconds = 0;
+        for (auto& c : a["channels"].items()) {
+            if (!c["target"].has("node")) continue;
+            const std::string path = c["target"]["path"].asString();
+            const int p = path == "translation" ? 0 : path == "rotation" ? 1 : path == "scale" ? 2 : -1;
+            if (p < 0) continue;
+            const Json& smp = a["samplers"][size_t(c["sampler"].asNumber())];
+            Channel ch;
+            ch.node = size_t(c["target"]["node"].asNumber());
+            ch.path = p;
+            ch.width = p == 1 ? 4 : 3;
+            ch.times = accessor(g, size_t(smp["input"].asNumber()), 1);
+            ch.values = accessor(g, size_t(smp["output"].asNumber()), ch.width);
+            const std::string interp = smp.has("interpolation") ? smp["interpolation"].asString() : "LINEAR";
+            ch.step = interp == "STEP";
+            ch.cubic = interp == "CUBICSPLINE";
+            if (ch.node >= nodes.size() || ch.times.empty()) continue;
+            // Rotations stored as normalised integers.
+            const int type = int(g.json["accessors"][size_t(smp["output"].asNumber())]["componentType"].asNumber());
+            if (p == 1 && type != 5126)
+                for (double& v : ch.values) v /= type == 5121 ? 255.0 : type == 5123 ? 65535.0 : 1.0;
+            seconds = std::max(seconds, float(ch.times.back()));
+            channels.push_back(std::move(ch));
+        }
+        if (channels.empty()) continue;
+        JointAnimation ja;
+        ja.name = a.has("name") ? a["name"].asString() : "animation" + std::to_string(ai);
+        ja.seconds = seconds;
+        const size_t frames = std::max<size_t>(2, size_t(std::lround(double(seconds) * fps)) + 1);
+        for (size_t f = 0; f < frames; ++f) {
+            const double t = std::min(double(seconds), double(f) / fps);
+            std::vector<Trs> pose = rest;
+            for (const Channel& ch : channels) {
+                // Its keys around t (each a value, or for cubic splines {in tangent, value, out tangent}).
+                const size_t n = ch.times.size();
+                size_t k = 0;
+                while (k + 1 < n && ch.times[k + 1] <= t) ++k;
+                const size_t k1 = std::min(k + 1, n - 1);
+                const double span = ch.times[k1] - ch.times[k];
+                const double u = ch.step || span <= 0 ? 0.0 : std::clamp((t - ch.times[k]) / span, 0.0, 1.0);
+                const size_t stride = ch.cubic ? 3 : 1, mid = ch.cubic ? 1 : 0;
+                auto value = [&](size_t key, size_t c) {
+                    const size_t at = (key * stride + mid) * size_t(ch.width) + c;
+                    return at < ch.values.size() ? ch.values[at] : 0.0;
+                };
+                if (ch.path == 1) {
+                    double q0[4], q1[4], dot = 0;
+                    for (size_t c = 0; c < 4; ++c) q0[c] = value(k, c), q1[c] = value(k1, c), dot += q0[c] * q1[c];
+                    const double sign = dot < 0 ? -1 : 1;
+                    double q[4], len = 0;
+                    for (size_t c = 0; c < 4; ++c) q[c] = q0[c] * (1 - u) + sign * q1[c] * u, len += q[c] * q[c];
+                    len = len > 0 ? std::sqrt(len) : 1;
+                    for (size_t c = 0; c < 4; ++c) pose[ch.node].r[c] = float(q[c] / len);
+                } else {
+                    auto& dst = ch.path == 0 ? pose[ch.node].t : pose[ch.node].s;
+                    for (size_t c = 0; c < 3; ++c) dst[c] = float(value(k, c) * (1 - u) + value(k1, c) * u);
+                }
+            }
+            std::vector<Mat> world(nodes.size());
+            std::vector<char> done(nodes.size(), 0);
+            std::function<const Mat&(size_t)> worldOf = [&](size_t i) -> const Mat& {
+                if (!done[i]) {
+                    const Mat own = nodes[i].has("matrix") ? local(nodes[i]) : trs(pose[i].t, pose[i].r, pose[i].s);
+                    world[i] = sj.parentNode[i] == SIZE_MAX ? own : mul(worldOf(sj.parentNode[i]), own);
+                    done[i] = 1;
+                }
+                return world[i];
+            };
+            std::vector<std::array<float, 16>> row;
+            for (size_t n : sj.nodes) row.push_back(worldOf(n));
+            ja.frames.push_back(std::move(row));
+        }
+        out.push_back(std::move(ja));
     }
     return out;
 }

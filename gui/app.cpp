@@ -1020,6 +1020,7 @@ void App::drawMenu() {
         if (ImGui::MenuItem("Export a model (FBX / OBJ)...")) tools_.showModel = true;
         if (ImGui::MenuItem("Import into a file (texture, model, animation keys)...")) tools_.showImport = true;
         if (ImGui::MenuItem("Game scripts and objparams (export / import)...")) tools_.showScripts = true;
+        if (ImGui::MenuItem("Replace an actor (model, rig and animations)...", nullptr, false, !root_.empty())) tools_.showActor = true;
         if (ImGui::MenuItem("Pack folders and convert XCTD...")) tools_.showPack = true;
         if (ImGui::MenuItem("Inspect, extract and replace (info, list, symbols, menus, fonts)...")) tools_.showFileJobs = true;
         ImGui::Separator();

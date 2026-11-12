@@ -105,6 +105,7 @@ struct Mesh {
         uint32_t indexCountAt = 0; // the draw's index count
         uint32_t groupRecord = 0;  // its group {u32 path count, ->path, u32 draws, ->draws}
         uint32_t drawRecord = 0;   // its 32-byte record in the group's draws
+        std::vector<uint32_t> samplers; // each of `textures`' sampler record {u32 slot, u16 N+1, u16 N, ..}; draws may share one
         std::vector<uint32_t> vertex; // buffer index of each of `vertices`
     } source;
 };
@@ -121,6 +122,7 @@ struct Model {
     std::vector<Bone> bones;
     std::vector<Mesh> meshes;
     std::vector<std::string> textures;  // texture asset names (split halves merged)
+    std::vector<int> textureFiles;      // the texturefileN of each of `textures` (a split one's mip half)
     std::vector<std::string> materials; // shader_* names
     struct Group {
         std::vector<size_t> meshes;

@@ -50,6 +50,10 @@ ImportReport importGlb(caff::Caff& c, size_t symbol, const Bytes& glbFile, bool 
 // top level's group in the same place (the levels' groups pair in order). Returns what it did.
 std::vector<std::string> keepTopDetailLevel(caff::Caff& c, size_t symbol);
 
+// Makes mesh `mesh` draw the model's texture `texture` (one of Model::textures) in place of its colour map. Draws that
+// share the mesh's sampler record change with it; returns those meshes (the mesh among them).
+std::vector<size_t> bindColourMap(caff::Caff& c, size_t symbol, size_t mesh, const std::string& texture);
+
 // Rig override: moves the model's joints (its bind pose, which the game skins and animates from) to the FBX bones named
 // like them. Orientations, hierarchy and bone count stay for the game's animations; unnamed bones follow their parent.
 ImportReport importRig(caff::Caff& c, size_t symbol, const Bytes& fbxFile);
@@ -88,6 +92,9 @@ CopyResult copyModel(caff::Caff& dst, size_t symbol, const caff::Caff& src, size
 // A FindTexture that looks in one CAFF (whole textures and mip halves) and, for streamed top
 // levels, in a stream bundle file (normally the CAFF's paired one; may be empty).
 FindTexture texturesIn(std::shared_ptr<const caff::Caff> caff, const fs::path& streamBundle);
+
+// Lists the assets named by `names` (1-based symbol name indices) in the bundle's manifest, where the game finds them.
+void addToManifest(caff::Caff& c, const std::vector<uint32_t>& names);
 
 // The stream bundle paired with a bundle: Bundle/4f/<name> -> Bundle/50/<name>.
 fs::path pairedStreamBundle(const fs::path& bundle);

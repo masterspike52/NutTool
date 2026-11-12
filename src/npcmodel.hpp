@@ -4,6 +4,7 @@
 
 #include "blockmodel.hpp"
 #include "common.hpp"
+#include "model.hpp"
 
 #include <array>
 
@@ -52,6 +53,10 @@ Bytes writeSkinnedModel(const std::string& assetName, const Rig& rig, const std:
 // last frame its first. `idle` is "breathe" or "walk" (built in) or a JSON timeline file (anim-import's format).
 // `armsDown` lowers both shoulders by that many degrees in every frame (a T-posed model's arms to its sides).
 Bytes writeIdleAnim(const std::string& assetName, const Rig& rig, const std::string& idle, float seconds, float armsDown = 0);
+
+// An anim's CAFF for the rig from its keys, `frames` (30 a second) of a key per bone: local rotations (the bind
+// rotations are identity), offsets from the bind positions, scales.
+Bytes writeAnim(const std::string& assetName, const Rig& rig, const std::vector<model::Key>& keys, uint32_t frames);
 
 // An animation table entry: its name (as state tables play it) and the anim asset's name (aid_anim_...).
 struct AnimEntry {

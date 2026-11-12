@@ -1159,6 +1159,31 @@ ImportReport importGlb(caff::Caff& c, size_t symbol, const Bytes& file, bool rem
     return importMeshes(c, symbol, glbMeshes(file), removeMissing);
 }
 
+std::vector<size_t> bindColourMap(caff::Caff& c, size_t symbol, size_t mesh, const std::string& texture) {
+    const Model m = parse(c, symbol);
+    if (mesh >= m.meshes.size()) fail("mesh " + std::to_string(mesh) + " is not in " + m.name);
+    const Mesh& me = m.meshes[mesh];
+    const auto t = std::find(m.textures.begin(), m.textures.end(), texture);
+    if (t == m.textures.end()) fail(texture + " is not one of " + m.name + "'s textures");
+    size_t k = 0;
+    while (k < me.textures.size() && me.textures[k] != me.texture) ++k;
+    if (me.texture < 0 || k >= me.source.samplers.size()) fail("mesh " + std::to_string(mesh) + " draws no colour map to replace");
+    const uint32_t record = me.source.samplers[k];
+    Bytes d = c.symbolData(symbol);
+    if (uint64_t(record) + 8 > d.size()) fail("sampler record outside the model");
+    // {u32 slot, u16 N+1, u16 N}: N is the texturefileN, and the upper half keeps its distance from it.
+    const uint32_t word = be32(&d[record + 4]);
+    const int file = m.textureFiles[size_t(t - m.textures.begin())];
+    const int delta = int(word >> 16) - int(word & 0xFFFF);
+    putBe32(&d[record + 4], uint32_t(uint16_t(file + delta)) << 16 | uint16_t(file));
+    c.replaceSymbolData(symbol, d);
+    std::vector<size_t> changed;
+    for (size_t i = 0; i < m.meshes.size(); ++i)
+        if (std::find(m.meshes[i].source.samplers.begin(), m.meshes[i].source.samplers.end(), record) != m.meshes[i].source.samplers.end())
+            changed.push_back(i);
+    return changed;
+}
+
 std::vector<std::string> keepTopDetailLevel(caff::Caff& c, size_t symbol) {
     std::vector<std::string> notes;
     const Model m = parse(c, symbol);
@@ -1441,6 +1466,8 @@ int sectionIndex(const caff::Caff& c, const std::string& name) {
 }
 
 } // namespace
+
+void addToManifest(caff::Caff& c, const std::vector<uint32_t>& names) { addManifestEntries(c, names); }
 
 fs::path pairedStreamBundle(const fs::path& bundle) { return bundle.parent_path().parent_path() / "50" / bundle.filename(); }
 

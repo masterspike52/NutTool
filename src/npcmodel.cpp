@@ -318,7 +318,6 @@ Bytes writeSkinnedModel(const std::string& assetName, const Rig& rig, const std:
 
 Bytes writeIdleAnim(const std::string& assetName, const Rig& rig, const std::string& idle, float seconds, float armsDown) {
     const std::vector<blockmodel::SkinBone> bones = skinBones(rig);
-    const std::vector<int> depth = blockmodel::detail::boneDepths(bones);
     const uint32_t n = uint32_t(bones.size());
     if (!(seconds > 0)) seconds = kDefaultSeconds;
     const long counted = std::lround(double(seconds) * kFps) + 1;
@@ -369,8 +368,22 @@ Bytes writeIdleAnim(const std::string& assetName, const Rig& rig, const std::str
             }
         }
     }
-    const std::vector<float> scale = {fromBits(0x38000100), fromBits(0x38000100), fromBits(0x38000100), fromBits(0x38000000), fromBits(0x38000000),
-                                      fromBits(0x38000000), fromBits(0x38000000), fromBits(0x38000000), fromBits(0x38000000)};
+    return writeAnim(assetName, rig, keys, frames);
+}
+
+Bytes writeAnim(const std::string& assetName, const Rig& rig, const std::vector<model::Key>& keys, uint32_t frames) {
+    const std::vector<blockmodel::SkinBone> bones = skinBones(rig);
+    const std::vector<int> depth = blockmodel::detail::boneDepths(bones);
+    const uint32_t n = uint32_t(bones.size());
+    if (frames < 2 || frames > 0xFFFF || keys.size() != size_t(frames) * n) fail(assetName + ": wrong number of keys");
+    const float duration = float(frames - 1) / kFps;
+    // Translations in steps fitting the farthest (2^-15 m reaches 1 m); rotations and scales in the game's own steps.
+    float far = 0;
+    for (const model::Key& k : keys)
+        for (float x : k.translation) far = std::max(far, std::fabs(x));
+    const float move = std::max(fromBits(0x38000000), far / 32000.0f);
+    const std::vector<float> scale = {fromBits(0x38000100), fromBits(0x38000100), fromBits(0x38000100), move, move, move,
+                                      fromBits(0x38000000), fromBits(0x38000000), fromBits(0x38000000)};
     const std::vector<float> def = {0, 0, 0, 0, 0, 0, 1, 1, 1};
     const model::EncodedTrack track = model::encodeTrack(assetName, keys, frames, n, scale, def);
 
