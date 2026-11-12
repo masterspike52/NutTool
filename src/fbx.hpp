@@ -83,6 +83,11 @@ struct MeshData {
     std::vector<std::array<float, 2>> cornerUv;     // first UV set as stored (v up); empty when none
     // Per control point: bone (by name) and weight; empty when the mesh has no skin.
     std::vector<std::vector<std::pair<std::string, float>>> skin;
+    // Its first material's colour (DiffuseColor, as stored: linear) when that material has no texture.
+    std::optional<std::array<float, 3>> plainColour;
+    // Its first material's colour texture, encoded (PNG...), when a .glb gives it one, and that image's name.
+    Bytes colourImage;
+    std::string colourImageName;
 };
 std::vector<MeshData> readMeshes(const Bytes& file);
 

@@ -4,9 +4,13 @@
 
 #include "assetdb.hpp"
 #include "container.hpp"
+#include "modelimport.hpp"
 #include "objparams.hpp"
+#include "renutmake.hpp"
+#include "renutpart.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <set>
@@ -76,6 +80,10 @@ void assetList(App& app, const char* id, const std::vector<std::string>& names, 
 
 namespace {
 
+// Choices offered for a reNut part's collision and attachable faces (any other text works too).
+const std::vector<std::string> kCollisions = {"none", "body_light_cube", "body_light_wedge", "body_light_corner"};
+const std::vector<std::string> kAttachable = {"all", "none", "top", "bottom", "sides", "top+sides"};
+
 class ScriptDocument : public Document {
 public:
     ScriptDocument(ScriptInfo info, std::shared_ptr<const Catalog> cat, const fs::path& root) : info_(std::move(info)), cat_(std::move(cat)), root_(root) {
@@ -89,6 +97,8 @@ public:
         Bytes data = c.symbolData(si);
         editor_.loadAsset(info_.name, data, lookup());
         findUses(data);
+        original_ = std::move(data);
+        part_.id = "mymod_" + renutpart::baseName(info_.name);
     }
 
     std::string title() const override { return info_.name; }
@@ -129,6 +139,14 @@ public:
                 editor_.check();
                 app.status(editor_.problem.empty() ? "Loaded " + toUtf8(p) + " (save to apply it)" : "Loaded " + toUtf8(p) + ": " + editor_.problem);
             });
+        }
+        if (info_.objParams) {
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!editor_.problem.empty());
+            bool requested = app.takePartDialog(info_.name) && editor_.problem.empty(); // reNut > New part
+            if (ImGui::Button("Save as reNut part...") || requested) ImGui::OpenPopup("Save as reNut part");
+            ImGui::EndDisabled();
+            drawPartPopup(app);
         }
         helpMarker(info_.objParams
                        ? "One field per line, name = value. Fields without a name go by offset; words that are 0 are not listed, "
@@ -196,6 +214,7 @@ public:
             }
             editor_.loadAsset(info_.name, data, lookup());
             findUses(data);
+            original_ = data;
             app.status("Saved " + info_.name + " to " + std::to_string(patched.size()) + (patched.size() == 1 ? " bundle" : " bundles"));
             return true;
         } catch (std::exception& e) {
@@ -205,6 +224,149 @@ public:
     }
 
 private:
+    // A new part for reNut from this one and the edits in the editor (renutpart.hpp); the shipped
+    // part stays as it is.
+    void drawPartPopup(App& app) {
+        if (!ImGui::BeginPopupModal("Save as reNut part", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+        ImGui::PushTextWrapPos(em(560));
+        ImGui::TextUnformatted("Makes a new part for reNut, starting from this one, in a RexFabric Lua mod: a script calling "
+                               "renut.parts.add, with what you changed in the editor as its fields. This part itself is not "
+                               "changed. Put the mod folder in reNut's mods folder (mods\\<your mod>).");
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        ImGui::SetNextItemWidth(em(420));
+        inputText("Mod folder", part_.mod);
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) app.openFolderDialog("Mod folder", [this](const fs::path& p) { part_.mod = toUtf8(p); });
+        ImGui::SetNextItemWidth(em(260));
+        inputText("Part id", part_.id);
+        helpMarker("1-40 characters of a-z, 0-9 and _, unique across every mod: start it with your mod's name. Vehicles keep parts by "
+                   "id, so don't change it once players have the part.");
+        ImGui::SetNextItemWidth(em(260));
+        inputTextWithHint("Garage name", "the part's own", part_.name);
+        ImGui::SetNextItemWidth(em(120));
+        ImGui::InputInt("How many the player owns", &part_.count);
+        part_.count = std::clamp(part_.count, 1, 99);
+        ImGui::Checkbox("A new kind of part (callbacks to fill in)", &part_.behaviour);
+        helpMarker("Adds every callback (on_use, on_tick, on_physics...) to the script, empty, for you to fill in with what the part "
+                   "does. Without it the part is a variant: the shipped part with your values.");
+        ImGui::Checkbox("Replace the script if it exists", &part_.overwrite);
+        helpMarker("Off: an existing script is kept. With a model or footprint of its own, those are then made anew and the script "
+                   "you may have edited stays.");
+
+        ImGui::SeparatorText("Its own model and footprint");
+        ImGui::Checkbox("A model of its own", &part_.ownModel);
+        helpMarker("The base's model (or the template's) with your mesh file's geometry, as model import applies it: OBJ or FBX "
+                   "objects named like the export's (group1_mesh8), or a node of a .glb. It goes, with a copy of the collision, "
+                   "into the mod's own stream bundle (<mod folder>\\bundles), and the script gets model = \"<id>\".");
+        if (part_.ownModel) {
+            ImGui::Indent();
+            pathField(app, "Mesh file##part", part_.model, PathPick::OpenFile, {{"OBJ, FBX or glTF", "obj;fbx;glb"}});
+            glbNodes(part_.model, part_.nodesSeen, part_.nodes, part_.nodesError);
+            bool glb = lower(toUtf8(fromUtf8(trim(part_.model)).extension())) == ".glb";
+            if (glb) {
+                comboField("Node##part", part_.mesh, part_.nodes, "the node whose mesh it takes");
+                if (!part_.nodesError.empty()) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "%s", part_.nodesError.c_str());
+                ImGui::SetNextItemWidth(em(260));
+                inputTextWithHint("Into meshes##part", "8,0,17,25", part_.into);
+                helpMarker("The template's meshes that get the node's mesh, by number (as Export from a file > Models with Every draw "
+                           "group names them: group0_mesh8 is 8); every other mesh is removed.");
+                ImGui::SetNextItemWidth(em(260));
+                inputTextWithHint("Flat colour at##part", "u,v or u,v,u2,v2 (optional)", part_.flat);
+                helpMarker("Sets every vertex to one spot of the textures (from the image's top left; u2, v2 for the second set, the "
+                           "ambient occlusion) for one flat colour. Empty projects the textures along each face's main axis.");
+            }
+            ImGui::SetNextItemWidth(em(260));
+            inputTextWithHint("Template##part", "this part's own model", part_.templateName);
+            helpMarker("Another part model to start from, such as wheel_standard (aid_model_banjox_vehicleparts_ may be left out).");
+            comboField("Collision##part", part_.collision, kCollisions, "the template's", em(260));
+            helpMarker("The collision is the template's, keeping its size, or another part model's (body_light_wedge...), or none.");
+            ImGui::Unindent();
+        }
+        ImGui::Checkbox("A footprint of its own", &part_.ownFootprint);
+        helpMarker("The base's footprint (its cells and attach points) with only some faces taking other parts. top makes a part that "
+                   "goes under a block and hangs down. The script gets attach = \"<id>\".");
+        if (part_.ownFootprint) {
+            ImGui::Indent();
+            comboField("Attachable faces##part", part_.attachable, kAttachable, "top", em(260));
+            helpMarker("all, none, top, bottom, sides, top+sides, or a list of directions such as -x,-y,+z.");
+            ImGui::Unindent();
+        }
+        if (part_.ownModel || part_.ownFootprint) {
+            std::string hint;
+            try {
+                if (!trim(part_.mod).empty()) hint = renutmake::defaultBundle(fromUtf8(trim(part_.mod)));
+            } catch (std::exception&) {
+            }
+            ImGui::SetNextItemWidth(em(260));
+            inputTextWithHint("Stream bundle name##part", hint.empty() ? "the mod folder's name" : hint.c_str(), part_.bundle);
+        }
+
+        ImGui::SeparatorText("mod.toml (when the folder has none)");
+        ImGui::SetNextItemWidth(em(260));
+        inputTextWithHint("Mod name##part", "the folder's name", part_.modName);
+        ImGui::SetNextItemWidth(em(260));
+        inputTextWithHint("Author##part", "none", part_.author);
+        ImGui::Spacing();
+        bool ready = !part_.mod.empty() && renutpart::validId(part_.id) && (!part_.ownModel || !trim(part_.model).empty());
+        ImGui::BeginDisabled(!ready || app.busy());
+        if (ImGui::Button("Write")) {
+            try {
+                renutpart::Part p;
+                p.id = part_.id;
+                p.base = renutpart::baseName(info_.name);
+                p.name = part_.name;
+                p.count = part_.count;
+                p.behaviour = part_.behaviour;
+                p.original = original_;
+                p.edited = editor_.build(editor_.text);
+                // The model and footprint come from the game's stream bundle paired with the part's bundle.
+                bool assets = part_.ownModel || part_.ownFootprint;
+                renutmake::PartAssets pa;
+                if (part_.ownModel) {
+                    pa.model = fromUtf8(trim(part_.model));
+                    pa.templateName = trim(part_.templateName);
+                    pa.glb.node = part_.mesh;
+                    for (auto& s : split(part_.into, ','))
+                        if (!trim(s).empty()) pa.glb.into.push_back(std::atoi(trim(s).c_str()));
+                    for (auto& s : split(part_.flat, ','))
+                        if (!trim(s).empty()) pa.glb.flat.push_back(float(std::atof(trim(s).c_str())));
+                    pa.collision = trim(part_.collision);
+                }
+                if (part_.ownFootprint) pa.attachable = trim(part_.attachable).empty() ? std::string("all") : trim(part_.attachable);
+                pa.bundle = trim(part_.bundle);
+                fs::path bundle = info_.locs.front().file;
+                for (auto& l : info_.locs)
+                    if (l.entry < 0) {
+                        bundle = l.file;
+                        break;
+                    }
+                fs::path stream = model::pairedStreamBundle(bundle), mod = fromUtf8(part_.mod);
+                std::string modName = trim(part_.modName), author = trim(part_.author);
+                bool force = part_.overwrite;
+                auto names = lookup();
+                ImGui::CloseCurrentPopup();
+                app.runTask("Making reNut part " + p.id, true,
+                            [&app, p, pa, assets, stream, mod, modName, author, force, names](Task&) mutable -> std::function<void()> {
+                                auto say = [&app](const std::string& s) { app.log(s); };
+                                fs::path file;
+                                if (!assets || renutmake::addPartAssets(mod, stream, p, pa, force, say))
+                                    file = renutpart::write(mod, p, modName, author, force, names);
+                                return [&app, file, mod] {
+                                    if (!file.empty()) app.status("Wrote " + toUtf8(file));
+                                    else app.status("Made the part's model and footprint in " + toUtf8(mod) + " and kept its script (see the log)");
+                                };
+                            });
+            } catch (std::exception& e) {
+                app.error(std::string("Save as reNut part: ") + e.what());
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
     gamescript::NameLookup lookup() const {
         auto cat = cat_;
         return [cat](uint32_t id) { return cat ? cat->nameOf(id) : std::string(); };
@@ -228,6 +390,17 @@ private:
     ScriptEditor editor_;
     std::vector<std::string> uses_;
     float leftFrac_ = 0.68f;
+    Bytes original_;  // the asset as loaded or last saved
+    struct {
+        std::string mod, id, name, modName, author;
+        int count = 1;
+        bool behaviour = false, overwrite = false;
+        // Its own model (a mesh file, a .glb node and the template's meshes it goes into) and footprint.
+        bool ownModel = false, ownFootprint = false;
+        std::string model, mesh, into, flat, templateName, collision, attachable = "top", bundle;
+        std::vector<std::string> nodes;
+        std::string nodesSeen, nodesError;
+    } part_;  // Save as reNut part
 };
 
 } // namespace

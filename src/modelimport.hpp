@@ -21,6 +21,9 @@ struct ImportReport {
     int rebuilt = 0; // meshes given new geometry
     int hidden = 0;  // meshes emptied by an object without faces
     std::vector<std::string> notes;
+    // Textures the model draws (by name, split halves merged) that a file object's own image is for: its draw shows the
+    // texture as it is (gain 1, offset 0), and the caller puts the image in the texture's place.
+    std::vector<std::pair<std::string, Bytes>> images;
 };
 
 // Applies an OBJ to the model whose .data part is `symbol`. Objects are matched to meshes by the
@@ -29,22 +32,31 @@ struct ImportReport {
 //    texture coordinate set); fields that did not change keep their exact bytes.
 //  - Anything else replaces the mesh's geometry. Each new vertex takes its bone weights, extra
 //    texture coordinate sets and other fields from the nearest original vertex of the mesh.
-//  - An object without faces hides the mesh.
+//  - An object without faces removes the mesh: its draw is taken out of its group, so the model's
+//    later meshes number one lower when it is read again.
 // Meshes not named in the file are left alone. Throws when the file names no mesh or does not fit.
 ImportReport importObj(caff::Caff& c, size_t symbol, const std::string& objText);
 
 // The same from a binary FBX file's mesh objects, named the same way. Skin weights on bones named
 // like the model's (exactly, or ignoring case and underscores) replace the weights copied from the
-// nearest original vertex; the fur shells FBX export adds are ignored.
-ImportReport importFbx(caff::Caff& c, size_t symbol, const Bytes& fbxFile);
+// nearest original vertex; the fur shells FBX export adds are ignored. An object whose material is a
+// plain colour (no texture) other than the game's has its draw drawn in it (c:basecolour, or texture gain 0 and offset).
+// With `removeMissing`, the meshes the model draws by default that the file has no object for are removed.
+ImportReport importFbx(caff::Caff& c, size_t symbol, const Bytes& fbxFile, bool removeMissing = false);
+// The same from a .glb's mesh nodes (a skinned export brought back from Blender as glTF), at their rest pose.
+ImportReport importGlb(caff::Caff& c, size_t symbol, const Bytes& glbFile, bool removeMissing = false);
+
+// Only the top detail level is drawn, at every distance: each group drawn at one lower level only draws the draws of the
+// top level's group in the same place (the levels' groups pair in order). Returns what it did.
+std::vector<std::string> keepTopDetailLevel(caff::Caff& c, size_t symbol);
 
 // Rig override: moves the model's joints (its bind pose, which the game skins and animates from) to the FBX bones named
 // like them. Orientations, hierarchy and bone count stay for the game's animations; unnamed bones follow their parent.
 ImportReport importRig(caff::Caff& c, size_t symbol, const Bytes& fbxFile);
 
-// OBJ or FBX, told apart by the file's content. With `rig` (FBX only), importRig first, then the meshes when the
+// OBJ, FBX or .glb, told apart by the file's content. With `rig` (FBX only), importRig first, then the meshes when the
 // file has any named like the model's.
-ImportReport importMeshFile(caff::Caff& c, size_t symbol, const Bytes& file, bool rig = false);
+ImportReport importMeshFile(caff::Caff& c, size_t symbol, const Bytes& file, bool rig = false, bool removeMissing = false);
 
 // Where copyModel gets a texture the destination lacks: the CAFF holding it (a whole texture, or
 // the "mip" half of a split one) and, for a split texture, its streamed top level: a stream

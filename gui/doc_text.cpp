@@ -72,15 +72,20 @@ public:
         }
         ImGui::SameLine();
         if (ImGui::Button("Import JSON...")) {
-            app.openFileDialog("Import strings", {{"JSON", "json"}}, [this, &app](const fs::path& p) {
+            bool prune = prune_;
+            app.openFileDialog("Import strings", {{"JSON", "json"}}, [this, &app, prune](const fs::path& p) {
                 size_t before = table_.entries.size();
-                loctext::applyJson(table_, Json::parse(readText(p)), false);
+                loctext::applyJson(table_, Json::parse(readText(p)), prune);
                 rebuildOrder();
                 dirty_ = true;
-                app.status("Imported strings from " + toUtf8(p) + " (" + std::to_string(table_.entries.size() - before) + " new)");
+                app.status("Imported strings from " + toUtf8(p) + " (" + std::to_string(before) + " strings before, " +
+                           std::to_string(table_.entries.size()) + " now)");
             });
         }
-        helpMarker("Import matches strings by name and adds new names. Export/import use the same JSON format as the command line tool.");
+        ImGui::SameLine();
+        ImGui::Checkbox("Drop strings it lacks", &prune_);
+        helpMarker("Import matches strings by name and adds new names. With Drop strings it lacks, strings the JSON doesn't list "
+                   "are removed (the command line's --prune). Export/import use the same JSON format as the command line tool.");
         if (!reference_.empty()) {
             ImGui::SameLine();
             ImGui::Checkbox("Show English", &showReference_);
@@ -257,6 +262,7 @@ private:
     std::string title_, lang_;
     std::map<uint16_t, std::string> reference_;
     bool showReference_ = false;
+    bool prune_ = false; // Import JSON drops the strings the file doesn't list
     std::vector<size_t> order_;
     std::string filter_;
     int selected_ = -1;

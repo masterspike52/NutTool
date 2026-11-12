@@ -582,6 +582,8 @@ Model parse(const caff::Caff& c, size_t symbol) {
                 so.ibRecord = ib->second.record;
                 so.wideIndices = wide;
                 so.indexCountAt = pair + 4;
+                so.groupRecord = g;
+                so.drawRecord = d;
                 std::vector<int32_t> remap(src.vertices.size(), -1);
                 for (uint32_t k = 0; k + 2 < nidx; k += 3) {
                     uint32_t tri[3];
@@ -1014,12 +1016,36 @@ void writeAnimationKeys(caff::Caff& c, size_t symbol, const std::vector<Key>& ke
     if (!t.hasData || !t.hasWidths) fail("animation " + a.name + ": its rotation track has no data to replace");
     if (v.u16(p + 36) != uint32_t(a.frames)) fail("animation " + a.name + ": track frame count differs from the header's");
     if (keys.size() != size_t(a.frames) * a.bones) fail("animation " + a.name + ": wrong number of keys");
+    const EncodedTrack e = encodeTrack(a.name, keys, uint32_t(a.frames), t.records, t.scale, t.def);
 
+    Bytes d = c.symbolData(symbol);
+    auto append = [&](const Bytes& b) {
+        uint32_t at = uint32_t((d.size() + 15) & ~size_t(15));
+        d.resize(at, 0);
+        d.insert(d.end(), b.begin(), b.end());
+        return at;
+    };
+    uint32_t maskAt = append(e.masks);
+    Bytes body = e.bases;
+    body.insert(body.end(), e.widths.begin(), e.widths.end());
+    body.insert(body.end(), e.frames.begin(), e.frames.end());
+    uint32_t dataAt = append(body);
+    putBe32(&d[p + 12], maskAt);
+    putBe32(&d[p + 16], dataAt);
+    putBe32(&d[p + 20], dataAt + uint32_t(e.bases.size()));
+    putBe16(&d[p + 24], uint16_t(e.bases.size()));
+    putBe16(&d[p + 26], uint16_t(e.widths.size()));
+    putBe16(&d[p + 28], uint16_t(e.stride));
+    c.replaceSymbolData(symbol, d);
+}
+
+EncodedTrack encodeTrack(const std::string& name, const std::vector<Key>& keys, uint32_t nf, uint32_t records,
+                         const std::vector<float>& scale, const std::vector<float>& def) {
+    if (keys.size() != size_t(nf) * records || scale.size() < 9 || def.size() < 9) fail("animation " + name + ": wrong number of keys");
     // Channel values per record, quantised by the track's scales: x y z (w >= 0, the decoder rebuilds it),
     // translation, scale. Bases are 16-bit and widths at most 16 bits.
-    const uint32_t nf = uint32_t(a.frames);
     auto quantise = [&](uint32_t ch, float x) {
-        double q = std::round(double(x) / double(t.scale[ch]));
+        double q = std::round(double(x) / double(scale[ch]));
         return int32_t(std::clamp(q, -32768.0, 32767.0));
     };
     struct Channel {
@@ -1031,21 +1057,22 @@ void writeAnimationKeys(caff::Caff& c, size_t symbol, const std::vector<Key>& ke
     Bytes masks, bases, widths;
     std::vector<Channel> animated;
     bool clamped = false;
-    for (uint32_t r = 0; r < t.records; ++r) {
+    for (uint32_t r = 0; r < records; ++r) {
         Channel chs[9];
         for (uint32_t ch = 0; ch < 9; ++ch) {
             std::vector<int32_t> q(nf);
             for (uint32_t f = 0; f < nf; ++f) {
-                const Key& k = keys[size_t(f) * a.bones + r];
+                const Key& k = keys[size_t(f) * records + r];
                 float sign = k.rotation[3] < 0 ? -1.0f : 1.0f;
                 float x = ch < 3 ? k.rotation[ch] * sign : ch < 6 ? k.translation[ch - 3] : k.scale[ch - 6];
-                if (std::fabs(double(x) / double(t.scale[ch])) > 32767.5) clamped = true;
+                // A value at the channel's default isn't stored (narrow scales can't hold 1.0 itself).
+                if (x != def[ch] && std::fabs(double(x) / double(scale[ch])) > 32767.5) clamped = true;
                 q[f] = quantise(ch, x);
             }
             auto [lo, hi] = std::minmax_element(q.begin(), q.end());
             Channel& out = chs[ch];
             if (*lo == *hi) {
-                out.kind = *lo == quantise(ch, t.def[ch]) ? 0 : 1;
+                out.kind = *lo == quantise(ch, def[ch]) ? 0 : 1;
                 out.base = *lo;
                 continue;
             }
@@ -1077,7 +1104,7 @@ void writeAnimationKeys(caff::Caff& c, size_t symbol, const std::vector<Key>& ke
             }
         }
     }
-    if (clamped) fail("animation " + a.name + ": a translation is more than 1 m from its bone's rest position, which this track cannot store");
+    if (clamped) fail("animation " + name + ": a translation is more than 1 m from its bone's rest position, which this track cannot store");
     // Widths: low nibble first, stored minus one.
     for (size_t k = 0; k < animated.size(); ++k) {
         uint8_t w = uint8_t((std::max(1u, animated[k].width) - 1) & 0xF);
@@ -1089,7 +1116,7 @@ void writeAnimationKeys(caff::Caff& c, size_t symbol, const std::vector<Key>& ke
     uint32_t bitsPerFrame = 0;
     for (auto& ch : animated) bitsPerFrame += std::max(1u, ch.width);
     uint32_t stride = (bitsPerFrame + 31) / 32 * 4;
-    if (bases.size() + widths.size() > 0xFFFF || stride > 0xFFFF) fail("animation " + a.name + ": too much motion for one track");
+    if (bases.size() + widths.size() > 0xFFFF || stride > 0xFFFF) fail("animation " + name + ": too much motion for one track");
     // Frames: each starts on a word; values LSB first within big-endian words.
     Bytes frames(size_t(stride) * nf + 8, 0);
     for (uint32_t f = 0; f < nf; ++f) {
@@ -1102,26 +1129,7 @@ void writeAnimationKeys(caff::Caff& c, size_t symbol, const std::vector<Key>& ke
         }
         for (uint32_t k = 0; k < stride / 4; ++k) putBe32(&frames[size_t(f) * stride + 4 * k], words[k]);
     }
-
-    Bytes d = c.symbolData(symbol);
-    auto append = [&](const Bytes& b) {
-        uint32_t at = uint32_t((d.size() + 15) & ~size_t(15));
-        d.resize(at, 0);
-        d.insert(d.end(), b.begin(), b.end());
-        return at;
-    };
-    uint32_t maskAt = append(masks);
-    Bytes body = bases;
-    body.insert(body.end(), widths.begin(), widths.end());
-    body.insert(body.end(), frames.begin(), frames.end());
-    uint32_t dataAt = append(body);
-    putBe32(&d[p + 12], maskAt);
-    putBe32(&d[p + 16], dataAt);
-    putBe32(&d[p + 20], dataAt + uint32_t(bases.size()));
-    putBe16(&d[p + 24], uint16_t(bases.size()));
-    putBe16(&d[p + 26], uint16_t(widths.size()));
-    putBe16(&d[p + 28], uint16_t(stride));
-    c.replaceSymbolData(symbol, d);
+    return {std::move(masks), std::move(bases), std::move(widths), std::move(frames), stride};
 }
 
 std::string toMtl(const Model& m) {

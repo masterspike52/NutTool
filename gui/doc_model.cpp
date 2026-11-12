@@ -666,7 +666,7 @@ private:
                                [this, &app, name, orig](const fs::path& p) { applyMotionFile(app, name, p, orig); });
         }
         ImGui::EndDisabled();
-        helpMarker("Gives this animation new motion from a JSON timeline of poses (docs/animation-keys.md), played here straight away. "
+        helpMarker("Gives this animation new motion from a JSON timeline of poses (reNut's docs/nuttool/animations.md), played here straight away. "
                    "Ctrl+S writes it into every bundle holding the animation. It keeps its name and length, so the game plays your "
                    "motion wherever it played the original.");
         ImGui::SameLine();
@@ -956,6 +956,20 @@ private:
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        // Tools > Export a model has the command line's other options (every animation, another bundle's, fur texture size...).
+        const AssetLoc* bundle = nullptr;
+        for (auto& l : info_.locs)
+            if (l.entry < 0 && !bundle) bundle = &l;
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!bundle);
+        if (ImGui::Button("More options...")) {
+            ImGui::CloseCurrentPopup();
+            app.openModelExport(bundle->file, info_.name);
+        }
+        ImGui::EndDisabled();
+        helpMarker("Opens Tools > Export a model for this model's bundle, with the command line's other options: every animation, "
+                   "animations from another bundle, no textures, the fur texture size. It exports the model as the bundle holds it, "
+                   "not the meshes shown here.");
         ImGui::EndPopup();
     }
 
@@ -1271,7 +1285,7 @@ private:
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("Import OBJ / FBX: objects named like the export's (group0_mesh3) edit that mesh in place when the vertex "
                            "and triangle counts match, otherwise replace its geometry (skinning comes from the FBX's weights on "
-                           "bones named like this model's, else from the nearest original vertex); an object with no faces hides "
+                           "bones named like this model's, else from the nearest original vertex); an object with no faces removes "
                            "the mesh. Replace copies another game model into this one's place.");
         ImGui::PopStyleColor();
         bool coloursPending = !colourEdited_.empty();
@@ -1535,6 +1549,9 @@ public:
                     auto streamed = applyReplacements(*l.caff, loc.symbol, loc);
                     patchColours(*l.caff, loc.symbol);
                     // Copied textures' streamed levels go into the bundle's stream bundle, written first.
+                    if (!streamed.empty() && saveAs)
+                        fail("the copied textures' full-size levels go into the bundle's stream bundle, which Save as can't write: "
+                             "use Save, or Tools > Import into a file > Model swap with Write the stream bundle to");
                     if (!streamed.empty() && !saveAs) {
                         fs::path sp = model::pairedStreamBundle(loc.file);
                         Loaded sl = loadAsset(sp);

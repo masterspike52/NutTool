@@ -46,7 +46,33 @@ private:
     WaveBankView view_;
 };
 
+// A loose wave bank file (.xwb), opened from disk.
+class WaveBankFileDocument : public Document {
+public:
+    WaveBankFileDocument(const fs::path& p, Bytes data) {
+        path = p;
+        title_ = toUtf8(p.filename());
+        auto raw = std::make_shared<const Bytes>(std::move(data));
+        view_.setBank(std::make_shared<const media::WaveBank>(media::parseWaveBank(*raw)), toUtf8(p.stem()), raw);
+    }
+
+    std::string title() const override { return title_; }
+
+    void draw(App& app) override {
+        ImGui::TextDisabled("%s", toUtf8(path).c_str());
+        view_.draw(app);
+    }
+
+private:
+    std::string title_;
+    WaveBankView view_;
+};
+
 } // namespace
+
+std::unique_ptr<Document> makeWaveBankDocument(const fs::path& p, Bytes data) {
+    return std::make_unique<WaveBankFileDocument>(p, std::move(data));
+}
 
 std::unique_ptr<Document> makeAudioDocument(const AudioBankInfo& info, const fs::path& root, const std::string& filter) {
     return std::make_unique<AudioDocument>(info, root, filter);

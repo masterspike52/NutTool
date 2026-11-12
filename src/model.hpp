@@ -103,6 +103,8 @@ struct Mesh {
         uint32_t ibRecord = 0;    // resource record {->header, ->.gpu offset, bytes, format}
         bool wideIndices = false; // 32-bit indices
         uint32_t indexCountAt = 0; // the draw's index count
+        uint32_t groupRecord = 0;  // its group {u32 path count, ->path, u32 draws, ->draws}
+        uint32_t drawRecord = 0;   // its 32-byte record in the group's draws
         std::vector<uint32_t> vertex; // buffer index of each of `vertices`
     } source;
 };
@@ -177,5 +179,16 @@ Animation parseAnimation(const caff::Caff& c, size_t symbol);
 // Animation::keys). Its length, frame count, pose and other tracks stay; the rotation track's
 // tables are re-encoded and appended to the symbol, and its pointers moved to them.
 void writeAnimationKeys(caff::Caff& c, size_t symbol, const std::vector<Key>& keys);
+
+// A rotation track's tables in the narrow form (16-bit bases, 4-bit widths, each frame on whole words
+// and 8 spare bytes after the last), as writeAnimationKeys and new animations write them.
+struct EncodedTrack {
+    Bytes masks, bases, widths, frames;
+    uint32_t stride = 0;  // bytes per frame
+};
+// Encodes `keys` (frames * records) with the track's nine channel scales and defaults (rotation x y z,
+// translation, scale). `name` is the animation's, for errors.
+EncodedTrack encodeTrack(const std::string& name, const std::vector<Key>& keys, uint32_t frames, uint32_t records,
+                         const std::vector<float>& scale, const std::vector<float>& def);
 
 } // namespace nut::model

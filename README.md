@@ -11,14 +11,12 @@ It comes in two forms that share the same code:
 
 Both are Windows programs.
 
-New to NutTool? Start with the tutorials:
-
-- **[Starter tutorial](docs/tutorial-starter.md)**: finding your way around, texture swaps
-  and upscaling, recolouring, text, audio, and packaging a mod for reNut.
-- **[Advanced tutorial](docs/tutorial-advanced.md)**: replacing characters with other
-  game characters or your own models, working in Blender with FBX (fur included), new
-  animations, split and animated textures, menus and the title update, vehicle parts, game
-  scripts, fonts, the command line, Lua and raw assets.
+New to NutTool? NutTool's documentation lives in reNut's repository:
+**[NutTool's docs](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/README.md)** cover
+setting up, every window of `nuttool-gui` ([the NutTool window](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/gui-guide.md)),
+custom models, animations, parts and vehicles, [worlds](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/worlds.md),
+[characters](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/characters.md), player models,
+textures and text, script graphs, the command line, packaging and sharing, and troubleshooting.
 
 ## What it handles
 
@@ -72,6 +70,15 @@ cmake --build build
 ```
 
 ## The GUI
+
+This section is a summary for reference. **[NutTool's docs](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/README.md)**
+in reNut's repository explain every window and button step by step:
+[the NutTool window](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/gui-guide.md),
+[custom models](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/custom-models.md),
+[parts and vehicles](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/parts-and-vehicles.md),
+[worlds](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/worlds.md),
+[characters](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/characters.md) and
+[troubleshooting](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/troubleshooting.md).
 
 Start `nuttool-gui.exe`. It finds an `assets` folder next to it or in the current
 folder; otherwise use **File > Open assets folder**. You can also pass a folder or file on
@@ -147,9 +154,9 @@ the command line, or drag one onto the window.
     - Bones are matched by name, so other characters' animations apply only to the
       bones the two skeletons share.
     - **Replace motion...** gives the shown animation new motion from a JSON timeline
-      (the `anim-import` format, [docs/animation-keys.md](docs/animation-keys.md); the
-      Blender add-on `docs/blender/nuttool_animation_keys.py` exports it from an animated
-      armature) and
+      (the `anim-import` format, [Animations](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/animations.md); the
+      Blender add-on [`nuttool_animation_keys.py`](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/blender/nuttool_animation_keys.py)
+      exports it from an animated armature) and
       plays it straight away. **Build on the original** keys the animation from the
       bundle's `.bak`, so a new try doesn't build on an earlier one, and **Reload**
       re-reads the edited JSON. **Ctrl+S** writes the motion into every bundle holding
@@ -163,7 +170,9 @@ the command line, or drag one onto the window.
     materials with their colour maps embedded at full size, and animations as takes. You
     can include every animation named after the model, only the one playing, or none.
     Furry models also get their fur (**Fur shells**, on by default), using the viewer's
-    fur length and tiling.
+    fur length and tiling. **More options...** in either export opens *Tools > Export a
+    model* for the model's bundle (every animation, another bundle's animations, no
+    textures, fur texture size: all of `model-fbx` / `model-obj`).
   - **Replace**: **Import OBJ / FBX** applies an edited export or new geometry (see
     "Models" below); with **Override rig** it also moves the joints to the FBX's bones of
     the same names. **Replace with another model** copies any other game model into
@@ -175,9 +184,11 @@ the command line, or drag one onto the window.
   **Export raw / Replace raw**. Selecting a texture shows a preview with mip/face/channel
   controls and **Export PNG / Export DDS / Import image / Remove mipmaps**. Streamed top levels from the
   matching stream bundle are merged automatically, and importing updates both files.
-  There are also buttons for **Export all textures** and **Unpack to folder**.
+  There are also buttons for **Export all textures**, **Unpack to folder** and **More
+  exports...** (*Tools > Export from a file* for this bundle).
 - **Stream bundles**: an entry list. CAFF entries open in the same asset view; wave banks
-  open the audio player (below); entries can be exported or replaced.
+  open the audio player (below); entries can be exported or replaced. **Unpack all**,
+  **Export all audio** and **More exports...** work on the whole file.
 - **Audio**: every XACT wave bank in the game (420 banks, 8,963 waves, about 5 hours),
   grouped by the first word of their names: Impacts, Vocals, Ambience, Objects,
   Bolt-ons, Dialog, Music, Footsteps, Engines and so on. The browser search also finds
@@ -191,7 +202,8 @@ the command line, or drag one onto the window.
     originals** do the whole bank in the background.
   - Almost every wave is XMA, the Xbox 360's WMA Pro variant, decoded with FFmpeg.
 - **Text**: a string table editor with search and an English reference column for other
-  languages, plus wrapped previews, add/delete string, and JSON import/export.
+  languages, plus wrapped previews, add/delete string, and JSON import/export (**Drop
+  strings it lacks** makes the import remove the strings the JSON doesn't list, as `--prune`).
   CJK text uses the system fonts (Microsoft YaHei, Malgun Gothic).
 - **Fonts**: a grid of every glyph. Select one to see it large, edit its metrics, or
   replace it from a PNG. Glyph pages can be exported and imported; the export also
@@ -205,19 +217,58 @@ the command line, or drag one onto the window.
 - **Vehicle parts** (once indexing is done): all 153 parts, by category (wheels, weapon,
   propulsion...). A part's tab shows its objparams as named fields (mass, health, shop
   ratings, model, animations...) in an editor; *Save to every copy* writes each bundle
-  that holds it. Any `aid_objparams_` symbol in a bundle tab shows the same editor.
+  that holds it. **Save as reNut part...** instead makes your edits a new part of their own
+  for reNut, leaving the shipped part as it is (see
+  [New parts for reNut](#new-parts-for-renut-lua)). Any `aid_objparams_` symbol in a bundle
+  tab shows the same editor.
 - **Videos**: a player (Media Foundation decodes the WMV3 video and WMA audio) with
   play/pause (Space or click the picture), seeking, volume and loop, plus export/replace.
-- **Font metadata, tile.bmp, asset index**: a text editor, an image view, and a
-  searchable index (double-click opens the file).
+- **Font metadata, tile.bmp, asset index**: a text editor (with **Export / Import text**
+  as UTF-8 and **Save as UTF-16 character list**), an image view, and a searchable index
+  (double-click opens the file; **Export JSON** writes `index --json`).
 - **Tools**: *Extract everything* (with progress and cancel; **Textures only** writes
   just the textures as PNG into one folder, and **Only names containing** keeps only what
   is named with some text, such as `ui_`), *Export mod package* (a
   `.nbpatch` of your edits for reNut, see below), *Bulk import textures* and *Remove
-  mipmaps from changed textures* (see [Bulk texture jobs](#bulk-texture-jobs)), *Fit menus
+  mipmaps from changed textures* (see [Bulk texture jobs](#bulk-texture-jobs); it can also
+  compare with a clean copy of the game folder), *Fit menus
   to resized textures* (see [Resized menu textures](#resized-menu-textures)), *Restore original files* (puts each
   file's `.bak` back, undoing everything saved to it; pick which files), *Verify all
-  files*, *Script (Lua)* (see "Scripting" below), and an *Asset ID calculator*.
+  files*, *Script (Lua)* (see "Scripting" below; an **Arguments** field fills the script's
+  `arg` table), and an *Asset ID calculator* (one name per line).
+  The command-line jobs that have no tab of their own have windows there too; they run the
+  same code as the commands, and their output goes to the log (**View > Log**):
+  - *Export from a file*: a bundle's, stream bundle's or `.xwb`'s textures (DDS, PNG or
+    both, with a stream bundle for the split ones), every model as OBJ with a bone list
+    (every draw group, PNG textures), or its wave banks (decoded to WAV, by name).
+  - *Export a model (FBX / OBJ)*: one model with every `model-fbx` / `model-obj` option;
+    the model list is read from the bundle. *Export shape keys* writes a reNut model's shape
+    keys as a `.glb` (`renut-shapes-export`).
+  - *Import into a file*: a texture into one bundle (with its stream bundle, other output
+    files, XCTD), an OBJ or FBX into one model (`model-import`, with `--rig`), a model swap
+    from any file (`model-swap`, with `-o`, `--stream-out` and XCTD), or animation keys into
+    one bundle; the name lists are read from the files.
+  - *Game scripts and objparams*: export a bundle's scripts, objparams or vehicle parts as
+    text files and import a file or folder of edited ones.
+  - *Pack folders and convert XCTD*: unpack any bundle or stream bundle (`caff-unpack`,
+    `sb-unpack`), rebuild one from an unpacked folder, decompress an XCTD file or wrap one.
+  - *Inspect, extract and replace*: `info` and `list` on any file (output in the log),
+    `extract` / `replace` of one symbol or entry (`--section .gpu`, `-o`, XCTD), `menu-fix`
+    on chosen bundles, and `font-import` with or without a base font.
+  - *Run a nuttool command*: any command line, with the commands' usage in a list and the
+    output in the window.
+- **reNut** menu: *New part from a shipped part* (pick the part; its tab opens **Save as
+  reNut part**), *New block from a .glb* (`renut-block`: mesh node picked from the file,
+  shape, attachable faces, category, shape key weights and the rest as fields), *New world from a model*
+  (`renut-world`, with a character and challenge editor that writes `npcs.json` and a materials list,
+  read from the model, that writes `materials.json`; see
+  [Worlds](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/worlds.md) and
+  [Characters](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/characters.md)), *Vehicle
+  blueprint* (`renut-vehicle`, with a parts list editor that writes the vehicle file), *Script
+  graphs* (nodes wired together as in a visual scripting editor, each graph made into one of a mod's
+  Lua scripts on save: every `renut` and `rex` function and event, flow, maths, variables and Lua of
+  your own; see [Script graphs](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/script-graphs.md); `graph-lua` does it
+  from the command line), and *Export mod package*.
 
 Edited documents are marked in their tab. **Ctrl+S** saves, writing a plain
 (uncompressed) file and keeping a one-time `.bak` of the original; the backup can be
@@ -538,6 +589,362 @@ Named fields of every part (the 960-byte base the game reads at 0x82607A38):
 Fuel tanks add `fuelCapacity` and ammo boxes `ammoCapacity`. The other class fields
 (engines, wheels, weapons...) are listed by offset with their values.
 
+### New parts for reNut (Lua)
+
+Editing a part changes it for everyone who loads your mod. For reNut you can instead make a **new
+part** from a shipped one: it sits next to the original in the garage, already owned, and the
+original stays as it is. NutTool writes it as a RexFabric Lua mod for reNut, a script calling
+`renut.parts.add` (reNut's [parts and vehicles tutorial](https://github.com/masterspike52/reNut/blob/main/docs/tutorials/parts-and-vehicles.md)
+describes it):
+
+```
+nuttool renut-part assets\Bundle\4f\685374 wheels_monster mods\mymod --id mymod_bigwheel --name "Big Wheel" --count 4 --fields edited.txt
+```
+
+- `<mod folder>` is the mod's folder in reNut's `mods` folder. NutTool writes
+  `scripts\<id>.lua` there, and `mod.toml` (the mod's name, `--mod-name`, and `--author`) if the
+  folder has none. An existing script is only replaced with `--force`.
+- `--fields` takes objparams text as `objparams-export` writes it, edited. Every value that differs
+  from the shipped part becomes one of the new part's `fields`. An edited `name` becomes its garage
+  name, unless `--name` gives one.
+- `--behaviour` makes it **a new kind of part**: the script gets every callback (`on_use`,
+  `on_tick`, `on_physics`, `on_throttle`, `on_damage`...), empty, for you to fill in with what the
+  part does in Lua: thrust, firing, repairs and so on.
+- `--model <file.obj|fbx>` gives it **a model of its own**: the shipped part's model (or
+  `--template <model>`'s, e.g. `wheel_standard`) with the file's meshes, as `model-import` applies
+  them. Export the template with `model-export ... --all-groups`, edit it, and keep each object's
+  name (`group1_mesh8`): a named object replaces that mesh, an object with a vertex and no faces
+  removes it, and unnamed meshes stay. Give every level of detail (each group) the new shape. NutTool
+  writes the model and a copy of the template's collision into the mod's own stream bundle,
+  `<mod folder>\bundles\Bundle\50\<id>` (`aid_streambundle_banjox_<folder name>`, or `--bundle`),
+  which reNut loads with the game's common bundles, and the script gets `model = "<id>"`. The
+  collision keeps the template's size, so keep the new shape within it, or take another part
+  model's with `--collision <model>` (`body_light_cube`, `body_light_wedge`, `body_light_corner`).
+  Run it again after changing the file: an existing script is kept (unless `--force`) and only the
+  model is rebuilt.
+
+  A binary glTF (`.glb`) works too: `--mesh <node>` names the node whose mesh is taken (with its
+  transforms), and `--into 8,0,17,25` the template's meshes that get it; every other mesh is
+  removed, and it is bound to the template's root bone. Its normals are smoothed where faces meet at
+  under 40 degrees, and its texture coordinates are projected along each face's main axis, or with
+  `--flat u,v[,u2,v2]` all set to one spot of the textures (from the image's top left; u2, v2 for
+  the second set, the ambient occlusion) for one flat colour. The horn's paintable metal is meshes
+  8, 0 and 17 (its detailed metal, whose editable map is the paint mask), with mesh 25 its shadow;
+  `--flat 0.098,0.598,0.82,0.055` is fully painted there, without scratches or baked shadow.
+
+`renut-block <mod folder> --id <id> --model file.glb --mesh <node>` makes **a block of its own**
+from scratch, with nothing taken from the game: a model of the node's mesh (drawn by reNut's own
+part shaders in the part's paint colour, lit by the game's lights), a footprint (`--shape cube`,
+`wedge` or `corner` for its collision, `--attachable` for its faces) and a script calling
+`renut.parts.add` without a base (`--category body`, `--type`, `--mass`, `--health`, `--count`).
+The mesh's shape keys (its glTF morph targets) come along, blended by reNut's shaders:
+`scripts/<id>_shapes.lua` lists them with their starting weights (`--shapes name=weight,...`, else the
+file's own), and Lua moves one part's with `part:set_shape(name, weight)` (reNut passes the part's
+own weights to the draw through its paint constant's spare lane, c28.w).
+
+- `--attachable top` (or `all`, `none`, `bottom`, `sides`, `top+sides`, or directions such as
+  `-x,-y,+z`) gives it **a footprint of its own**: the base's cells and attach points, with only
+  those faces taking other parts. `top` makes a part that goes under a block and hangs down. It goes
+  into the same stream bundle, and the script gets `attach = "<id>"`.
+
+  Two lines of NutTool's own go in the OBJ for jointed parts: `joint BONE x y z` moves a joint of
+  the template's skeleton (its bind pose), and `skin BONE` binds the `v` lines after it wholly to
+  that bone (`skin` alone ends it). reNut's `part:bone` then turns those bones from Lua. A third,
+  `uv2 U V`, gives the `v` lines after it that second texture coordinate (written as `vt` is;
+  `uv2` alone ends it).
+
+In the GUI, **Save as reNut part...** in a part's tab does the same with the editor's text, and
+can give the part a model of its own (mesh file, `.glb` node picked from the file, into meshes,
+flat colour, template, collision) and a footprint of its own (attachable faces). **reNut > New
+block from a .glb** and **reNut > Vehicle blueprint** do `renut-block` and `renut-vehicle`.
+
+`renut-shapes-export <model or stream bundle> <out.glb> [--model text]` writes the shape keys of
+NutTool's models (worlds, characters, blocks) back out: each draw that has them a mesh with them as
+named morph targets (`extras.targetNames`), at the starting weights in the mod's scripts
+(`renut.shapes.define`, read from the `scripts` folder beside the bundle's folder). From a stream
+bundle it takes every model, or those named with `--model`'s text. Characters come out in their
+rest pose, without the skeleton. In the GUI: **Tools > Export a model**, **Export shape keys**.
+
+**A world of its own:** `renut-world <assets dir> <mod folder> --id <id> --model file.glb` makes a
+world from every mesh node of the file (`--model a.dae;b.dae`: of several files, in one space, for a
+level that comes in rooms), with its materials: base colour times vertex colours, and
+the base colour texture at its texture coordinates (`TEXCOORD_n`; images in the `.glb` or files beside
+it). A text glTF (`.gltf`) works the same, its buffer a data URI or a `.bin` file beside it, and its
+images beside it. A skinned mesh (one with `JOINTS_0` and `WEIGHTS_0` and a skin) is placed by its
+joints at their rest pose, as glTF says (its node's own transform is ignored), so a rigged level or
+prop comes out as it stands in its bind pose. `--model` can also be a Wavefront `.obj` with its `.mtl`: a material's `map_Kd` (BMP, PNG, JPG or
+TGA, beside the OBJ) at the `vt` coordinates, shown in white (an exporter's `Kd` under a texture is a
+dim grey), or else its `Kd`. It can also be a COLLADA `.dae`: each geometry its visual scene places
+(with the nodes' transforms; a Z-up file is turned Y-up), its `<triangles>`, `<polylist>` or
+`<polygons>` with their material's diffuse texture (or colour) at the lowest `TEXCOORD` set, times their
+`COLOR` (a mesh whose colours are out of range is drawn without them). `--colour-scale s` multiplies
+every vertex colour (2 for 3DS rips, whose colours are stored at half). Vertices are split where their
+texture coordinates differ, normals are smoothed by angle (`--smooth`), textures repeat, and texels
+under half alpha are cut out. It is scaled by `--scale` and stands on a flat square ground `--ground`
+units wide (`--ground-colour rrggbb`) when given:
+
+- its model, drawn by reNut's world shaders: one draw per texture (each at most 65535 vertices, more
+  draws when it needs them), binding its texture in the GPU's texture fetch constant 0. Its vertices
+  are 32 bytes: position, normal, colour and texture coordinate;
+- its textures, `aid_texture_renutworld_<id>_<n>`: each image at power-of-two sides, at most
+  `--max-texture` pixels a side (256, 512, 1024 or 2048; default 1024; bigger images are shrunk),
+  DXT1 (DXT5 when it has alpha) with every mip level, whole (not split for streaming), made from a
+  car park texture's header. Materials without a texture get a small white one, so their colour shows.
+  A world with hundreds of textures needs `--max-texture 512` (or less) to fit in the game's memory;
+- its collision (the same triangles; reNut builds the collision's MOPP as the world loads);
+- **a big world in chunks:** a Havok collision mesh indexes at most 65535 places (16-bit indices),
+  so a world with more is cut into chunks of neighbouring triangles (in Morton order of their middles
+  across x and z), each with at most 65000 places. Each chunk is a model and a collision of its own: the
+  first keeps the world's names (`aid_model_renutworld_<id>`, `aid_havok_renutworld_<id>`), the others
+  get `_<n>` after them, and the scene places each with an `op_01` line. The log lists each chunk's
+  vertices, triangles, draws and places;
+- a marker with the player's start (`--spawn x,y,z`, else 2 m above the flat ground nearest the
+  model's middle, found by casting down onto its triangles; `--spawn-yaw`) and a door home to Showdown
+  Town (`--exit x,y,z`, else on flat ground 10-15 m from the start, facing it; `--exit-yaw`; `--no-exit` for
+  none, for a world a mod leaves from Lua with `renut.worlds.go`);
+- its scene, in the mod's stream bundle (`--bundle`), and the world itself (textures, model,
+  collision and marker) in `<mod folder>/worlds/Bundle/50`, which the game loads when the player goes
+  through the door;
+- `scripts/renutworld_<id>.lua`, declaring it (`renut.worlds.add`) and its door in Showdown Town
+  (`--door x,y,z`, `--door-yaw`; by default beside Mumbo's Motors' door; `--no-door` for none, for a
+  world a mod reaches from another with `renut.worlds.go`). `--door-style` picks its
+  kind: `wall` (default: the world door, one-sided, for against a wall), `arch` (the stone arch home,
+  two-sided: model, collision and objparams copied from the car park's bundle `4f\20abf9` as
+  `aid_*_renutworld_<id>_arch`, with its two hologram textures, which Showdown Town lacks, copied as
+  `aid_texture_renutworld_<id>_archhologram...`; the script gets `style = "arch"` and that `look`),
+  `palace` (L.O.G.'s palace door, `banjox_portal_hornportal`) or `hidden` (no model:
+  `banjox_portal_mumbosmotors`, a trigger for a doorway already there);
+- with `--music song.ogg` (or `.mp3`, `.flac`, `.wav`), its music: the file is copied to
+  `<mod folder>/music/` and the script gets `music = "music/<file>"` and `music_volume`
+  (`--music-volume`, 0 to 1, default 0.8). reNut loops it while the player is in the world, pausing
+  the level's own music under it; it pauses with the game and while a challenge's song or a Stereo's
+  game song or file plays (reNut's [worlds and doors tutorial](https://github.com/masterspike52/reNut/blob/main/docs/tutorials/worlds-and-doors.md)).
+  An existing script is kept unless
+  `--force`, so a changed `--music` needs `--force` (or an edit to the script);
+- with `--player-model <id>`, `player_model = "<id>"` in the script: reNut makes Banjo with that
+  player model (`renut-player-model`, [below](#player-models)) in the world;
+- objects named with `_water` (a glTF node or mesh, an OBJ object or group, a .dae node), and
+  triangles whose object, material or texture name holds a `--water name,...` part, become the game's
+  water instead of model and collision, drawn from those very triangles as the game's own levels'
+  water is: a water region (chunk 0x26 of every chunk's model, which the scene's water setup reads from
+  its background as it starts, `sub_82385678`), so it has the water's exact shape, every level of it in
+  one (no limit on levels) and steep pieces (falls) too. For its physics, each triangle by its own
+  slope: one sloping more than 60 degrees falls (water to look at, not to swim in); the rest, banded by
+  height into levels (within 0.4 m of a level's lowest, at their area-weighted height), are water to swim
+  in, filed by the cells of a 16 x 16 grid over the water they reach (z-major). The scene has one `op_7D`: the car park's `testtrack_watersetup_calmwater`
+  arguments with argument 66, the land mask, replaced by `aid_texture_renutworld_<id>_watermask`
+  (256-1024 a side, texels about 0.5 m, black where the water is and a texel past it; its smaller levels
+  keep the darkest texels);
+- `--stats jiggies=N,trophies=N,jinjos=N,notes=N` sets the totals the door's stats panel shows (the
+  script's `stats`); left out, reNut counts them from the world's challenges;
+- a `.glb`/`.gltf`'s shape keys (morph targets, deltas through the skin or node transform, scaled
+  as the world) come along: each draw carries its shapes' deltas after its vertices
+  ([Custom models](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/custom-models.md)),
+  and `scripts/renutworld_<id>_shapes.lua` (written anew each time) names
+  them with their starting weights (`--shapes name=weight,...`, else the file's own), which Lua moves
+  with `renut.worlds.set_shape`. They move what's drawn, not the collision;
+- each material keeps its look ([Worlds](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/worlds.md)): alpha (`opaque`, `cutout`, `blend`, `add`), cutoff,
+  opacity, emissive colour, strength and texture, glow (the colour target's alpha, which the game's bloom
+  reads), double-sided and unlit, from the file (glTF `alphaMode`, `alphaCutoff`, `doubleSided`, `emissiveFactor`,
+  `emissiveTexture`, `KHR_materials_emissive_strength`, `KHR_materials_unlit`; a .dae's emission,
+  transparency and double-sided flag; an .mtl's `Ke`, `map_Ke`, `d`), with `--materials materials.json`'s
+  settings over them by name (`renut-materials model out.json` writes a model's to edit). Draws are split by
+  texture and material; each carries a material record after its vertices, see-through ones (`blend`, `add`)
+  go in the game's translucent bucket without a shadow, and `scripts/renutworld_<id>_materials.lua` names them
+  for `renut.worlds.set_material` (emissive, strength, glow, opacity while played);
+- with `--hologram image.png` (or `.jpg`) on an arch, the arch's hologram shows the image; on a wall
+  door, a door of its own: a copy of the game's world door
+  (`aid_model_renutworld_<id>_door` and its collision, from Showdown Town's common bundle `4f\234cec`)
+  whose hologram shows the image, cropped to a square: its two hologram atlases (colour and alpha
+  mask, split for streaming like the game's) are rebuilt as `aid_texture_renutworld_<id>_hologram...`
+  with the image in every cell, and `aid_objparams_renutworld_<id>_door` names the copied model. They
+  go in the mod's stream bundle, and the script's `renut.doors.add` gets `look = "renutworld_<id>_door"`;
+- with `--sky`, a sky: `aid_model_renutworld_<id>_sky`, a sphere of 48 x 24 faces (both ways round)
+  drawn by reNut's sky shaders, which put each vertex at infinity in its direction (just inside the
+  far plane, so everything draws in front of it) and leave it unlit. Its texture,
+  `aid_texture_renutworld_<id>_sky`, wraps once around it from straight up (its top) to straight down:
+  `--sky panorama.png` (or `.jpg`) takes a 360-degree equirectangular image, `--sky rrggbb,rrggbb`
+  makes a gradient from the first colour overhead to the second at the horizon. The scene shows it
+  with `op_2C <model> 1 0 0 0 0`, as Spiral Mountain's sets its skydome: the game's sky slot
+  (`0x8239FBB0`), drawn at the camera each frame (`0x8239FD90`).
+
+The world borrows the car park's bundle for its lights, its door home and the vehicles' parts. In the
+GUI, **reNut > New world from a model** does the same.
+
+**Characters of its own:** `--npcs npcs.json` (in the GUI, the world window's *Characters* editor, or
+*From a JSON file*; see [Characters](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/characters.md)) adds NPCs who
+stand in the world with a looping idle, talk, and give a "reach the gate" challenge. Model, idle
+and sound paths are read beside the JSON file:
+
+```json
+{
+  "npcs": [{
+    "id": "treasuregal",
+    "name": "Treasure Chest Shop Gal",
+    "model": "treasure_girl.dae", "scale": 0.0374, "smooth": 40,
+    "position": [24, 0, 88], "yaw": 0,
+    "rig": "auto", "idle": "breathe",
+    "tag": "renut_hyrulefield_treasuregal",
+    "lines": {"greeting": "...", "objectives": "...", "win": "...", "lose": "...", "completed": "..."},
+    "voice": ["sounds/hey.ogg", "sounds/hmm.ogg"], "voiceVolume": 0.9,
+    "sounds": {"win": "sounds/cheer.ogg"},
+    "challenge": {
+      "id": "treasuregal_race", "name": "Treasure Dash", "summary": "...",
+      "goal": [-104.7, 6.5, 347.6], "goalYaw": -31.5, "gate": [16, 26],
+      "timeLimit": 60, "tt": 25, "jiggy": 40, "notes": 1
+    }
+  }]
+}
+```
+
+- `id` (a-z, 0-9 and `_`, unique in the world) names its assets `..._renutnpc_<world>_<id>`; `name` is
+  who it is. `model` is a `.dae`, `.glb` or `.obj` (y up after loading, as `--model`), times `scale`,
+  stood with its feet on its origin; `colourScale` (default 1) multiplies its vertex colours.
+- `position` is where its feet go (the game drops it onto the ground), `yaw` in degrees (0 faces +z).
+- `rig: "auto"` gives it a skeleton made from its shape (15 bones: `BASE`, `BACKA` hips, `BACKB` chest,
+  `NECK1`, `HEAD`, and per side `LF_`/`RT_` `H` `K` `F` hip, knee, ankle and `S` `E` shoulder, elbow;
+  elbows halfway out along a T-pose's arms, else halfway down) and skins every vertex to it (below the
+  hips to each side's leg chain); `idle` is a built-in idle (`"breathe"`) or a JSON timeline file,
+  looping while it stands. The built-in `walk` swings the legs (knees bending as each comes through)
+  and the arms against them.
+- `tag` is its objTag, a name of your own (reNut maps it onto one the game knows); `speaker` (default
+  32) is the dialog speaker slot (`dbCharData_Id`) its dialogs name, which reNut gives its chardata.
+- `lines` are its words: `greeting` is needed; with a challenge, all five. `{PAGEBREAK}` starts a new
+  page and `{MOODHAPPY}`, `{MOODSAD}`, `{MOODANGRY}` set a mood, as in the game's own text.
+- `voice` (optional) is what it sounds like as each page of a line comes up, as the game's characters
+  babble: a game character's name (`"humba"`; also `banjo`, `kazooie`, `mumbo`, `grunty`, `klungo`,
+  `log`, `bottles`, `jinjo`, `pikelet`, `pigpig`, `jolly`, `rhino`, `piddles`, `blubber`, `ghostpig`,
+  `penguin`, `boggy`, `mrfit`, `kingjingaling`, `thomas`), whose voice cues are copied into its chardata,
+  or a list of sound files (`.ogg`, `.mp3`, `.flac`, `.wav`), one played at random per page by reNut.
+  Without it the character is silent. `voiceVolume` (0 to 1, default 0.9) is how loud its files play.
+- `sounds` (optional) gives a line a sound file of its own (`greeting`, `objectives`, `win`, `lose`,
+  `completed`), played once as the line starts instead of the voice on its first page. Sound files are
+  copied to `<mod folder>/sounds/<id>/` (two with the same file name are refused).
+- `challenge` (optional): drive through the gate at `goal` (its middle, on the ground; `goalYaw`
+  degrees, `gate` width and height) within `timeLimit` seconds for notes (10 times `notes`), within
+  `jiggy` for a jiggy, within `tt` for a T.T. trophy. The jiggy counts towards the world itself. The
+  clock counts up (`"countDown": true` counts down from `timeLimit` instead, failing at 0). The player's
+  own vehicle starts it at `start` (`startYaw` degrees), by default 12 m from the character towards
+  the goal and facing it: a kind-21 marker record with the challenge's mask, which the game spawns the
+  player's vehicle at (`0x824FCFD0`); without one the player would start on foot.
+- `exclude` (optional): parts of object, material or texture names to leave out of the model (a rip's
+  shadow sheet below the feet); `armsDown` (degrees, 0-90): both shoulders lowered by that much in
+  every animation, for a T-posed model (about 70).
+- `enemy` (optional): `{"health": 3, "behaviour": "mirror"}` makes it an enemy: no lines needed, no
+  challenge, no talk block; its Lua gets `enemy = {health = n}`. `"mirror"` also writes
+  `scripts/renutnpc_<world>_<id>_ai.lua` (kept unless `--force`), a `renut.npcs.on` script copying
+  Banjo as his mirror image; `"none"` leaves its behaviour to the modder's Lua.
+- `shapes` (optional): `{"blink": 0, "smile": 0.5}`, starting weights for the model's shape keys (a
+  `.glb`'s morph targets, which come along), over the file's own. Its Lua gets a
+  `renut.shapes.define{model = "renutnpc_<world>_<id>", ...}`, and `npc:set_shape(name, weight)` moves
+  them in game.
+
+Every NPC also gets `aid_anim_..._walk` (the built-in walk, a stride a second) as `walk` and `run` in its
+animtable, for Lua moving it. Each NPC gets, in the world's bundles: `aid_model_renutnpc_<world>_<id>` (a skinned model drawn by
+reNut's skinned shaders) and its textures (`aid_texture_..._<n>`, in the world's resident bundle),
+`aid_anim_..._idle` and `aid_animtable_...`; its actor `aid_objparams_...` (Pikelet's layout, from
+Showdown Town's common bundle `4f\234cec`), body `_body`, stand and idle states `_stand` / `_idle`, state
+table `aid_statetable_...` (the game's common dialog, hit and other states besides), and
+`aid_chardata_...` (Humba's layout and dialog camera; its voice cues at +0x90, 4 moods of short,
+medium and long, are the `voice` character's, or none); a one-line `aid_dialog_..._<line>` per line,
+whose text key is `dialog__renut_<world>_<id>_<line>`; and its talk script `aid_script_..._talk`. A
+challenge is `aid_challenge_renutchallenge_<world>_<id>`, Park Prix 1's (`4f\685374`) with its own
+header: its dialogs, flags, jiggy counter `renut_<world>_jiggies`, times and rewards. The marker gets a
+record for the NPC (kind 6, snapped to the ground) and one for its goal gate (kind 22, in the
+challenge's marker mask), and the scene registers the giver and what talking to it runs:
+
+```
+op_6F "<tag>" "renut_<world>_<challenge>_beaten" @aid_challenge_renutchallenge_<world>_<id> 0 0 0
+op_71
+op_58 "<tag>" 0 0 0
+op_5A @aid_script_renutnpc_<world>_<id>_talk 1
+op_1B
+```
+
+The talk script starts the challenge (`op_60`), which says the greeting (or, once beaten, the completed
+line), the objectives, and afterwards the win or lose line; without a challenge it says the greeting.
+`scripts/renutnpc_<world>_<id>.lua` (written anew each time: edit the JSON) calls `renut.npcs.add`
+with the NPC's tag, scene (`renutworld_<world>`), chardata, speaker slot, every text (dialog lines, the challenge's title and summary,
+the world's name), the challenge's flags (`..._seen`, `_notes`, `_beaten`, `_tt`) and jiggy counter, and its
+`voice`, `voice_volume` and `sounds` (reNut loads a game character's dialog wavebank in the world, and
+plays sound files itself as each page starts: reNut's
+[characters and challenges tutorial](https://github.com/masterspike52/reNut/blob/main/docs/tutorials/characters-and-challenges.md)).
+
+How a world draw binds its texture (the game's own models do the same): the rendergraph's +0x1C
+counts its textures and +0x7C points at a word per texture, which the game fills as the model loads by
+looking up the property dictionary's `texturefileN` (a texture asset's name; a name ending in `mip` or
+`top` is a split texture's half). Draw field 6 is a sampler record `{count, ->program, samplers}`, each
+sampler `{fetch constant, u16 N+1 (a split texture's top; N for a whole one), u16 N, clamp u, clamp v}`; at each draw the
+game copies texture N's fetch constant into that fetch constant with those clamp modes (0 repeats).
+
+**A vehicle for the mod:**
+
+```
+nuttool renut-vehicle assets\Bundle\4f\685374 mods\mymod\vehicles\mech.json mods\mymod
+```
+
+writes `mods\mymod\vehicles\mech.blueprint`, which reNut adds to the player's saved vehicles once.
+The vehicle file names it and lists its parts: `{"name": "MECH", "parts": [{"part":
+"body_light_cube", "cell": [3, 2, 4], "rotation": [0, 0, 180], "colour": "4e7bc7", "button": "X"},
+...]}`. Cells are garage grid cells (y up), rotations are degrees about x, y and z, and a part
+made with `renut-part` also names its shipped `"base"`, whose record gives its block type and mass.
+
+[Parts and vehicles](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/parts-and-vehicles.md)
+in NutTool's docs goes through parts, blocks and vehicles made this way, and reNut's
+[parts and vehicles tutorial](https://github.com/masterspike52/reNut/blob/main/docs/tutorials/parts-and-vehicles.md)
+their Lua.
+
+#### Player models
+
+```
+nuttool renut-player-model assets mods\mymod Linkjo.fbx --id linkjo [--template actor_banjotuxedo]
+```
+
+makes a player model reNut makes Banjo with (`renut.player.set_model("linkjo")`, or
+`player_model = "linkjo"` in `renut.worlds.add`; `renut-world --player-model linkjo` writes that).
+It's a copy of Banjo's model from the common bundle (`4f\685374`): `--template` picks
+`actor_banjo` or `actor_banjotuxedo`, and by default it's the one a `model-fbx` export of it names
+(its root object). The file is an FBX, or a `.glb` Blender exported from one (its skinned mesh
+nodes at rest, their joints by name). Its meshes are applied as `model-import` does them (objects
+named like the export's, two naming one mesh, as Blender's `.001` copies, joined); the meshes the
+model draws by default that the file left out (deleted in Blender) are removed, its hidden
+alternatives kept. An object that needs a draw of its own (a second object naming a mesh, as
+Blender's `.001` copy of an added part; a plain-coloured object over a textured draw whose colour
+can't be set) takes one of those left-out meshes in its group, untextured, and is drawn as it.
+An export holds the top detail level only, so that's what's drawn at every distance: each lower
+level's groups draw the top level's (they pair in order). The model goes in the
+mod's bundle as `aid_model_renut_player_<id>`, its textures Banjo's own. The skeleton stays, so
+his animations work. A mesh whose material in the file is a plain colour (no texture) that differs
+from the game's is drawn in it, as the export writes colours (the game's own values): an untextured
+draw's `c:basecolour`, or a textured draw's colour map gain set to 0 and offset to the colour. When
+other draws share them, the draw first gets its own copy of its material record and constants. A draw has one colour, so of two
+objects joined into a mesh the first one's is used.
+
+A `.glb` object whose material has a base colour texture of its own (an image the file holds, not the one the export wrote:
+those are named after the game texture they show, and are left as the game's) takes it too: the texture its
+draw shows is copied as `aid_texture_renut_player_<id>_<n>` (a split texture's mip half and streamed top level, from the
+common bundle and `50\685374`) with the image in it, at most 1024 a side (at the texture's own size when its layout can't
+change size), into the mod's bundle; the model's name for that texture points at the copy, and the draw's colour map gain
+and offset are set to 1 and 0 so the image shows as it is. Every draw of the model that uses that texture shows the image,
+so name the object after a mesh whose texture only it uses (a replaced wrench part, say: the wrench's meshes share one
+texture, so delete the rest of them). An object rebuilt into another mesh keeps that mesh's other maps (normal, specular).
+
+#### Character packs
+
+```
+nuttool renut-characters assets <reNut folder>\mods [--only npc_cpu_klungo,npc_humba]
+```
+
+makes the packs reNut's `renut.actors.spawn` loads to spawn a game character in any world. For each
+character (an objparams with a model in an actor bundle, `aid_objparams_banjox_actor_<name>`) it
+follows what the character uses: the ids in its objparams and the objparams they lead to, `aid_`
+names in their strings, and its model's textures. What neither its actor bundle, its group's shared
+one (`actor_npccommon` and `actor_townsfolkcommon`, `actor_gruntbotcommon`) nor `banjox_common`
+holds is copied from the smallest bundle that has it (a split texture's streamed top level with it)
+into `mods\.characters\Bundle\50\<id of renutchar_<name>>`. Without a pack, reNut loads the
+character's whole world bundles (tens of MB), which a heavy world has no room for. The first run
+reads every bundle of the game, which takes a while.
+
 ### Audio and video
 
 `nuttool wave-export assets\Bundle\50\685374 waves` writes each wave bank as `.xwb`,
@@ -599,7 +1006,8 @@ their parent's). `--bone-ends` (**Short end bones**) gives each childless bone a
 `<bone>_end` child, `--bone-end-size` percent of the skeleton's size (default 1.5) down its
 bone axis, so it draws as a stub; Blender's *Ignore Leaf Bones* hides the helpers but keeps
 the stub length. They carry no weights, and `model-import` ignores them.
-`docs/blender/tidy_bones.py`, run in Blender with
+[`tidy_bones.py`](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/blender/tidy_bones.py)
+(in NutTool's docs), run in Blender with
 the armature selected, sets each bone to reach its main child and childless ones to short
 stubs, without moving anything.
 
@@ -621,7 +1029,8 @@ on bones the skeleton lacks are dropped and listed. For each object:
   mesh, and its bone weights too unless the FBX gives them, so a replacement that sits
   where the old part was follows the same bones.
   A vertex buffer holds at most 65,535 vertices (counting the old ones other draws use).
-- **An object with no faces** (just a vertex) hides the mesh.
+- **An object with no faces** (just a vertex) removes the mesh: its draw is taken out of the
+  model, so the model's later meshes number one lower when it is exported again.
 
 Meshes not named in the file stay as they are. New parts cannot be added; replace an
 existing mesh instead. Other detail levels draw their own meshes, so either edit those too
@@ -665,21 +1074,24 @@ player models' Kazooie part and wrench), the swap warns: in game, Kazooie then s
 her bind pose and there is no wrench (so no attack hitbox). Swap between models with the
 same parts (Banjo's outfits) to keep those.
 
-**[docs/model-swaps.md](docs/model-swaps.md)** walks through a swap step by step: what
-the swap notes mean, testing in reNut, and what to do when a swapped character crashes the
-game, T-poses or looks distorted.
+**[Custom models](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/custom-models.md)**
+in NutTool's docs walks through a swap step by step, and its
+**[troubleshooting page](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/troubleshooting.md)** says what to do
+when a swapped character crashes the game, T-poses or looks distorted.
 
 ### Animations
 
 ```
-nuttool anim-import assets\Bundle\4f\685374 banjox_actor_banjo_stand docs\examples\banjo-macarena.json
+nuttool anim-import assets\Bundle\4f\685374 banjox_actor_banjo_stand banjo-macarena.json
 ```
 
 `anim-import` gives an existing animation new motion from a JSON timeline of poses: bone
 rotations in Euler degrees and offsets in metres, eased between keys. Bones without keys
 keep the animation's own motion. The animation's length, frame count, pose and facial
 channels stay, so the game plays the new motion wherever it played the old one.
-**[docs/animation-keys.md](docs/animation-keys.md)** describes the format; the example
+**[Animations](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/animations.md)** in
+NutTool's docs describes the format; the example,
+[`banjo-macarena.json`](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/examples/banjo-macarena.json),
 replaces Banjo's idle with the Macarena.
 
 The rotation track (`QUAT_BITSTREAM`, decoded at `0x8220A6A8` / `0x829FBF00`) is
@@ -715,9 +1127,9 @@ f:set_colour("banjox_actor_mumbo", "blinn11", "velvetColour", 0.8, 0.1, 0.1)
 f:save()                                         -- in place, with a one-time .bak
 ```
 
-**[docs/scripting.md](docs/scripting.md)** is the full reference: every function, path
-rules, binary data, saving and backups, and recipes (batch FBX export, text edits,
-audio, byte patching).
+The Lua script window starts with an example of the basics, and
+**[the command line](https://github.com/masterspike52/reNut/blob/main/docs/nuttool/cli.md)** page of
+NutTool's docs has more.
 
 ### Mod packages for reNut (.nbpatch)
 

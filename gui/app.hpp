@@ -5,6 +5,7 @@
 #include "common.hpp"
 #include "image.hpp"
 #include "nbpatch.hpp"
+#include "tools.hpp"
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -155,6 +156,19 @@ public:
     void runReadOnlyTask(const std::string& label, bool modal, std::function<std::function<void()>(Task&)> work);
     bool busy() const { return !tasks_.empty(); }
 
+    // ---- the command-line tool's commands (tools.cpp)
+    using CommandDone = std::function<void(int code, const std::string& output)>;
+    // Runs a nuttool command line on a worker thread, as the command-line tool does. Its output goes to the
+    // log (unless `logOutput` is false); `done`, else the status bar, gets the exit code and output.
+    void runCommand(const std::string& label, std::vector<std::string> args, CommandDone done = {}, bool logOutput = true);
+    // Tools > Export from a file, for `file`; Tools > Export a model, for `model` in `file`.
+    void openExportTools(const fs::path& file);
+    void openModelExport(const fs::path& file, const std::string& model);
+    // reNut > New part: the part's tab opens its Save as reNut part dialog when it is drawn.
+    void requestPartDialog(const std::string& part) { partDialog_ = part; }
+    bool takePartDialog(const std::string& part);
+    void showLog() { showLog_ = true; }
+
 private:
     void loadSettings();
     void saveSettings();
@@ -188,6 +202,30 @@ private:
     void drawRestore();
     void drawBulkImport();
     void drawChangedMips();
+    // The command-line tool's jobs (tools.cpp)
+    void drawToolWindows();
+    void drawConsole();
+    void drawPackTools();
+    void drawExportTools();
+    void drawModelExport();
+    void drawImportTools();
+    void drawScriptTools();
+    void drawFileJobs();
+    void drawPartPicker();
+    void drawBlockTool();
+    void drawWorldTool();
+    bool drawNpcEditor();  // the world tool's characters; true when each can be made
+    void drawVehicleTool();
+    bool drawVehicleEditor();  // the vehicle tool's parts list; true when it can be made
+    void drawScriptGraph();    // reNut > Script graphs (script_graph.cpp)
+    // Runs the command `build` makes (it throws when a path can't be passed); `writes` are files it may
+    // change, refused while a tab holding one has unsaved changes and closed after.
+    void runTool(const std::string& label, const std::function<std::vector<std::string>()>& build, std::vector<fs::path> writes = {});
+    void commandFinished(const std::string& label, int code, const std::string& output);
+    bool checkUnsaved(const std::vector<fs::path>& files);
+    void reloadWritten(const std::vector<fs::path>& files);
+    // The models, animations and textures in `file` (UTF-8), read in the background; null until then.
+    const FileNames* fileNames(const std::string& file);
     // Scripting (script_window.cpp)
     void drawScript();
     void runScript();
@@ -267,6 +305,10 @@ private:
     // Texture jobs over many textures
     bool showBulkImport_ = false, showChangedMips_ = false;
     std::string bulkFolder_;
+    bool mipsFromOriginal_ = false; // Remove mipmaps from changed textures: compare with modOriginal_
+    // Windows for the command-line tool's jobs, and the part whose reNut dialog was asked for.
+    ToolWindows tools_;
+    std::string partDialog_;
     // Scripting: the editor text is kept in script.lua next to settings.txt.
     struct ScriptOutput {
         std::mutex m;
@@ -276,6 +318,7 @@ private:
     bool showScript_ = false, scriptLoaded_ = false;
     bool scriptAutosave_ = true; // off for a --script file, so it does not replace the saved editor text
     std::string scriptText_;
+    std::string scriptArgs_; // the script's `arg` table, as on the command line
     fs::path scriptPath_, startupScript_, startupFbx_;
     std::shared_ptr<ScriptOutput> scriptOutput_ = std::make_shared<ScriptOutput>();
     Task* scriptTask_ = nullptr; // compared only, never dereferenced unless still in tasks_
@@ -305,5 +348,15 @@ fs::path exportName(const std::string& asset, const std::string& ext);
 bool inputText(const char* label, std::string& s, ImGuiInputTextFlags flags = 0);
 bool inputTextWithHint(const char* label, const char* hint, std::string& s, ImGuiInputTextFlags flags = 0);
 bool inputTextMultiline(const char* label, std::string& s, const ImVec2& size, ImGuiInputTextFlags flags = 0);
+
+// A path field (UTF-8) with a Browse... button, then `label` (up to any "##"). Returns true when typed in.
+enum class PathPick { OpenFile, SaveFile, Folder };
+bool pathField(App& app, const char* label, std::string& path, PathPick pick, std::vector<App::Filter> filters = {}, const char* hint = "");
+// A text field with a list to pick from beside it (typing narrows the list), then `label`.
+bool comboField(const char* label, std::string& value, const std::vector<std::string>& options, const char* hint = "", float width = 0);
+// A path as the command-line tool reads its arguments (the system code page); throws when it can't be.
+std::string cliPath(const fs::path& p);
+// A command line's arguments: spaces separate them, double quotes keep spaces in one.
+std::vector<std::string> splitCommandLine(const std::string& line);
 
 } // namespace nut::gui

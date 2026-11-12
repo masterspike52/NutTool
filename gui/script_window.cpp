@@ -7,7 +7,7 @@ namespace nut::gui {
 
 namespace {
 
-const char* kExample = R"(-- NutTool script. print() writes to the output below; docs/scripting.md has the API.
+const char* kExample = R"(-- NutTool script. print() writes to the output below; reNut's docs/nuttool/cli.md has the API.
 -- nut.assets is the open assets folder: relative paths start there.
 
 local path = "Bundle/4f/685374"
@@ -51,10 +51,12 @@ void App::runScript() {
     std::string code = scriptText_;
     std::string chunk = scriptPath_.empty() ? std::string("script") : toUtf8(scriptPath_.filename());
     fs::path root = root_, dir = scriptPath_.empty() ? fs::path() : scriptPath_.parent_path();
-    runTask("Running script", false, [out, code, chunk, root, dir](Task& t) -> std::function<void()> {
+    std::vector<std::string> args = splitCommandLine(scriptArgs_);
+    runTask("Running script", false, [out, code, chunk, root, dir, args](Task& t) -> std::function<void()> {
         script::Options opt;
         opt.assets = root;
         opt.scriptDir = dir;
+        opt.args = args;
         opt.cancel = &t.cancel;
         opt.output = [out](const std::string& s) {
             std::lock_guard<std::mutex> lk(out->m);
@@ -152,6 +154,10 @@ void App::drawScript() {
     ImGui::TextDisabled("%s", scriptPath_.empty() ? "(unsaved script)" : toUtf8(scriptPath_).c_str());
     if (!script::available()) ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "This build has no Lua: scripts cannot run.");
     if (root_.empty()) ImGui::TextDisabled("No assets folder is open: relative paths start at the current folder.");
+    ImGui::SetNextItemWidth(em(420));
+    inputTextWithHint("Arguments", "the script's arg table, as on the command line", scriptArgs_);
+    helpMarker("Words separated by spaces (double quotes keep spaces in one), given to the script as arg[1], arg[2]... as "
+               "'nuttool script <file.lua> <arguments>' does.");
 
     float avail = ImGui::GetContentRegionAvail().y;
     float editorH = std::max(em(80), avail * 0.62f);

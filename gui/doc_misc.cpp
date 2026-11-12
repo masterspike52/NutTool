@@ -180,9 +180,29 @@ public:
     bool dirty() const override { return dirty_; }
     bool canSave() const override { return true; }
 
-    void draw(App&) override {
+    void draw(App& app) override {
         ImGui::TextDisabled(utf16_ ? "UTF-16 (big-endian) character list: the glyphs the game pre-renders for this language."
                                    : "Plain text font configuration.");
+        // As the command line's ini-export and ini-import: the text as UTF-8, and text files read back.
+        if (ImGui::Button("Export text...")) {
+            std::string text = text_;
+            app.saveFileDialog("Export as UTF-8 text", {{"Text", "txt"}}, [&app, text](const fs::path& p) {
+                writeText(p, text);
+                app.status("Exported " + toUtf8(p));
+            }, fromUtf8(toUtf8(path.stem()) + ".txt"));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Import text...")) {
+            app.openFileDialog("Import UTF-8 text", {{"Text", "txt"}, {"All files", "*"}}, [this, &app](const fs::path& p) {
+                text_ = readText(p);
+                dirty_ = true;
+                app.status("Loaded " + toUtf8(p) + " (save to write it)");
+            });
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Save as UTF-16 character list", &utf16_)) dirty_ = true;
+        helpMarker("Character lists (precache files) are UTF-16 big-endian with a byte order mark; the other font metadata is "
+                   "plain text. Saving writes the text in the form ticked here (the command line's ini-import --utf16).");
         if (inputTextMultiline("##text", text_, ImGui::GetContentRegionAvail(), ImGuiInputTextFlags_AllowTabInput)) dirty_ = true;
     }
 
@@ -287,6 +307,26 @@ public:
         inputText("##filter", filter_);
         ImGui::SameLine();
         ImGui::TextDisabled("%zu assets listed in db_index.txt (double-click to open)", entries_.size());
+        ImGui::SameLine();
+        if (ImGui::Button("Export JSON...")) {
+            // The command line reads <root>\Debug\db_index.txt.
+            fs::path root = path.parent_path().filename() == "Debug" ? path.parent_path().parent_path() : root_;
+            app.saveFileDialog("Export the asset index", {{"JSON", "json"}}, [&app, root](const fs::path& out) {
+                // The command line's index --json writes the list; its output is kept as the file.
+                app.runCommand("Exporting the asset index", {"index", cliPath(root), "--json"}, [&app, out](int code, const std::string& text) {
+                    if (code) {
+                        std::string why = trim(text);
+                        if (startsWith(why, "error: ")) why = why.substr(7);
+                        app.error("The asset index was not exported: " + why);
+                        return;
+                    }
+                    writeText(out, text);
+                    app.status("Exported the asset index to " + toUtf8(out));
+                }, false);
+            }, fromUtf8("db_index.json"));
+        }
+        helpMarker("Every asset in db_index.txt with its id, file (relative to the assets folder), whether that file exists, "
+                   "timestamp and version, as the command line's index --json writes them.");
         std::string needle = lower(filter_);
         if (!ImGui::BeginTable("##index", 4, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_NoSavedSettings)) return;
         ImGui::TableSetupScrollFreeze(0, 1);
@@ -381,6 +421,7 @@ std::unique_ptr<Document> loadDocument(const fs::path& p, const fs::path& root) 
         case FileKind::Font: return makeFontDocument(p, std::move(l.raw));
         case FileKind::Asf: return makeVideoDocument(p, std::move(l.raw));
         case FileKind::Bmp: return makeImageDocument(p, std::move(l.raw));
+        case FileKind::WaveBank: return makeWaveBankDocument(p, std::move(l.raw));
         default: return makeHexDocument(p, std::move(l.raw), kindName(l.kind));
     }
 }

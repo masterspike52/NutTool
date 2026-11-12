@@ -21,6 +21,7 @@ std::unique_ptr<Document> makeHexDocument(const fs::path& p, Bytes data, const s
 std::unique_ptr<Document> makeTextureDocument(const TextureInfo& t, const fs::path& root);
 std::unique_ptr<Document> makeModelDocument(const ModelInfo& m, std::shared_ptr<const Catalog> catalog, const fs::path& root);
 std::unique_ptr<Document> makeAudioDocument(const AudioBankInfo& info, const fs::path& root, const std::string& filter);
+std::unique_ptr<Document> makeWaveBankDocument(const fs::path& p, Bytes data);
 std::unique_ptr<Document> makeScriptDocument(const ScriptInfo& s, std::shared_ptr<const Catalog> catalog, const fs::path& root);
 
 // Text editor for a game script or objparams; the text is rebuilt whenever it changes, to report mistakes.

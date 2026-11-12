@@ -20,7 +20,8 @@
 //   +0x50 group 0 {size, rt, rt, rt, storedSize}  +0x64 group 1 {same}
 //
 // Section record (33 bytes, packed): u32 nameOffset, u8 alignLog2, u32 firstSymbol,
-//   u32 size, 4 x u32 runtime, u32 storedSize.
+//   u32 size, 4 x u32 runtime, u32 storedSize. "firstSymbol" is in fact the 1-based index of the
+//   section's string pool symbol, 0 for none (the game's loader, 0x82A01D30, reads it so).
 // Symbol record (14 bytes): u32 nameIndex (1-based), u32 offset, u32 size, u8 section (1-based), u8 kind.
 // Relocation: {u32 fromSymbol, u32 toSymbol, u32 count} + `count` offsets into fromSymbol.
 //   At load, each u32 at fromSymbol+offset that is < size(toSymbol) gets address(toSymbol) added,

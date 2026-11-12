@@ -59,6 +59,19 @@ add_library(nutcore STATIC
     src/modelimport.cpp
     src/nbpatch.cpp
     src/objparams.cpp
+    src/renutpart.cpp
+    src/renutmodel.cpp
+    src/renutvehicle.cpp
+    src/renutmake.cpp
+    src/renutchars.cpp
+    src/renutworld.cpp
+    src/renutnpc.cpp
+    src/gltfobj.cpp
+    src/collada.cpp
+    src/blockmodel.cpp
+    src/npcmodel.cpp
+    src/scriptgraph.cpp
+    src/scriptgraph_nodes.cpp
     src/ops.cpp
     src/xui.cpp
     src/commands.cpp
@@ -141,6 +154,8 @@ if(NUTTOOL_HAVE_GUI_DEPS)
         gui/texture_edit.cpp
         gui/doc_model.cpp
         gui/script_window.cpp
+        gui/script_graph.cpp
+        gui/tools.cpp
         gui/doc_audio.cpp
         gui/audio_view.cpp
         gui/gl_view.cpp
@@ -153,6 +168,14 @@ if(NUTTOOL_HAVE_GUI_DEPS)
         set(NUTTOOL_SDL SDL3::SDL3-static)
     endif()
     target_link_libraries(nuttool-gui PRIVATE nutcore imgui::imgui ${NUTTOOL_SDL} glad::glad)
+    # The script graph editor's canvas (vcpkg port "imgui-node-editor").
+    find_package(unofficial-imgui-node-editor CONFIG QUIET)
+    if(TARGET unofficial::imgui-node-editor::imgui-node-editor)
+        target_link_libraries(nuttool-gui PRIVATE unofficial::imgui-node-editor::imgui-node-editor)
+        target_compile_definitions(nuttool-gui PRIVATE NUTTOOL_NODE_EDITOR=1)
+    else()
+        message(STATUS "imgui-node-editor not found: the script graph editor is disabled")
+    endif()
     # Media Foundation decodes the WMV movies.
     target_sources(nuttool-gui PRIVATE gui/video_player_mf.cpp)
     target_link_libraries(nuttool-gui PRIVATE opengl32 mfplat mfreadwrite mfuuid shlwapi ole32)

@@ -1,5 +1,5 @@
 // Lua scripting: a `nut` table over the asset code, shared by `nuttool script` and the GUI's
-// script window. docs/scripting.md documents the API.
+// script window. reNut's docs/nuttool/cli.md documents the API.
 #pragma once
 
 #include "common.hpp"

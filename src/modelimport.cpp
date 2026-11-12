@@ -2,12 +2,14 @@
 
 #include "assetdb.hpp"
 #include "fbx.hpp"
+#include "gltfobj.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <set>
 #include <tuple>
@@ -107,6 +109,12 @@ struct Obj {
     std::vector<Vec2> vt;
     std::vector<Object> objects;
     std::vector<std::vector<std::pair<int, float>>> skin; // per v (FBX): skeleton bone and weight; may be empty
+    // NutTool's OBJ lines: "skin BONE" binds the "v" lines after it wholly to that bone ("skin" alone
+    // ends it), "uv2 U V" gives them that second texture coordinate (as "vt" is written; "uv2" alone
+    // ends it), "joint BONE x y z" moves that joint of the skeleton.
+    std::vector<std::string> skinBone; // per v; empty keeps the copied weights
+    std::vector<std::optional<Vec2>> uv2; // per v; none keeps the copied one
+    std::vector<std::pair<std::string, Vec3>> joints;
 };
 
 Obj parseObj(const std::string& text) {
@@ -129,6 +137,8 @@ Obj parseObj(const std::string& text) {
         return i >= 1 && size_t(i) <= count ? int(i - 1) : -1;
     };
     size_t lineNo = 0;
+    std::string skinBone;
+    std::optional<Vec2> uv2;
     for (size_t p = 0; p < text.size();) {
         size_t e = text.find('\n', p);
         if (e == std::string::npos) e = text.size();
@@ -142,12 +152,27 @@ Obj parseObj(const std::string& text) {
         if (key == "o" || (key == "g" && !hasO)) {
             o.objects.push_back({});
             o.objects.back().name = rest;
+        } else if (key == "skin") {
+            skinBone = rest;
+        } else if (key == "uv2") {
+            Vec2 x{};
+            if (rest.empty()) uv2.reset();
+            else if (std::sscanf(rest.c_str(), "%f %f", &x[0], &x[1]) == 2) uv2 = x;
+            else fail("OBJ line " + std::to_string(lineNo) + ": uv2 is \"uv2 U V\"");
+        } else if (key == "joint") {
+            char name[128] = {};
+            Vec3 x{};
+            if (std::sscanf(rest.c_str(), "%127s %f %f %f", name, &x[0], &x[1], &x[2]) < 4)
+                fail("OBJ line " + std::to_string(lineNo) + ": joint is \"joint BONE x y z\"");
+            o.joints.push_back({name, x});
         } else if (key == "v") {
             Vec3 x{};
             if (std::sscanf(rest.c_str(), "%f %f %f", &x[0], &x[1], &x[2]) < 3) fail("OBJ line " + std::to_string(lineNo) + ": bad vertex");
             auto& ob = object();
             if (!ob.vSet) { ob.firstV = o.v.size(); ob.vSet = true; }
             o.v.push_back(x);
+            o.skinBone.push_back(skinBone);
+            o.uv2.push_back(uv2);
             ob.endV = o.v.size();
         } else if (key == "vt") {
             Vec2 x{};
@@ -193,6 +218,8 @@ struct NewVertex {
     Vec3 pos, normal;
     Vec2 uv; // as stored (OBJ v already flipped)
     bool hasUv = false;
+    Vec2 uv2; // the second set, the same way
+    bool hasUv2 = false;
     std::vector<std::pair<int, float>> skin; // skeleton bone and weight; empty keeps the vertex's own
 };
 
@@ -275,6 +302,10 @@ void encodeVertex(uint8_t* p, const Layout& l, const NewVertex& nv, bool onlyCha
             putBe16(q + 2, toHalf(nv.uv[1]));
         }
     }
+    if (nv.hasUv2 && l.uvSets.size() > 1) {
+        putBe16(p + l.uvSets[1], toHalf(nv.uv2[0]));
+        putBe16(p + l.uvSets[1] + 2, toHalf(nv.uv2[1]));
+    }
     if (l.skinned && !nv.skin.empty()) writeSkin(p, l, nv.skin, onlyChanged);
 }
 
@@ -286,13 +317,68 @@ uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 
 namespace {
 
-ImportReport applyObj(caff::Caff& c, size_t symbol, const Obj& obj) {
+// Per byte of a 32-byte draw record at `at`: the relocation target (1-based symbol) of a pointer
+// starting there, and the size of a swapped element starting there; 0 for neither.
+std::array<std::pair<uint32_t, uint32_t>, 32> recordShape(const caff::Caff& c, size_t symbol, uint32_t at) {
+    std::array<std::pair<uint32_t, uint32_t>, 32> shape{};
+    for (int set = 0; set < 2; ++set) {
+        for (auto& r : c.relocs[set])
+            if (r.from == symbol + 1)
+                for (uint32_t o : r.offsets)
+                    if (o >= at && o < at + 32) shape[o - at].first = r.to;
+        for (auto& w : c.swaps[set])
+            if (w.symbol == symbol + 1)
+                for (uint32_t o : w.offsets)
+                    for (uint32_t k = 0; k < std::max<uint32_t>(w.elementCount, 1); ++k) {
+                        uint32_t e = o + k * w.stride;
+                        if (e >= at && e < at + 32) shape[e - at].second = w.elementSize;
+                        if (!w.stride) break;
+                    }
+    }
+    return shape;
+}
+
+// Takes the meshes `remove` out of the model: each group's later draws move up over them and its
+// draw count drops. Draw records hold only pointers, laid out alike, so the symbol's relocation and
+// swap tables stay right when the bytes move; a group where they differ is refused.
+void removeDraws(const caff::Caff& c, size_t symbol, Bytes& data, const Model& m, const std::set<size_t>& remove) {
+    std::map<uint32_t, std::set<uint32_t>> byGroup; // group -> draw records to remove
+    for (size_t mi : remove) byGroup[m.meshes[mi].source.groupRecord].insert(m.meshes[mi].source.drawRecord);
+    for (auto& [g, gone] : byGroup) {
+        const uint32_t count = be32(&data[g + 8]), first = be32(&data[g + 12]);
+        // Nothing else may point into the draws (only the group, at their start).
+        for (int set = 0; set < 2; ++set)
+            for (auto& r : c.relocs[set])
+                if (r.from == symbol + 1 && r.to == symbol + 1)
+                    for (uint32_t o : r.offsets) {
+                        uint32_t to = be32(&data[o]);
+                        if (to >= first && to < first + 32 * count && o != g + 12 && (o < first || o >= first + 32 * count))
+                            fail("a draw of the model is pointed at from elsewhere; its meshes can't be removed");
+                    }
+        const Bytes before(data.begin() + first, data.begin() + first + 32 * count);
+        uint32_t slot = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (gone.count(first + 32 * i)) continue;
+            if (slot != i) {
+                if (recordShape(c, symbol, first + 32 * slot) != recordShape(c, symbol, first + 32 * i))
+                    fail("draws of one group are laid out differently; its meshes can't be removed");
+                std::memcpy(&data[first + 32 * slot], &before[32 * i], 32);
+            }
+            ++slot;
+        }
+        putBe32(&data[g + 8], slot);
+    }
+}
+
+ImportReport applyObj(caff::Caff& c, size_t symbol, const Obj& obj, bool removeMissing = false) {
     Model m = parse(c, symbol);
     ImportReport rep;
+    static const Obj::Object kMissing; // a mesh the model draws by default that the file left out: removed
     auto skinOf = [&](size_t v) { return v < obj.skin.size() ? obj.skin[v] : std::vector<std::pair<int, float>>(); };
 
     // Objects -> meshes.
     std::map<size_t, const Obj::Object*> byMesh;
+    std::map<size_t, Obj::Object> joined; // objects naming one mesh (Blender's "mesh34.001" copies), as one
     std::vector<std::string> unnamed;
     for (auto& ob : obj.objects) {
         if (ob.tris.empty() && !ob.vSet) continue; // empty "o" lines
@@ -301,7 +387,18 @@ ImportReport applyObj(caff::Caff& c, size_t symbol, const Obj& obj) {
             unnamed.push_back(ob.name.empty() ? "(unnamed)" : ob.name);
             continue;
         }
-        if (byMesh.count(size_t(mi))) fail("two objects name mesh " + std::to_string(mi));
+        if (auto had = byMesh.find(size_t(mi)); had != byMesh.end()) {
+            Obj::Object& j = joined.try_emplace(size_t(mi), *had->second).first->second;
+            j.tris.insert(j.tris.end(), ob.tris.begin(), ob.tris.end());
+            if (ob.vSet) {
+                j.firstV = j.vSet ? std::min(j.firstV, ob.firstV) : ob.firstV;
+                j.endV = j.vSet ? std::max(j.endV, ob.endV) : ob.endV;
+                j.vSet = true;
+            }
+            had->second = &j;
+            rep.notes.push_back(ob.name + ": joined to the other object naming mesh " + std::to_string(mi));
+            continue;
+        }
         byMesh[size_t(mi)] = &ob;
     }
     if (!unnamed.empty()) {
@@ -311,6 +408,10 @@ ImportReport applyObj(caff::Caff& c, size_t symbol, const Obj& obj) {
              " meshes): name each object after the mesh it replaces, as the export does (group0_mesh3)");
     }
     if (byMesh.empty()) fail("the file has no objects");
+    if (removeMissing)
+        for (size_t i = 0; i < m.meshes.size(); ++i)
+            if (!byMesh.count(i) && m.meshes[i].group >= 0 && size_t(m.meshes[i].group) < m.groups.size() && m.groups[size_t(m.meshes[i].group)].shown)
+                byMesh[i] = &kMissing;
 
     std::map<int, Bytes> gpu; // edited copies of .gpu symbols
     auto gpuData = [&](int sym) -> Bytes& { return gpu.try_emplace(sym, c.symbolData(size_t(sym))).first->second; };
@@ -324,6 +425,7 @@ ImportReport applyObj(caff::Caff& c, size_t symbol, const Obj& obj) {
         std::vector<uint32_t> base; // template vertex (buffer index) of each new vertex
     };
     std::vector<Rebuild> rebuilds;
+    std::set<size_t> removed;
 
     for (auto& [mi, ob] : byMesh) {
         Mesh& mesh = m.meshes[mi];
@@ -392,14 +494,16 @@ ImportReport applyObj(caff::Caff& c, size_t symbol, const Obj& obj) {
             ++rep.edited;
             continue;
         }
+        // ---- removed: the draw is taken out of its group
+        if (ob->tris.empty()) {
+            ++rep.hidden;
+            removed.insert(mi);
+            rep.notes.push_back("mesh " + std::to_string(mi) + (ob == &kMissing ? ": removed (drawn by default, not in the file)" : ": removed"));
+            continue;
+        }
         // ---- new geometry
         Rebuild rb;
         rb.mesh = mi;
-        if (ob->tris.empty()) {
-            ++rep.hidden;
-            rebuilds.push_back(std::move(rb));
-            continue;
-        }
         std::map<Obj::Corner, uint32_t> unique;
         for (auto& t : ob->tris)
             for (auto& cn : t) {
@@ -413,6 +517,10 @@ ImportReport applyObj(caff::Caff& c, size_t symbol, const Obj& obj) {
                     }
                     v.normal = cn.vn >= 0 ? obj.vn[size_t(cn.vn)] : Vec3{0, 0, 0};
                     v.skin = skinOf(size_t(cn.v));
+                    if (size_t(cn.v) < obj.uv2.size() && obj.uv2[size_t(cn.v)]) {
+                        v.uv2 = {(*obj.uv2[size_t(cn.v)])[0], 1.0f - (*obj.uv2[size_t(cn.v)])[1]};
+                        v.hasUv2 = true;
+                    }
                     rb.verts.push_back(v);
                 }
                 rb.tris.push_back(it->second);
@@ -550,6 +658,7 @@ ImportReport applyObj(caff::Caff& c, size_t symbol, const Obj& obj) {
         }
     }
 
+    removeDraws(c, symbol, data, m, removed);
     for (auto& [sym, d] : gpu) c.replaceSymbolData(size_t(sym), d);
     c.replaceSymbolData(symbol, data);
     return rep;
@@ -572,12 +681,394 @@ std::string boneKey(const std::string& n) {
     return out;
 }
 
+ImportReport moveJoints(caff::Caff& c, size_t symbol, const std::vector<fbx::BoneData>& fb);
+
 } // namespace
 
-ImportReport importObj(caff::Caff& c, size_t symbol, const std::string& objText) { return applyObj(c, symbol, parseObj(objText)); }
+ImportReport importObj(caff::Caff& c, size_t symbol, const std::string& objText) {
+    Obj obj = parseObj(objText);
+    const Model m = parse(c, symbol);
+    std::map<std::string, int> bones;
+    std::string names;
+    for (size_t i = 0; i < m.bones.size(); ++i) {
+        bones.emplace(boneKey(m.bones[i].name), int(i));
+        names += (i ? ", " : "") + m.bones[i].name;
+    }
+    auto boneIndex = [&](const std::string& name) {
+        auto it = bones.find(boneKey(name));
+        if (it == bones.end()) fail("the model has no bone '" + name + "' (its bones: " + (names.empty() ? "none" : names) + ")");
+        return it->second;
+    };
+    // "joint" lines move the skeleton first, so the geometry is bound to the joints where they end up.
+    ImportReport rig;
+    if (!obj.joints.empty()) {
+        std::vector<fbx::BoneData> fb;
+        for (auto& [name, pos] : obj.joints) {
+            const Bone& b = m.bones[size_t(boneIndex(name))];
+            fbx::BoneData d;
+            d.name = b.name;
+            d.parent = b.parent >= 0 ? m.bones[size_t(b.parent)].name : std::string();
+            d.position = pos;
+            d.fromBind = true;
+            fb.push_back(d);
+        }
+        rig = moveJoints(c, symbol, fb);
+    }
+    obj.skin.assign(obj.v.size(), {});
+    size_t bound = 0;
+    for (size_t k = 0; k < obj.v.size(); ++k)
+        if (!obj.skinBone[k].empty()) {
+            obj.skin[k] = {{boneIndex(obj.skinBone[k]), 1.0f}};
+            ++bound;
+        }
+    ImportReport rep = applyObj(c, symbol, obj);
+    rep.notes.insert(rep.notes.begin(), rig.notes.begin(), rig.notes.end());
+    if (bound) rep.notes.push_back(std::to_string(bound) + " vertex(es) bound to the bones their \"skin\" lines name");
+    return rep;
+}
 
-ImportReport importFbx(caff::Caff& c, size_t symbol, const Bytes& file) {
-    std::vector<fbx::MeshData> meshes = fbx::readMeshes(file);
+namespace {
+
+// Meshes whose file material is a plain colour (no texture), as the export writes them (the game's values), are
+// drawn in it: an untextured draw's c:basecolour, or a textured draw's c:textureGain<slot> 0 and
+// c:textureOffset<slot> the colour; alpha kept. A draw sharing those constants with others gets its own copy of its
+// material record when that's shared, then of the register blocks holding them.
+// A draw's material record (draw + 20): 400 bytes, its one pointer at + 0xd4 (the register blocks).
+constexpr uint32_t kMaterialRecord = 0x190;
+
+// Meshes in `imaged` show their colour map as it is (gain 1, offset 0): the caller gives the texture the file's image.
+void applyPlainColours(caff::Caff& c, size_t symbol, const std::map<size_t, std::array<float, 3>>& colours, std::vector<std::string>& notes,
+                       const std::set<size_t>& imaged = {}) {
+    if (colours.empty() && imaged.empty()) return;
+    Model m = parse(c, symbol);
+    Bytes data = c.symbolData(symbol);
+    std::map<std::pair<int, uint32_t>, std::set<size_t>> users; // where a constant is stored -> the meshes using it
+    for (size_t i = 0; i < m.meshes.size(); ++i)
+        for (auto& k : m.meshes[i].constants)
+            if (k.symbol >= 0) users[{k.symbol, k.offset}].insert(i);
+    auto relocTarget = [&](uint32_t at) -> int {
+        for (int set = 0; set < 2; ++set)
+            for (auto& r : c.relocs[set])
+                if (r.from == symbol + 1 && std::find(r.offsets.begin(), r.offsets.end(), at) != r.offsets.end()) return int(r.to) - 1;
+        return -1;
+    };
+    std::map<int, Bytes> edited; // other symbols' new bytes
+    auto bytesOf = [&](int sym) -> Bytes& { return size_t(sym) == symbol ? data : edited.try_emplace(sym, c.symbolData(size_t(sym))).first->second; };
+    auto write = [&](const Mesh::Constant& k, const std::array<float, 4>& v) {
+        Bytes& d = bytesOf(k.symbol);
+        if (k.offset + 16 > d.size()) fail("a material constant outside its symbol");
+        for (int q = 0; q < 4; ++q) {
+            uint32_t bits;
+            std::memcpy(&bits, &v[size_t(q)], 4);
+            putBe32(&d[k.offset + 4 * uint32_t(q)], bits);
+        }
+    };
+    // What each mesh's colour writes: constants of its draw and their new values.
+    struct Write {
+        Mesh::Constant* k;
+        std::array<float, 4> v;
+    };
+    std::map<size_t, std::vector<Write>> plans;
+    int textured = 0, untextured = 0;
+    for (auto& [mi, colour] : colours) {
+        if (mi >= m.meshes.size()) continue;
+        Mesh& me = m.meshes[mi];
+        const std::string at = "mesh " + std::to_string(mi);
+        auto named = [&](const std::string& n) -> Mesh::Constant* {
+            for (auto& k : me.constants)
+                if (k.name == n && k.symbol >= 0) return &k;
+            return nullptr;
+        };
+        if (me.texture < 0) {
+            bool exported = true; // the colour the export wrote for it
+            for (int q = 0; q < 3; ++q) exported &= std::fabs(me.colour[q] - colour[size_t(q)]) < 1e-4f;
+            if (exported) continue;
+            Mesh::Constant* base = named("c:basecolour");
+            if (!base) {
+                notes.push_back(at + ": its colour isn't used (its draw has no c:basecolour)");
+                continue;
+            }
+            bool same = true;
+            for (int q = 0; q < 3; ++q) same &= std::fabs(base->value[size_t(q)] - colour[size_t(q)]) < 1e-4f;
+            if (same) continue; // the game's own, as exported
+            plans[mi] = {{base, {colour[0], colour[1], colour[2], base->value[3]}}};
+            ++untextured;
+            continue;
+        }
+        int slot = -1;
+        for (size_t k = 0; k < me.textures.size() && k < me.textureSlots.size(); ++k)
+            if (me.textures[k] == me.texture) slot = me.textureSlots[k];
+        Mesh::Constant *gain = named("c:textureGain" + std::to_string(slot)), *offset = named("c:textureOffset" + std::to_string(slot));
+        if (slot < 0 || !gain || !offset) {
+            notes.push_back(at + ": its plain colour isn't used (its draw's colour map has no gain and offset)");
+            continue;
+        }
+        plans[mi] = {{gain, {0, 0, 0, gain->value[3]}}, {offset, {colour[0], colour[1], colour[2], offset->value[3]}}};
+        ++textured;
+    }
+    int ownImages = 0;
+    std::set<size_t> imagePlans;
+    for (size_t mi : imaged) {
+        if (mi >= m.meshes.size() || plans.count(mi) || m.meshes[mi].texture < 0) continue;
+        Mesh& me = m.meshes[mi];
+        int slot = -1;
+        for (size_t k = 0; k < me.textures.size() && k < me.textureSlots.size(); ++k)
+            if (me.textures[k] == me.texture) slot = me.textureSlots[k];
+        Mesh::Constant *gain = nullptr, *offset = nullptr;
+        for (auto& k : me.constants) {
+            if (k.symbol < 0) continue;
+            if (k.name == "c:textureGain" + std::to_string(slot)) gain = &k;
+            if (k.name == "c:textureOffset" + std::to_string(slot)) offset = &k;
+        }
+        if (slot < 0 || !gain || !offset) continue; // nothing tints its colour map
+        bool plain = true;
+        for (size_t q = 0; q < 3; ++q) plain &= gain->value[q] == 1 && offset->value[q] == 0;
+        if (plain) continue;
+        plans[mi] = {{gain, {1, 1, 1, gain->value[3]}}, {offset, {0, 0, 0, offset->value[3]}}};
+        imagePlans.insert(mi);
+    }
+
+    int coloured = 0;
+    for (auto& [mi, writes] : plans) {
+        Mesh& me = m.meshes[mi];
+        const std::string at = "mesh " + std::to_string(mi);
+        // Shared: another draw reads one of these places and isn't given the same value there.
+        auto shared = [&] {
+            for (const Write& w : writes) {
+                auto u = users.find({w.k->symbol, w.k->offset});
+                if (u == users.end()) continue;
+                for (size_t o : u->second) {
+                    if (o == mi) continue;
+                    auto p = plans.find(o);
+                    bool same = false;
+                    if (p != plans.end())
+                        for (const Write& x : p->second) same |= x.k->symbol == w.k->symbol && x.k->offset == w.k->offset && x.v == w.v;
+                    if (!same) return true;
+                }
+            }
+            return false;
+        };
+        if (shared()) {
+            // Its material record (draw + 20) lists register blocks {->values, count, u32} at + 0xd4.
+            const uint32_t rec = me.source.drawRecord + 20;
+            if (rec + 4 > data.size()) {
+                notes.push_back(at + ": its plain colour isn't used (its draw record wasn't found)");
+                continue;
+            }
+            uint32_t f5 = be32(&data[rec]);
+            bool alone = true;
+            for (size_t o = 0; o < m.meshes.size(); ++o)
+                if (o != mi && m.meshes[o].source.drawRecord + 24 <= data.size() && be32(&data[m.meshes[o].source.drawRecord + 20]) == f5) alone = false;
+            if (!alone) {
+                // Its own copy of the record (kMaterialRecord bytes), with the pointers in it, at the end of .data.
+                if (uint64_t(f5) + kMaterialRecord > data.size()) {
+                    notes.push_back(at + ": its colour isn't used (its material record runs past the model's data)");
+                    continue;
+                }
+                const uint32_t copy = alignUp(uint32_t(data.size()), 16);
+                const Bytes record(data.begin() + f5, data.begin() + f5 + kMaterialRecord);
+                data.resize(copy, 0);
+                data.insert(data.end(), record.begin(), record.end());
+                for (int set = 0; set < 2; ++set)
+                    for (auto& r : c.relocs[set]) {
+                        if (r.from != symbol + 1) continue;
+                        std::vector<uint32_t> added;
+                        for (uint32_t o : r.offsets)
+                            if (o >= f5 && o < f5 + kMaterialRecord) added.push_back(copy + (o - f5));
+                        r.offsets.insert(r.offsets.end(), added.begin(), added.end());
+                    }
+                putBe32(&data[rec], copy);
+                f5 = copy;
+                notes.push_back(at + ": its material record copied, so its colour is its own");
+            }
+            // Every constant of this draw moves with its block (the others' places are left to them).
+            std::vector<std::pair<Mesh::Constant*, std::pair<int, uint32_t>>> was;
+            for (auto& k : me.constants) was.push_back({&k, {k.symbol, k.offset}});
+            for (uint32_t k = 0; k < 8; ++k) {
+                const uint32_t e = f5 + 0xd4 + 12 * k;
+                if (e + 8 > data.size()) break;
+                const int t = relocTarget(e);
+                if (t < 0 || size_t(t) == symbol) break;
+                const uint32_t from = be32(&data[e]), bytes = 16 * std::min<uint32_t>(be32(&data[e + 4]), 64);
+                auto inBlock = [&](const Mesh::Constant* kc) { return kc->symbol == t && kc->offset >= from && kc->offset < from + bytes; };
+                bool needed = false;
+                for (const Write& w : writes) needed |= inBlock(w.k);
+                if (!needed) continue;
+                Bytes& sd = bytesOf(t);
+                if (uint64_t(from) + bytes > sd.size()) break;
+                const Bytes block(sd.begin() + from, sd.begin() + from + bytes);
+                const uint32_t to = alignUp(uint32_t(sd.size()), 16);
+                sd.resize(to, 0);
+                sd.insert(sd.end(), block.begin(), block.end());
+                putBe32(&data[e], to);
+                for (auto& kc : me.constants)
+                    if (inBlock(&kc)) kc.offset = to + (kc.offset - from);
+            }
+            bool moved = true;
+            for (const Write& w : writes)
+                for (auto& [k, place] : was)
+                    if (k == w.k) moved &= place != std::make_pair(k->symbol, k->offset);
+            if (!moved) {
+                notes.push_back(at + ": its colour isn't used (its constants couldn't be given a copy of its own)");
+                continue;
+            }
+            // Its old places are the other draws' now.
+            for (auto& [k, place] : was)
+                if (auto u = users.find(place); u != users.end()) u->second.erase(mi);
+            notes.push_back(at + ": its material constants copied, so its colour is its own");
+        }
+        for (const Write& w : writes) write(*w.k, w.v);
+        if (imagePlans.count(mi)) ++ownImages;
+        else ++coloured;
+    }
+    c.replaceSymbolData(symbol, data);
+    for (auto& [sym, d] : edited) c.replaceSymbolData(size_t(sym), d);
+    if (!colours.empty())
+        notes.push_back(std::to_string(coloured) + " of " + std::to_string(textured + untextured) + " recoloured mesh(es) drawn in their material's colour (" +
+                        std::to_string(textured) + " in place of a texture)");
+    if (ownImages) notes.push_back(std::to_string(ownImages) + " mesh(es) with an image of their own drawn untinted (texture gain 1, offset 0)");
+}
+
+} // namespace
+
+namespace {
+
+// A .glb's skinned meshes as the FBX reader gives them (a corner per triangle point).
+std::vector<fbx::MeshData> glbMeshes(const Bytes& file) {
+    std::vector<fbx::MeshData> out;
+    for (auto& sm : gltfobj::skinnedMeshes(file)) {
+        fbx::MeshData md;
+        md.name = sm.name;
+        md.points = sm.points;
+        md.skin = sm.skin;
+        md.plainColour = sm.plainColour;
+        md.colourImage = sm.colourImage;
+        md.colourImageName = sm.colourImageName;
+        for (auto& t : sm.triangles) {
+            std::vector<int> poly;
+            for (uint32_t v : t) {
+                poly.push_back(int(md.cornerPoint.size()));
+                md.cornerPoint.push_back(int(v));
+                if (!sm.normals.empty()) md.cornerNormal.push_back(sm.normals[v]);
+                if (!sm.uvs.empty()) md.cornerUv.push_back(sm.uvs[v]);
+            }
+            md.polygons.push_back(std::move(poly));
+        }
+        out.push_back(std::move(md));
+    }
+    return out;
+}
+
+// An image the export wrote for a draw: named after the game texture it shows ("..._colour_0x0df995b5", or cut short to a hash,
+// "..._colo_458a4ae"; Blender may repeat it after a "-"), so all of it but the last part is in that texture's name.
+bool exportedImage(const std::string& imageName, const std::string& textureName) {
+    const size_t dash = imageName.find('-');
+    std::string stem = lower(dash == std::string::npos ? imageName : imageName.substr(0, dash));
+    const size_t cut = stem.rfind('_');
+    if (cut == std::string::npos) return false;
+    stem.resize(cut);
+    const std::string name = lower(textureName);
+    return stem.size() >= 8 && name.find(stem) != std::string::npos;
+}
+
+bool hasConstant(const Mesh& me, const std::string& name) {
+    return std::any_of(me.constants.begin(), me.constants.end(), [&](const Mesh::Constant& k) { return k.name == name && k.symbol >= 0; });
+}
+
+// Whether a textured draw's colour map can be given a plain colour (its slot's c:textureGain and c:textureOffset).
+bool colourMapSettable(const Mesh& me) {
+    int slot = -1;
+    for (size_t k = 0; k < me.textures.size() && k < me.textureSlots.size(); ++k)
+        if (me.textures[k] == me.texture) slot = me.textureSlots[k];
+    return slot >= 0 && hasConstant(me, "c:textureGain" + std::to_string(slot)) && hasConstant(me, "c:textureOffset" + std::to_string(slot));
+}
+
+// Objects that need a draw of their own take a spare: a mesh drawn by default that the file left out (its own group's
+// first, else another's), untextured with a c:basecolour. That's a second object naming a mesh (Blender's "mesh34.001" copy) and a
+// plain-coloured object over a textured draw whose colour can't be set. They're renamed to it.
+void assignSpares(const Model& m, std::vector<fbx::MeshData>& meshes, std::vector<std::string>& notes) {
+    std::set<size_t> named;
+    for (auto& md : meshes)
+        if (!isFurShell(md.name) && meshOfName(md.name) >= 0) named.insert(size_t(meshOfName(md.name)));
+    std::map<int, std::vector<size_t>> spares; // group -> spare meshes, in order
+    for (size_t i = 0; i < m.meshes.size(); ++i) {
+        const Mesh& me = m.meshes[i];
+        const bool shown = me.group >= 0 && size_t(me.group) < m.groups.size() && m.groups[size_t(me.group)].shown;
+        // No colour map, and no fur (a volume texture in sampler slot 1).
+        const bool fur = std::find(me.textureSlots.begin(), me.textureSlots.end(), 1) != me.textureSlots.end();
+        if (shown && !named.count(i) && me.texture < 0 && !fur && hasConstant(me, "c:basecolour") && !me.indices.empty())
+            spares[me.group].push_back(i);
+    }
+    std::set<size_t> claimed;
+    for (auto& md : meshes) {
+        const int mi = meshOfName(md.name);
+        if (isFurShell(md.name) || mi < 0 || size_t(mi) >= m.meshes.size()) continue;
+        const Mesh& me = m.meshes[size_t(mi)];
+        const bool second = !claimed.insert(size_t(mi)).second;
+        const bool stuck = !second && md.plainColour && me.texture >= 0 && !colourMapSettable(me);
+        if (!second && !stuck) continue;
+        // Its own group's spare, else another drawn by default.
+        std::vector<size_t>* poolOf = &spares[me.group];
+        for (auto& [g, list] : spares)
+            if (poolOf->empty() && !list.empty()) poolOf = &list;
+        std::vector<size_t>& pool = *poolOf;
+        if (pool.empty()) {
+            if (stuck) notes.push_back(md.name + ": its plain colour can't be drawn (mesh " + std::to_string(mi) + " has no colour to set, and there's no spare mesh)");
+            continue;
+        }
+        const size_t spare = pool.front();
+        pool.erase(pool.begin());
+        const std::string was = md.name;
+        md.name = "group" + std::to_string(m.meshes[spare].group) + "_mesh" + std::to_string(spare);
+        claimed.insert(spare);
+        if (stuck) {
+            claimed.erase(size_t(mi));
+            notes.push_back(was + ": drawn as mesh " + std::to_string(spare) + " (untextured, left out of the file) so its plain colour shows; mesh " +
+                            std::to_string(mi) + " had no colour to set");
+        } else {
+            notes.push_back(was + ": drawn as mesh " + std::to_string(spare) + " (left out of the file), a draw of its own");
+        }
+    }
+}
+
+// importFbx's work, from the meshes of an FBX or a .glb.
+ImportReport importMeshes(caff::Caff& c, size_t symbol, std::vector<fbx::MeshData> meshes, bool removeMissing) {
+    std::vector<std::string> spareNotes;
+    if (removeMissing) assignSpares(parse(c, symbol), meshes, spareNotes);
+    // Plain colours first, while mesh numbers are the file's (a removed draw renumbers those after it).
+    std::map<size_t, std::array<float, 3>> colours;
+    std::vector<std::string> colourNotes;
+    for (auto& md : meshes) {
+        const int mi = meshOfName(md.name);
+        if (!md.plainColour || isFurShell(md.name) || mi < 0) continue;
+        auto [it, fresh] = colours.emplace(size_t(mi), *md.plainColour);
+        if (!fresh && it->second != *md.plainColour)
+            colourNotes.push_back(md.name + ": mesh " + std::to_string(mi) + " is drawn in the first object's colour (a draw has one)");
+    }
+    // Objects with an image of their own: their draw's colour map, by name, is to show it.
+    std::set<size_t> imaged;
+    std::vector<std::pair<std::string, Bytes>> images;
+    {
+        const Model before = parse(c, symbol);
+        std::map<std::string, size_t> imageOf; // texture name -> its entry in `images`
+        for (auto& md : meshes) {
+            const int mi = meshOfName(md.name);
+            if (md.colourImage.empty() || isFurShell(md.name) || mi < 0 || size_t(mi) >= before.meshes.size()) continue;
+            const Mesh& me = before.meshes[size_t(mi)];
+            if (me.texture < 0 || size_t(me.texture) >= before.textures.size()) {
+                colourNotes.push_back(md.name + ": its image isn't used (mesh " + std::to_string(mi) + " has no colour map)");
+                continue;
+            }
+            const std::string& tex = before.textures[size_t(me.texture)];
+            if (exportedImage(md.colourImageName, tex)) continue; // the game's own, as the export wrote it
+            auto [it, fresh] = imageOf.emplace(tex, images.size());
+            if (fresh) images.push_back({tex, md.colourImage});
+            else if (images[it->second].second != md.colourImage)
+                colourNotes.push_back(md.name + ": mesh " + std::to_string(mi) + " shows the first object's image (" + tex + " takes one)");
+            imaged.insert(size_t(mi));
+        }
+    }
+    applyPlainColours(c, symbol, colours, colourNotes, imaged);
     const Model m = parse(c, symbol);
     std::map<std::string, int> exact, loose;
     for (size_t i = 0; i < m.bones.size(); ++i) {
@@ -643,7 +1134,10 @@ ImportReport importFbx(caff::Caff& c, size_t symbol, const Bytes& file) {
         o.objects.push_back(std::move(ob));
     }
     if (o.objects.empty()) fail(shells ? "the file holds only fur shells" : "the file has no meshes");
-    ImportReport rep = applyObj(c, symbol, o);
+    ImportReport rep = applyObj(c, symbol, o, removeMissing);
+    rep.images = std::move(images);
+    rep.notes.insert(rep.notes.end(), spareNotes.begin(), spareNotes.end());
+    rep.notes.insert(rep.notes.end(), colourNotes.begin(), colourNotes.end());
     if (skinned) rep.notes.push_back(std::to_string(skinned) + " mesh(es) took their skin weights from the file");
     if (!unknownBones.empty()) {
         std::string list;
@@ -655,18 +1149,145 @@ ImportReport importFbx(caff::Caff& c, size_t symbol, const Bytes& file) {
     return rep;
 }
 
-ImportReport importMeshFile(caff::Caff& c, size_t symbol, const Bytes& file, bool rig) {
+} // namespace
+
+ImportReport importFbx(caff::Caff& c, size_t symbol, const Bytes& file, bool removeMissing) {
+    return importMeshes(c, symbol, fbx::readMeshes(file), removeMissing);
+}
+
+ImportReport importGlb(caff::Caff& c, size_t symbol, const Bytes& file, bool removeMissing) {
+    return importMeshes(c, symbol, glbMeshes(file), removeMissing);
+}
+
+std::vector<std::string> keepTopDetailLevel(caff::Caff& c, size_t symbol) {
+    std::vector<std::string> notes;
+    const Model m = parse(c, symbol);
+    Bytes d = c.symbolData(symbol);
+    // The render list (chunk 0x0A -> {->groups, count}), each group {u32 path count, ->path, u32 draw count, ->draws}.
+    uint32_t groups = 0, count = 0;
+    if (d.size() >= 8) {
+        const uint32_t dir = be32(&d[0]), n = be32(&d[4]);
+        for (uint32_t i = 0; i < n && i < 64 && uint64_t(dir) + 8 * i + 8 <= d.size(); ++i) {
+            if (be32(&d[dir + 8 * i]) != 0x0A) continue;
+            const uint32_t at = be32(&d[dir + 8 * i + 4]);
+            if (uint64_t(at) + 8 <= d.size()) groups = be32(&d[at]), count = be32(&d[at + 4]);
+        }
+    }
+    if (!count || uint64_t(groups) + 16ull * count > d.size()) fail("the model's render list wasn't found");
+    // Groups drawn at one level only (the levels their path's nodes allow), in order, by level bit.
+    std::map<uint32_t, std::vector<size_t>> byLevel;
+    for (size_t gi = 0; gi < m.groups.size() && gi < count; ++gi) {
+        uint32_t bits = ~0u;
+        bool lod = false;
+        for (int n : m.groups[gi].path)
+            if (n >= 0 && size_t(n) < m.nodes.size() && m.nodes[size_t(n)].lods) {
+                bits &= m.nodes[size_t(n)].lods;
+                lod = true;
+            }
+        if (lod && bits && !(bits & (bits - 1))) byLevel[bits].push_back(gi);
+    }
+    const auto top = byLevel.find(1u);
+    if (top == byLevel.end()) {
+        notes.push_back("the model has no detail levels to keep the top one of");
+        return notes;
+    }
+    // A self relocation at `at` (the draws pointer), added when the group had none.
+    auto selfPointer = [&](uint32_t at) {
+        for (int set = 0; set < 2; ++set)
+            for (auto& r : c.relocs[set])
+                if (r.from == symbol + 1 && std::find(r.offsets.begin(), r.offsets.end(), at) != r.offsets.end()) return;
+        for (auto& r : c.relocs[0])
+            if (r.from == symbol + 1 && r.to == symbol + 1) {
+                r.offsets.push_back(at);
+                return;
+            }
+        c.relocs[0].push_back({uint32_t(symbol + 1), uint32_t(symbol + 1), {at}});
+    };
+    for (auto& [bit, list] : byLevel) {
+        if (bit == 1u) continue;
+        int level = 0;
+        while (!(bit >> level & 1)) ++level;
+        if (list.size() != top->second.size()) {
+            notes.push_back("detail level " + std::to_string(level) + " kept: its " + std::to_string(list.size()) + " group(s) don't pair with the top level's " +
+                            std::to_string(top->second.size()));
+            continue;
+        }
+        // Its groups, in order, draw the top level's groups' draws.
+        for (size_t k = 0; k < list.size(); ++k) {
+            const uint32_t from = groups + 16 * uint32_t(top->second[k]), to = groups + 16 * uint32_t(list[k]);
+            putBe32(&d[to + 8], be32(&d[from + 8]));
+            putBe32(&d[to + 12], be32(&d[from + 12]));
+            selfPointer(to + 12);
+        }
+        notes.push_back("detail level " + std::to_string(level) + " draws the top level's meshes (" + std::to_string(list.size()) + " groups)");
+
+        // Groups drawn at the top level and others but not this one ("Banjo_0_1_"), placed by detail level alone: their
+        // draws join those of this level's group paired with a top group placed the same way, in a list of its own.
+        auto pureLevels = [&](size_t gi) {
+            if (m.groups[gi].path.empty()) return false;
+            for (int n : m.groups[gi].path)
+                if (n < 0 || size_t(n) >= m.nodes.size() || !m.nodes[size_t(n)].lods) return false;
+            return true;
+        };
+        std::vector<size_t> extra;
+        for (size_t gi = 0; gi < m.groups.size() && gi < count; ++gi) {
+            uint32_t bits = ~0u;
+            for (int n : m.groups[gi].path)
+                if (n >= 0 && size_t(n) < m.nodes.size()) bits &= m.nodes[size_t(n)].lods;
+            if (pureLevels(gi) && (bits & 1u) && !(bits & bit) && (bits & (bits - 1))) extra.push_back(gi);
+        }
+        size_t host = SIZE_MAX;
+        for (size_t k = 0; k < list.size() && host == SIZE_MAX; ++k)
+            if (pureLevels(top->second[k])) host = k;
+        if (extra.empty() || host == SIZE_MAX) continue;
+        std::vector<std::pair<uint32_t, uint32_t>> parts; // draws arrays (offset, count) joined
+        const uint32_t hostAt = groups + 16 * uint32_t(list[host]);
+        parts.push_back({be32(&d[hostAt + 12]), be32(&d[hostAt + 8])});
+        for (size_t gi : extra) parts.push_back({be32(&d[groups + 16 * uint32_t(gi) + 12]), be32(&d[groups + 16 * uint32_t(gi) + 8])});
+        const uint32_t joined = alignUp(uint32_t(d.size()), 16);
+        d.resize(joined, 0);
+        uint32_t total = 0;
+        for (auto& [at, n] : parts) {
+            if (uint64_t(at) + 32ull * n > d.size()) fail("a render group's draws are outside the model");
+            const uint32_t dst = uint32_t(d.size());
+            const Bytes recs(d.begin() + at, d.begin() + at + 32 * n);
+            d.insert(d.end(), recs.begin(), recs.end());
+            // The records' pointers, relocated at their copies too.
+            for (int set = 0; set < 2; ++set)
+                for (auto& r : c.relocs[set]) {
+                    if (r.from != symbol + 1) continue;
+                    std::vector<uint32_t> added;
+                    for (uint32_t o : r.offsets)
+                        if (o >= at && o < at + 32 * n) added.push_back(dst + (o - at));
+                    r.offsets.insert(r.offsets.end(), added.begin(), added.end());
+                }
+            total += n;
+        }
+        putBe32(&d[hostAt + 8], total);
+        putBe32(&d[hostAt + 12], joined);
+        notes.push_back("detail level " + std::to_string(level) + " also draws " + std::to_string(extra.size()) +
+                        " group(s) the top level shares with others but not it");
+    }
+    c.replaceSymbolData(symbol, d);
+    return notes;
+}
+
+ImportReport importMeshFile(caff::Caff& c, size_t symbol, const Bytes& file, bool rig, bool removeMissing) {
+    if (gltfobj::isGlb(file)) {
+        if (rig) fail("--rig takes an FBX file's skeleton");
+        return importGlb(c, symbol, file, removeMissing);
+    }
     if (!fbx::isFbx(file)) {
         if (rig) fail("only an FBX file carries a rig (OBJ has no skeleton)");
         return importObj(c, symbol, std::string(file.begin(), file.end()));
     }
-    if (!rig) return importFbx(c, symbol, file);
+    if (!rig) return importFbx(c, symbol, file, removeMissing);
     ImportReport rep = importRig(c, symbol, file);
     // Meshes too, when the file has any named like the model's.
     bool meshes = false;
     for (auto& md : fbx::readMeshes(file)) meshes |= !isFurShell(md.name) && meshOfName(md.name) >= 0;
     if (meshes) {
-        ImportReport r = importFbx(c, symbol, file);
+        ImportReport r = importFbx(c, symbol, file, removeMissing);
         rep.edited = r.edited, rep.rebuilt = r.rebuilt, rep.hidden = r.hidden;
         rep.notes.insert(rep.notes.end(), r.notes.begin(), r.notes.end());
     }
@@ -1260,8 +1881,10 @@ CopyResult copyModel(caff::Caff& dst, size_t symbol, const caff::Caff& srcIn, si
 
 // ---- rig override ------------------------------------------------------------------------------
 
-ImportReport importRig(caff::Caff& c, size_t symbol, const Bytes& fbxFile) {
-    std::vector<fbx::BoneData> fb = fbx::readBones(fbxFile);
+namespace {
+
+// Moves the joints named in `fb` (an FBX file's bones, or an OBJ's "joint" lines) to their positions.
+ImportReport moveJoints(caff::Caff& c, size_t symbol, const std::vector<fbx::BoneData>& fb) {
     const Model m = parse(c, symbol);
     const size_t n = m.bones.size();
     if (!n) fail("the model has no skeleton");
@@ -1392,5 +2015,9 @@ ImportReport importRig(caff::Caff& c, size_t symbol, const Bytes& fbxFile) {
     if (extras) rep.notes.push_back("rig: bones the model lacks were ignored (the game's skeleton cannot grow): " + extra + (extras > 8 ? ", ..." : ""));
     return rep;
 }
+
+} // namespace
+
+ImportReport importRig(caff::Caff& c, size_t symbol, const Bytes& fbxFile) { return moveJoints(c, symbol, fbx::readBones(fbxFile)); }
 
 } // namespace nut::model

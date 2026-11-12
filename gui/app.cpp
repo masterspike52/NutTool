@@ -212,6 +212,9 @@ void App::loadSettings() {
             else if (k == "modOriginal") modOriginal_ = v;
             else if (k == "bulkFolder") bulkFolder_ = v;
             else if (k == "zoom") userZoom_ = std::clamp(std::stof(v), 0.5f, 3.0f);
+            else
+                for (auto& [key, field] : tools_.remembered())
+                    if (k == "tools." + key) *field = v;
         }
     } catch (...) {
     }
@@ -222,6 +225,8 @@ void App::saveSettings() {
     std::string s = "assets=" + toUtf8(root_) + "\nupdate=" + toUtf8(updateDir_) + "\nbackups=" + (backups_ ? "1" : "0") + "\ndark=" + (darkTheme_ ? "1" : "0") +
                     "\nbrowserWidth=" + std::to_string(int(browserWidth_)) + "\nextractOut=" + extractOut_ + "\nlastDir=" + toUtf8(lastDir_) + "\nzoom=" + std::to_string(userZoom_) +
                     "\nmodAuthor=" + mod_.author + "\nmodOriginal=" + modOriginal_ + "\nbulkFolder=" + bulkFolder_ + "\n";
+    for (auto& [key, field] : tools_.remembered())
+        if (!field->empty() && field->find_first_of("\r\n") == std::string::npos) s += "tools." + key + "=" + *field + "\n";
     try { writeText(settingsPath_, s); } catch (...) {}
 }
 
@@ -928,6 +933,7 @@ void App::frame() {
     drawRestore();
     drawBulkImport();
     drawChangedMips();
+    drawToolWindows();
     drawScript();
     drawIdTool();
     drawAbout();
@@ -1009,8 +1015,27 @@ void App::drawMenu() {
                 };
             });
         }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Export from a file (textures, models, wave banks)...")) tools_.showExport = true;
+        if (ImGui::MenuItem("Export a model (FBX / OBJ)...")) tools_.showModel = true;
+        if (ImGui::MenuItem("Import into a file (texture, model, animation keys)...")) tools_.showImport = true;
+        if (ImGui::MenuItem("Game scripts and objparams (export / import)...")) tools_.showScripts = true;
+        if (ImGui::MenuItem("Pack folders and convert XCTD...")) tools_.showPack = true;
+        if (ImGui::MenuItem("Inspect, extract and replace (info, list, symbols, menus, fonts)...")) tools_.showFileJobs = true;
+        ImGui::Separator();
         if (ImGui::MenuItem("Script (Lua)...")) showScript_ = true;
+        if (ImGui::MenuItem("Run a nuttool command...")) tools_.showConsole = true;
         if (ImGui::MenuItem("Asset ID calculator...")) showIdTool_ = true;
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("reNut")) {
+        if (ImGui::MenuItem("New part from a shipped part...")) tools_.showPartPicker = true;
+        if (ImGui::MenuItem("New block from a .glb...")) tools_.showBlock = true;
+        if (ImGui::MenuItem("New world from a model...")) tools_.showWorld = true;
+        if (ImGui::MenuItem("Vehicle blueprint...")) tools_.showVehicle = true;
+        if (ImGui::MenuItem("Script graphs...")) tools_.showGraph = true;
+        ImGui::Separator();
+        if (ImGui::MenuItem("Export mod package (.nbpatch)...", nullptr, false, !root_.empty())) showModExport_ = true;
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
@@ -1281,7 +1306,11 @@ void App::drawExtractDialog() {
                "symbols of bundles and entries of stream bundles, wave banks, text tables, videos and fonts. A filtered bundle "
                "is written as loose files, without the caff.json needed to pack it back.");
     if (!extractTexturesOnly_ && extractFilter_.empty()) ImGui::TextDisabled("A full extraction writes about 8 GB and takes a few minutes.");
-    ImGui::BeginDisabled(extractOut_.empty());
+    // With no kind ticked, the extraction would take every kind.
+    bool anyKind = extractTexturesOnly_;
+    for (bool c : extractCats_) anyKind |= c;
+    if (!anyKind) ImGui::TextDisabled("Tick at least one kind of file.");
+    ImGui::BeginDisabled(extractOut_.empty() || !anyKind);
     if (ImGui::Button("Start")) {
         ops::ExtractOptions opt;
         opt.png = extractPng_;
@@ -1587,17 +1616,32 @@ void App::drawChangedMips() {
     bool anyDirty = false;
     for (auto& d : docs_) anyDirty |= d->dirty();
     if (anyDirty) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Unsaved changes in open tabs are discarded.");
-    ImGui::BeginDisabled(busy());
+    if (ImGui::RadioButton("Compare with the .bak backups##mips", !mipsFromOriginal_)) mipsFromOriginal_ = false;
+    if (ImGui::RadioButton("Compare with a clean copy of the game folder##mips", mipsFromOriginal_)) mipsFromOriginal_ = true;
+    if (mipsFromOriginal_) {
+        ImGui::SetNextItemWidth(em(400));
+        inputText("##mipsoriginal", modOriginal_);
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...##mipsoriginal"))
+            openFolderDialog("Clean game folder", [this](const fs::path& p) { modOriginal_ = toUtf8(p); }, fromUtf8(modOriginal_));
+        ImGui::SameLine();
+        helpMarker("The textures that differ from this untouched copy, or that it lacks, lose their mipmaps (as the command line's "
+                   "--original). The title update's files are compared with their backups only without it.");
+    }
+    ImGui::BeginDisabled(busy() || (mipsFromOriginal_ && trim(modOriginal_).empty()));
     if (ImGui::Button("Remove mipmaps")) {
         fs::path root = root_, update = updateRoot();
+        fs::path original = mipsFromOriginal_ ? fromUtf8(trim(modOriginal_)) : fs::path();
+        saveSettings();
         docs_.clear();
-        runTask("Removing mipmaps from changed textures", true, [this, root, update](Task& t) -> std::function<void()> {
+        runTask("Removing mipmaps from changed textures", true, [this, root, update, original](Task& t) -> std::function<void()> {
             ops::Progress pr;
             pr.log = [this](const std::string& s) { log(s); };
             pr.step = [&t](double f, const std::string& s) { t.report(f, s); };
             pr.cancel = &t.cancel;
-            auto changes = nbpatch::findChanges(root, {}, pr);
-            for (auto& c : nbpatch::findChanges(update, {}, pr)) changes.push_back(c);
+            auto changes = nbpatch::findChanges(root, original, pr);
+            if (original.empty())
+                for (auto& c : nbpatch::findChanges(update, {}, pr)) changes.push_back(c);
             int textures = 0, files = 0;
             for (size_t i = 0; i < changes.size() && !t.cancel; ++i) {
                 t.report(double(i) / double(changes.size()), changes[i].path);
@@ -1623,22 +1667,30 @@ void App::drawIdTool() {
     if (!showIdTool_) return;
     ImGui::SetNextWindowSize(ImVec2(520 * uiScale_, 0), ImGuiCond_Appearing);
     if (ImGui::Begin("Asset ID calculator", &showIdTool_)) {
-        ImGui::TextWrapped("Type an asset name such as aid_loctext_banjox_frontend or aid_texture_banjox_particles_spanglewhite.");
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        inputText("##name", idToolInput_);
-        if (auto id = assetdb::idFromName(trim(idToolInput_))) {
-            ImGui::Text("id: %s   type: %s", hex32(*id).c_str(), assetdb::typeName(uint8_t(*id >> 24)).c_str());
-            fs::path p = assetdb::pathForId(root_, *id);
-            ImGui::Text("file: %s", toUtf8(root_.empty() ? assetdb::pathForId("", *id) : fs::relative(p, root_)).c_str());
-            if (!root_.empty()) {
-                if (fs::exists(p)) {
-                    if (ImGui::Button("Open")) openPath(p);
-                } else {
-                    ImGui::TextDisabled("(no such file; the asset may live inside a bundle)");
+        ImGui::TextWrapped("Type an asset name such as aid_loctext_banjox_frontend or aid_texture_banjox_particles_spanglewhite, "
+                           "or several, one per line.");
+        inputTextMultiline("##name", idToolInput_, ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 4 + ImGui::GetStyle().FramePadding.y * 2));
+        int row = 0;
+        for (auto& line : split(idToolInput_, '\n')) {
+            std::string name = trim(line);
+            if (name.empty()) continue;
+            ImGui::PushID(row++);
+            if (row > 1) ImGui::Separator();
+            if (auto id = assetdb::idFromName(name)) {
+                ImGui::Text("%s\nid: %s   type: %s", name.c_str(), hex32(*id).c_str(), assetdb::typeName(uint8_t(*id >> 24)).c_str());
+                fs::path p = assetdb::pathForId(root_, *id);
+                ImGui::Text("file: %s", toUtf8(root_.empty() ? assetdb::pathForId("", *id) : fs::relative(p, root_)).c_str());
+                if (!root_.empty()) {
+                    if (fs::exists(p)) {
+                        if (ImGui::Button("Open")) openPath(p);
+                    } else {
+                        ImGui::TextDisabled("(no such file; the asset may live inside a bundle)");
+                    }
                 }
+            } else {
+                ImGui::TextDisabled("%s: unknown asset type prefix.", name.c_str());
             }
-        } else if (!idToolInput_.empty()) {
-            ImGui::TextDisabled("Unknown asset type prefix.");
+            ImGui::PopID();
         }
     }
     ImGui::End();

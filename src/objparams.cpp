@@ -249,4 +249,31 @@ Bytes fromText(const Bytes& base, std::string_view src) {
     return out;
 }
 
+std::vector<Change> changes(const Bytes& original, const Bytes& edited) {
+    if (!isObjParams(original) || !isObjParams(edited)) fail("not an objparams record");
+    if (className(original) != className(edited) || recordSize(original) != recordSize(edited))
+        fail("the records are of different classes");
+    // A field either record names (a word set to 0 is listed by the other one only), named ones first.
+    std::map<uint32_t, Field> fields;
+    for (const Bytes* d : {&original, &edited})
+        for (const Field& f : fieldsOf(*d, {})) {
+            auto [it, added] = fields.emplace(f.offset, f);
+            if (!added && it->second.name.empty() && !f.name.empty()) it->second = f;
+        }
+    const uint32_t end = recordSize(original);
+    std::vector<Change> out;
+    std::vector<bool> covered(end, false);
+    for (const auto& [offset, f] : fields) {
+        if (offset + f.size > end) continue;
+        std::fill(covered.begin() + offset, covered.begin() + offset + f.size, true);
+        if (std::equal(original.begin() + offset, original.begin() + offset + f.size, edited.begin() + offset)) continue;
+        out.push_back({offset, f.type, f.size, f.name});
+    }
+    // Bytes no field covers that changed anyway, as raw bytes.
+    for (uint32_t i = 2; i < end; ++i)
+        if (!covered[i] && original[i] != edited[i]) out.push_back({i, 'r', 1, {}});
+    std::sort(out.begin(), out.end(), [](const Change& a, const Change& b) { return a.offset < b.offset; });
+    return out;
+}
+
 } // namespace nut::objparams

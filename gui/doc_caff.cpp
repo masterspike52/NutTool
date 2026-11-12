@@ -486,11 +486,16 @@ public:
                 fs::path dir = path.empty() || picked.filename() == path.filename() ? picked : picked / path.filename();
                 app.runTask("Unpacking", true, [this, dir, &app](Task&) -> std::function<void()> {
                     ops::unpackCaff(*l_.caff, l_.xctd, dir);
-                    return [&app, dir] { app.status("Unpacked to " + toUtf8(dir) + " (rebuild with: nuttool caff-pack)"); };
+                    return [&app, dir] { app.status("Unpacked to " + toUtf8(dir) + " (rebuild it with Tools > Pack folders and convert XCTD)"); };
                 });
             });
         }
-        helpMarker("Writes caff.json plus one file per symbol. Edit the files and rebuild with 'nuttool caff-pack <folder> <file>'.");
+        helpMarker("Writes caff.json plus one file per symbol. Edit the files and rebuild the bundle with Tools > Pack folders and "
+                   "convert XCTD (or 'nuttool caff-pack <folder> <file>').");
+        ImGui::SameLine();
+        if (ImGui::Button("More exports...")) app.openExportTools(path);
+        helpMarker("Tools > Export from a file, for this bundle: its textures as DDS, PNG or both, every model as OBJ with a bone "
+                   "list, or its wave banks.");
         ctx_.streams = streamPtrs_;
         ctx_.pairedStream = stream_ ? &*stream_->sb : nullptr;
         ctx_.onChanged = [this] { dirty_ = true; };
@@ -567,7 +572,7 @@ public:
                 fs::path dir = path.empty() || picked.filename() == path.filename() ? picked : picked / path.filename();
                 app.runTask("Unpacking", true, [this, dir, &app](Task&) -> std::function<void()> {
                     ops::unpackStreamBundle(*l_.sb, dir);
-                    return [&app, dir] { app.status("Unpacked to " + toUtf8(dir) + " (rebuild with: nuttool sb-pack)"); };
+                    return [&app, dir] { app.status("Unpacked to " + toUtf8(dir) + " (rebuild it with Tools > Pack folders and convert XCTD)"); };
                 });
             });
         }
@@ -582,6 +587,10 @@ public:
                 });
             });
         }
+        ImGui::SameLine();
+        if (ImGui::Button("More exports...")) app.openExportTools(path);
+        helpMarker("Tools > Export from a file, for this stream bundle: wave banks decoded to WAV or picked by name, the textures "
+                   "of its entries, or their models as OBJ. Pack folders and convert XCTD rebuilds an unpacked stream bundle.");
         ImGui::SetNextItemWidth(-FLT_MIN);
         inputText("##entryfilter", filter_);
         if (filter_.empty() && !ImGui::IsItemActive())

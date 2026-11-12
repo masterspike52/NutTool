@@ -18,4 +18,14 @@ std::string toText(const Bytes& d, const gamescript::NameLookup& names = {});
 // Applies `text` onto `base`: the fields it lists change, every other byte stays. The size never changes.
 Bytes fromText(const Bytes& base, std::string_view text);
 
+// A field `edited` has another value in than `original` (records of one class): its offset, type (i int,
+// f float, a asset id, x hex word, s string, r raw bytes), size, and name (empty: known by its offset).
+struct Change {
+    uint32_t offset;
+    char type;
+    uint32_t size;
+    std::string name;
+};
+std::vector<Change> changes(const Bytes& original, const Bytes& edited);
+
 } // namespace nut::objparams

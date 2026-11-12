@@ -1571,6 +1571,7 @@ struct Scene {
     std::vector<RNode> top;
     std::map<int64_t, const RNode*> byId;
     std::multimap<int64_t, int64_t> parents, children;
+    std::multimap<int64_t, int64_t> propChildren;  // object-property connections (a material's textures), by parent
     Mat4 axes = identity();
 
     const RNode* topNode(const char* n) const {
@@ -1614,12 +1615,16 @@ void loadScene(Scene& s, const Bytes& file) {
     if (!objects) fail("FBX: the file has no objects");
     for (auto& o : objects->kids)
         if (!o.props.empty()) s.byId[o.num(0)] = &o;
-    if (connections)
-        for (auto& c : connections->kids)
+    if (connections) {
+        for (auto& c : connections->kids) {
             if (c.name == "C" && c.str(0) == "OO") {
                 s.parents.emplace(c.num(1), c.num(2));
                 s.children.emplace(c.num(2), c.num(1));
+            } else if (c.name == "C" && c.str(0) == "OP") {
+                s.propChildren.emplace(c.num(2), c.num(1));
             }
+        }
+    }
 
     const RNode* gs = s.topNode("GlobalSettings");
     auto axis = [&](const char* n, int def) {
@@ -1710,6 +1715,22 @@ std::vector<MeshData> readMeshes(const Bytes& file) {
             MeshData md;
             md.name = plainName(mdl->str(1));
             md.skin = skin;
+            // Its first material: a plain colour when no texture is connected to it.
+            auto matr = children.equal_range(mi->second);
+            for (auto m = matr.first; m != matr.second; ++m) {
+                if (!isA(m->second, "Material", nullptr)) continue;
+                bool textured = false;
+                for (const auto* links : {&s.children, &s.propChildren}) {
+                    auto tr = links->equal_range(m->second);
+                    for (auto t = tr.first; t != tr.second; ++t) textured |= isA(t->second, "Texture", nullptr);
+                }
+                const RNode* mat = byId.at(m->second);
+                const std::array<double, 3> none{-1, -1, -1};
+                std::array<double, 3> col = pVec3(mat, "DiffuseColor", none);
+                if (col[0] < 0) col = pVec3(mat, "Diffuse", none);
+                if (!textured && col[0] >= 0) md.plainColour = std::array<float, 3>{float(col[0]), float(col[1]), float(col[2])};
+                break;
+            }
             md.points.reserve(np);
             for (size_t k = 0; k < np; ++k) {
                 double x = (*verts)[3 * k], y = (*verts)[3 * k + 1], z = (*verts)[3 * k + 2];
